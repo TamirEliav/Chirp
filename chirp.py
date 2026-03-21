@@ -1,5 +1,5 @@
 """
-sap_rec.py — Sound Analysis & Recording  (v4 — multi-recording)
+chirp.py — Sound Analysis & Recording
 """
 
 import collections
@@ -1203,9 +1203,9 @@ class RecordingSidebar(QWidget):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SapWindow
+# ChirpWindow
 # ──────────────────────────────────────────────────────────────────────────────
-class SapWindow(QMainWindow):
+class ChirpWindow(QMainWindow):
 
     _THR_SCALE  = 1000
     _TIME_SCALE = 100
@@ -1242,7 +1242,7 @@ class SapWindow(QMainWindow):
         self._timer.timeout.connect(self._update_plot)
         self._timer.start()
 
-        self.setWindowTitle('SAP_rec — Sound Analysis & Recording')
+        self.setWindowTitle('Chirp — Sound Analysis & Recording')
         self.resize(1400, 850)
 
     # ──────────────────────────────────────────────────────────────────────
@@ -2399,7 +2399,7 @@ class SapWindow(QMainWindow):
         }
 
         path, _ = QFileDialog.getSaveFileName(
-            self, 'Save Settings', '', 'SAP_rec Settings (*.saprec);;All Files (*)')
+            self, 'Save Settings', '', 'Chirp Settings (*.chirp);;All Files (*)')
         if not path:
             return
         if not path.endswith('.saprec'):
@@ -2412,7 +2412,7 @@ class SapWindow(QMainWindow):
 
     def _load_settings(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, 'Load Settings', '', 'SAP_rec Settings (*.saprec);;All Files (*)')
+            self, 'Load Settings', '', 'Chirp Settings (*.chirp);;All Files (*)')
         if not path:
             return
         try:
@@ -3172,7 +3172,7 @@ class SapWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyleSheet(QSS)
-    win = SapWindow()
+    win = ChirpWindow()
     win.showMaximized()
     sys.exit(app.exec_())
 

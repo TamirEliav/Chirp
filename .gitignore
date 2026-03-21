@@ -2,5 +2,9 @@ __pycache__/
 *.pyc
 *.pyo
 recordings/
+*.chirp
 *.saprec
 .env
+.claude/
+.vscode/
+=5.15
