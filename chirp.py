@@ -301,6 +301,7 @@ class ThresholdRecorder:
         self._was_enabled      = False
         self._pre_trig_deque   = collections.deque(maxlen=1)
         self._pre_trig_maxlen  = 1
+        self._onset_time       = None  # precise onset timestamp
 
     def process_chunk(self, chunk: np.ndarray, *,
                       trigger_peak: float,
@@ -312,7 +313,7 @@ class ThresholdRecorder:
         if self._was_enabled and not enabled:
             if self._state == self._RECORDING and self._buf:
                 self._start_flush(self._buf, output_dir, filename_prefix, filename_suffix,
-                                  sample_rate=sample_rate)
+                                  sample_rate=sample_rate, onset_time=self._onset_time)
             self._reset()
         self._was_enabled = enabled
 
@@ -335,6 +336,8 @@ class ThresholdRecorder:
                 self._state           = self._PENDING
                 self._pending_chunks  = [chunk.copy()]
                 self._pending_samples = len(chunk)
+                # Capture precise onset: this chunk is the first above threshold
+                self._onset_time      = datetime.datetime.now()
             else:
                 self._pre_trig_deque.append(chunk.copy())
 
@@ -345,6 +348,10 @@ class ThresholdRecorder:
                 if self._pending_samples >= min_cross_samps:
                     self._state        = self._RECORDING
                     self._buf          = list(self._pre_trig_deque) + self._pending_chunks
+                    # Adjust onset for pre-trigger samples
+                    pre_trig_samples = sum(len(c) for c in self._pre_trig_deque)
+                    self._onset_time -= datetime.timedelta(
+                        seconds=pre_trig_samples / sample_rate)
                     self._pending_chunks  = []
                     self._pending_samples = 0
                     self._silent_count = 0
@@ -362,15 +369,16 @@ class ThresholdRecorder:
                 self._silent_count += len(chunk)
                 if self._silent_count >= hold_samps:
                     self._start_flush(self._buf, output_dir, filename_prefix, filename_suffix,
-                                      sample_rate=sample_rate)
+                                      sample_rate=sample_rate, onset_time=self._onset_time)
                     self._reset()
             else:
                 self._silent_count = 0
 
             if self._state == self._RECORDING and len(self._buf) > max_chunks:
                 self._start_flush(self._buf, output_dir, filename_prefix, filename_suffix,
-                                  sample_rate=sample_rate)
+                                  sample_rate=sample_rate, onset_time=self._onset_time)
                 self._buf = []
+                self._onset_time = datetime.datetime.now()  # new segment starts now
 
     def _reset(self):
         self._state           = self._IDLE
@@ -378,6 +386,7 @@ class ThresholdRecorder:
         self._pending_chunks  = []
         self._pending_samples = 0
         self._silent_count    = 0
+        self._onset_time      = None
         self._pre_trig_deque.clear()
 
     @property
@@ -386,16 +395,18 @@ class ThresholdRecorder:
 
     @staticmethod
     def _start_flush(buf_snapshot: list, output_dir: str,
-                     prefix: str = '', suffix: str = '', sample_rate: int = SAMPLE_RATE):
+                     prefix: str = '', suffix: str = '', sample_rate: int = SAMPLE_RATE,
+                     onset_time=None):
         threading.Thread(
             target=ThresholdRecorder._write_wav,
-            args=(list(buf_snapshot), output_dir, prefix, suffix, sample_rate),
+            args=(list(buf_snapshot), output_dir, prefix, suffix, sample_rate, onset_time),
             daemon=True,
         ).start()
 
     @staticmethod
     def _write_wav(buf_snapshot: list, output_dir: str,
-                   prefix: str = '', suffix: str = '', sample_rate: int = SAMPLE_RATE):
+                   prefix: str = '', suffix: str = '', sample_rate: int = SAMPLE_RATE,
+                   onset_time=None):
         audio = np.concatenate(buf_snapshot)
         if audio.ndim == 1:
             audio = audio.flatten()
@@ -403,7 +414,10 @@ class ThresholdRecorder:
         os.makedirs(output_dir, exist_ok=True)
         n_samples = audio.shape[0]
         audio_dur = n_samples / sample_rate
-        onset = datetime.datetime.now() - datetime.timedelta(seconds=audio_dur)
+        if onset_time is not None:
+            onset = onset_time
+        else:
+            onset = datetime.datetime.now() - datetime.timedelta(seconds=audio_dur)
         epoch_ms = int(onset.timestamp() * 1000)
         local_ts = onset.strftime('%Y%m%d_%H%M%S_%f')[:-3]
         parts = [p for p in [prefix.rstrip('_'), str(epoch_ms), local_ts, suffix.lstrip('_')] if p]
@@ -496,6 +510,17 @@ class RecordingEntity:
         self.freq_map_frac      = None
         self.display_freqs      = None
         self.rebuild_freq_mapping()
+
+    # ── Display reset ────────────────────────────────────────────────────
+
+    def reset_display(self):
+        """Clear display buffers and reset write heads. Does NOT affect recording/triggering."""
+        self.amp_buffer[:]    = 0.0
+        self.amp_buffer_r[:]  = 0.0
+        self.spec_buffer[:]   = SPEC_DB_MIN
+        self.spec_buffer_r[:] = SPEC_DB_MIN
+        self.write_head = 0
+        self.col_head   = 0
 
     # ── Freq mapping ──────────────────────────────────────────────────────
 
@@ -2337,6 +2362,8 @@ class ChirpWindow(QMainWindow):
     def _on_start_acq(self):
         e = self._sel
         if e:
+            for ent in self._entities:
+                ent.reset_display()
             e.start_acq()
             self._refresh_transport_ui()
 
@@ -2359,6 +2386,8 @@ class ChirpWindow(QMainWindow):
             self._refresh_transport_ui()
 
     def _on_start_all_acq(self):
+        for e in self._entities:
+            e.reset_display()
         for e in self._entities:
             e.start_acq()
         self._refresh_transport_ui()
