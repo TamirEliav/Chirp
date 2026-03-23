@@ -4,6 +4,9 @@ __pycache__/
 recordings/
 *.chirp
 *.saprec
+build/
+dist/
+*.spec
 .env
 .claude/
 .vscode/
