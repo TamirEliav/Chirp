@@ -3214,6 +3214,16 @@ class ChirpWindow(QMainWindow):
     # ──────────────────────────────────────────────────────────────────────
 
     def closeEvent(self, event):
+        active = any(e.acq_running or e.rec_enabled for e in self._entities)
+        if active:
+            reply = QMessageBox.warning(
+                self, 'Chirp',
+                'Acquisition or recording is still running.\n'
+                'Are you sure you want to quit?',
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                event.ignore()
+                return
         self._timer.stop()
         for e in self._entities:
             e.close()
