@@ -46,9 +46,9 @@ N_DISPLAY_ROWS      = 256
 
 # ── Recording defaults ─────────────────────────────────────────────────────────
 DEFAULT_THRESHOLD   = 0.05
-DEFAULT_MIN_CROSS   = 0.20
-DEFAULT_HOLD        = 0.50
-DEFAULT_MAX_REC     = 10.0
+DEFAULT_MIN_CROSS   = 0.10
+DEFAULT_HOLD        = 1.00
+DEFAULT_MAX_REC     = 60.0
 DEFAULT_PRE_TRIG    = 1.00
 RECORDINGS_DIR      = './recordings'
 DEFAULT_FREQ_LO     = 1000.0
@@ -163,7 +163,7 @@ QCheckBox {{ spacing: 6px; color: {C['text']}; }}
 QCheckBox::indicator {{ width: 16px; height: 16px; border: 1px solid {C['surface1']}; border-radius: 3px; background: {C['mantle']}; }}
 QCheckBox::indicator:checked {{ background: {C['mauve']}; border-color: {C['mauve']}; }}
 QCheckBox::indicator:hover {{ border-color: {C['blue']}; }}
-QLabel#param_label {{ color: {C['subtext']}; min-width: 90px; font-size: 9pt; }}
+QLabel#param_label {{ color: {C['subtext']}; font-size: 9pt; }}
 QLabel#status_on   {{ color: {C['green']}; font-weight: bold; font-size: 10pt; }}
 QLabel#status_off  {{ color: {C['surface2']};              font-size: 10pt; }}
 QLabel#trig_active {{ color: {C['red']};   font-weight: bold; font-size: 10pt; }}
@@ -401,14 +401,15 @@ class ThresholdRecorder:
             audio = audio.flatten()
         pcm16 = (audio * 32767.0).clip(-32768, 32767).astype(np.int16)
         os.makedirs(output_dir, exist_ok=True)
-        now   = datetime.datetime.now()
-        epoch_ms = int(now.timestamp() * 1000)
-        local_ts = now.strftime('%Y%m%d_%H%M%S_%f')[:-3]
+        n_samples = audio.shape[0]
+        audio_dur = n_samples / sample_rate
+        onset = datetime.datetime.now() - datetime.timedelta(seconds=audio_dur)
+        epoch_ms = int(onset.timestamp() * 1000)
+        local_ts = onset.strftime('%Y%m%d_%H%M%S_%f')[:-3]
         parts = [p for p in [prefix.rstrip('_'), str(epoch_ms), local_ts, suffix.lstrip('_')] if p]
         fname = '_'.join(parts) + '.wav'
         path  = os.path.join(output_dir, fname)
         scipy.io.wavfile.write(path, sample_rate, pcm16)
-        n_samples = audio.shape[0]
         ch_str = 'stereo' if audio.ndim == 2 else 'mono'
         print(f'[REC] saved {path}  ({n_samples/sample_rate:.2f} s, {ch_str})')
 
@@ -1473,14 +1474,35 @@ class ChirpWindow(QMainWindow):
 
         # Config panels — store refs for hide/show in view mode
         self._config_widgets: list[QWidget] = []
-        for builder in (self._build_transport, self._build_params,
-                        self._build_spec_params, self._build_settings):
-            hl = self._hline()
-            panel = builder()
-            vbox.addWidget(hl)
-            vbox.addWidget(panel)
-            self._config_widgets.append(hl)
-            self._config_widgets.append(panel)
+
+        # Row 1: transport
+        hl = self._hline()
+        transport = self._build_transport()
+        vbox.addWidget(hl)
+        vbox.addWidget(transport)
+        self._config_widgets.extend([hl, transport])
+
+        # Row 2: trigger params + display side by side
+        hl2 = self._hline()
+        params_panel = self._build_params()
+        spec_panel = self._build_spec_params()
+        combined = QWidget()
+        combined.setStyleSheet(f'background-color: {C["mantle"]};')
+        combined_h = QHBoxLayout(combined)
+        combined_h.setContentsMargins(0, 0, 0, 0)
+        combined_h.setSpacing(0)
+        combined_h.addWidget(params_panel, stretch=1)
+        combined_h.addWidget(spec_panel, stretch=1)
+        vbox.addWidget(hl2)
+        vbox.addWidget(combined)
+        self._config_widgets.extend([hl2, combined])
+
+        # Row 3: settings (output folder, filename, device)
+        hl3 = self._hline()
+        settings = self._build_settings()
+        vbox.addWidget(hl3)
+        vbox.addWidget(settings)
+        self._config_widgets.extend([hl3, settings])
 
         hbox.addWidget(right, stretch=1)
 
@@ -1632,32 +1654,33 @@ class ChirpWindow(QMainWindow):
         self._sb_thr.setValue(DEFAULT_THRESHOLD)
         self._sb_thr.hide()
 
-        # Timing group
-        time_box = QGroupBox('TRIGGER TIMING')
-        time_g   = QGridLayout(time_box)
-        time_g.setVerticalSpacing(8)
-        time_g.setHorizontalSpacing(10)
+        _TRIG_SCALE = 10  # slider integer ticks per second
 
-        self._sb_mc = self._spinbox_row(time_g, 0, 0, 'Min Cross',
-            sb_min=0.0, sb_max=60.0, sb_step=0.1, sb_dec=2,
-            suffix=' s', init=DEFAULT_MIN_CROSS)
-        self._sb_hold = self._spinbox_row(time_g, 0, 2, 'Hold',
-            sb_min=0.0, sb_max=60.0, sb_step=0.1, sb_dec=2,
-            suffix=' s', init=DEFAULT_HOLD)
-        self._sb_maxr = self._spinbox_row(time_g, 1, 0, 'Max Rec',
-            sb_min=1.0, sb_max=3600.0, sb_step=1.0, sb_dec=1,
-            suffix=' s', init=DEFAULT_MAX_REC)
-        self._sb_pre = self._spinbox_row(time_g, 1, 2, 'Pre-Trigger',
-            sb_min=0.0, sb_max=60.0, sb_step=0.1, sb_dec=2,
-            suffix=' s', init=DEFAULT_PRE_TRIG)
+        trig_box = QGroupBox('TRIGGER')
+        trig_g   = QGridLayout(trig_box)
+        trig_g.setVerticalSpacing(8)
+        trig_g.setHorizontalSpacing(10)
+        trig_g.setColumnStretch(1, 3)
 
-        # Freq filter group
-        freq_box = QGroupBox('TRIGGER BAND FILTER')
-        freq_g   = QGridLayout(freq_box)
-        freq_g.setVerticalSpacing(8)
-        freq_g.setHorizontalSpacing(10)
+        self._sl_mc, self._sb_mc = self._param_row(trig_g, 0, 0, 'Min Cross',
+            sl_min=0, sl_max=600, sl_init=int(DEFAULT_MIN_CROSS * _TRIG_SCALE),
+            sb_min=0.0, sb_max=60.0, sb_step=0.1, sb_dec=2, suffix=' s',
+            scale=_TRIG_SCALE)
+        self._sl_hold, self._sb_hold = self._param_row(trig_g, 1, 0, 'Hold',
+            sl_min=0, sl_max=600, sl_init=int(DEFAULT_HOLD * _TRIG_SCALE),
+            sb_min=0.0, sb_max=60.0, sb_step=0.1, sb_dec=2, suffix=' s',
+            scale=_TRIG_SCALE)
+        self._sl_maxr, self._sb_maxr = self._param_row(trig_g, 2, 0, 'Max Rec',
+            sl_min=10, sl_max=36000, sl_init=int(DEFAULT_MAX_REC * _TRIG_SCALE),
+            sb_min=1.0, sb_max=3600.0, sb_step=1.0, sb_dec=1, suffix=' s',
+            scale=_TRIG_SCALE)
+        self._sl_pre, self._sb_pre = self._param_row(trig_g, 3, 0, 'Pre-Trigger',
+            sl_min=0, sl_max=600, sl_init=int(DEFAULT_PRE_TRIG * _TRIG_SCALE),
+            sb_min=0.0, sb_max=60.0, sb_step=0.1, sb_dec=2, suffix=' s',
+            scale=_TRIG_SCALE)
 
-        self._chk_freq = QCheckBox('Enable')
+        # Band filter row (row 4)
+        self._chk_freq = QCheckBox('Band filter')
         self._chk_freq.setChecked(False)
 
         self._sb_freq_lo = QDoubleSpinBox()
@@ -1687,34 +1710,21 @@ class ChirpWindow(QMainWindow):
         lbl_lo.setObjectName('param_label')
         lbl_hi = QLabel('Hi')
         lbl_hi.setObjectName('param_label')
-        freq_g.addWidget(self._chk_freq,     0, 0)
-        freq_g.addWidget(lbl_lo,             0, 1)
-        freq_g.addWidget(self._sb_freq_lo,   0, 2)
-        freq_g.addWidget(lbl_hi,             0, 3)
-        freq_g.addWidget(self._sb_freq_hi,   0, 4)
 
-        outer.addWidget(time_box, stretch=2)
-        outer.addWidget(freq_box, stretch=1)
+        filt_row = QHBoxLayout()
+        filt_row.setSpacing(8)
+        filt_row.addWidget(self._chk_freq)
+        filt_row.addWidget(lbl_lo)
+        filt_row.addWidget(self._sb_freq_lo)
+        filt_row.addWidget(lbl_hi)
+        filt_row.addWidget(self._sb_freq_hi)
+        filt_row.addStretch()
+        trig_g.addLayout(filt_row, 4, 0, 1, 3)
+
+        outer.addWidget(trig_box)
         return w
 
-    def _spinbox_row(self, grid, row, col, label, *,
-                     sb_min, sb_max, sb_step, sb_dec, suffix, init) -> QDoubleSpinBox:
-        lbl = QLabel(label)
-        lbl.setObjectName('param_label')
-        lbl.setFixedWidth(70)
-        sb = QDoubleSpinBox()
-        sb.setRange(sb_min, sb_max)
-        sb.setSingleStep(sb_step)
-        sb.setDecimals(sb_dec)
-        sb.setValue(init)
-        sb.setSuffix(suffix)
-        sb.setFixedWidth(100)
-        sb.setAlignment(Qt.AlignRight)
-        grid.addWidget(lbl, row, col)
-        grid.addWidget(sb,  row, col + 1)
-        return sb
-
-    # ── Spectrogram display parameters ────────────────────────────────────
+    # ── Display parameters ───────────────────────────────────────────────
 
     def _build_spec_params(self) -> QWidget:
         w = QWidget()
@@ -1722,12 +1732,22 @@ class ChirpWindow(QMainWindow):
         outer = QHBoxLayout(w)
         outer.setContentsMargins(14, 6, 14, 6)
 
-        box  = QGroupBox('SPECTROGRAM DISPLAY')
+        box  = QGroupBox('DISPLAY')
         grid = QGridLayout(box)
         grid.setVerticalSpacing(8)
         grid.setHorizontalSpacing(10)
         grid.setColumnStretch(1, 3)
         grid.setColumnStretch(4, 1)
+
+        lbl_buf = QLabel('Buffer')
+        lbl_buf.setObjectName('param_label')
+        lbl_buf.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        self._buf_combo = QComboBox()
+        for s in RecordingEntity.SUPPORTED_DISPLAY_SECONDS:
+            label = f'{int(s)}s' if s == int(s) else f'{s}s'
+            self._buf_combo.addItem(label, userData=s)
+        self._buf_combo.setCurrentText(f'{int(DISPLAY_SECONDS)}s')
+        self._buf_combo.setFixedWidth(90)
 
         self._sl_gain, self._sb_gain = self._param_row(grid, 0, 0, 'Gain',
             sl_min=-200, sl_max=600, sl_init=0,
@@ -1746,7 +1766,7 @@ class ChirpWindow(QMainWindow):
 
         lbl_fft = QLabel('FFT')
         lbl_fft.setObjectName('param_label')
-        lbl_fft.setFixedWidth(55)
+        lbl_fft.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
         self._combo_fft = QComboBox()
         self._combo_fft.setFixedWidth(90)
         for sz in SpectrogramAccumulator.FFT_SIZES:
@@ -1755,7 +1775,7 @@ class ChirpWindow(QMainWindow):
 
         lbl_win = QLabel('Win')
         lbl_win.setObjectName('param_label')
-        lbl_win.setFixedWidth(55)
+        lbl_win.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
         self._combo_win = QComboBox()
         self._combo_win.setFixedWidth(90)
         for wn in SpectrogramAccumulator.WINDOW_TYPES:
@@ -1764,7 +1784,7 @@ class ChirpWindow(QMainWindow):
 
         lbl_fscale = QLabel('Scale')
         lbl_fscale.setObjectName('param_label')
-        lbl_fscale.setFixedWidth(55)
+        lbl_fscale.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
         self._combo_fscale = QComboBox()
         self._combo_fscale.setFixedWidth(90)
         self._combo_fscale.addItems(['Linear', 'Log', 'Mel'])
@@ -1772,7 +1792,7 @@ class ChirpWindow(QMainWindow):
 
         lbl_dfl = QLabel('Lo')
         lbl_dfl.setObjectName('param_label')
-        lbl_dfl.setFixedWidth(55)
+        lbl_dfl.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
         self._sb_disp_freq_lo = QDoubleSpinBox()
         self._sb_disp_freq_lo.setRange(0.0, SAMPLE_RATE / 2 - 1)
         self._sb_disp_freq_lo.setValue(0.0)
@@ -1783,7 +1803,7 @@ class ChirpWindow(QMainWindow):
 
         lbl_dfh = QLabel('Hi')
         lbl_dfh.setObjectName('param_label')
-        lbl_dfh.setFixedWidth(55)
+        lbl_dfh.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
         self._sb_disp_freq_hi = QDoubleSpinBox()
         self._sb_disp_freq_hi.setRange(1.0, SAMPLE_RATE / 2)
         self._sb_disp_freq_hi.setValue(SAMPLE_RATE / 2)
@@ -1802,9 +1822,11 @@ class ChirpWindow(QMainWindow):
         grid.addWidget(self._sb_disp_freq_lo,  3, 4)
         grid.addWidget(lbl_dfh,            4, 3)
         grid.addWidget(self._sb_disp_freq_hi,  4, 4)
+        grid.addWidget(lbl_buf,            5, 3)
+        grid.addWidget(self._buf_combo,    5, 4)
 
         self._chk_shared_spec = QCheckBox('Sync across all recordings')
-        grid.addWidget(self._chk_shared_spec, 5, 0, 1, 5)
+        grid.addWidget(self._chk_shared_spec, 6, 0, 1, 5)
 
         outer.addWidget(box)
         return w
@@ -1815,7 +1837,7 @@ class ChirpWindow(QMainWindow):
                    scale) -> tuple:
         lbl = QLabel(label)
         lbl.setObjectName('param_label')
-        lbl.setFixedWidth(90)
+        lbl.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
 
         sl = QSlider(Qt.Horizontal)
         sl.setRange(sl_min, sl_max)
@@ -1858,69 +1880,18 @@ class ChirpWindow(QMainWindow):
         outer.setContentsMargins(14, 6, 14, 10)
         outer.setSpacing(20)
 
-        folder_box = QGroupBox('OUTPUT FOLDER')
-        folder_h   = QHBoxLayout(folder_box)
-        folder_h.setSpacing(10)
+        output_box = QGroupBox('OUTPUT')
+        output_g   = QGridLayout(output_box)
+        output_g.setVerticalSpacing(4)
+        output_g.setHorizontalSpacing(6)
+        lbl_folder = QLabel('Folder')
+        lbl_folder.setObjectName('param_label')
         self._folder_edit = QLineEdit(RECORDINGS_DIR)
         self._folder_edit.setPlaceholderText('Path to recordings folder...')
         btn_browse = QPushButton('Browse...')
         btn_browse.setObjectName('btn_browse')
-        btn_browse.setFixedWidth(90)
+        btn_browse.setFixedWidth(70)
         btn_browse.clicked.connect(self._on_browse)
-        folder_h.addWidget(self._folder_edit, stretch=1)
-        folder_h.addWidget(btn_browse)
-
-        device_box = QGroupBox('INPUT DEVICE / CHANNEL')
-        device_g   = QGridLayout(device_box)
-        device_g.setVerticalSpacing(6)
-        device_g.setHorizontalSpacing(10)
-        self._device_combo = QComboBox()
-        self._device_combo.setMinimumWidth(200)
-        self._populate_device_combo()
-        btn_refresh = QPushButton('Refresh')
-        btn_refresh.setObjectName('btn_browse')
-        btn_refresh.setFixedWidth(70)
-        btn_refresh.clicked.connect(self._on_refresh_devices)
-        lbl_ch = QLabel('Mode')
-        lbl_ch.setObjectName('param_label')
-        self._chan_combo = QComboBox()
-        self._chan_combo.addItems(['Mono', 'Left', 'Right', 'Stereo'])
-        self._chan_combo.setCurrentIndex(0)
-        lbl_trig = QLabel('Trigger')
-        lbl_trig.setObjectName('param_label')
-        self._trig_combo = QComboBox()
-        self._trig_combo.addItems(['Average', 'Any Channel', 'Both Channels'])
-        self._trig_combo.setCurrentIndex(0)
-        self._trig_combo.setEnabled(False)
-        device_g.addWidget(self._device_combo, 0, 0, 1, 3)
-        device_g.addWidget(btn_refresh,        0, 3)
-        lbl_sr = QLabel('Rate')
-        lbl_sr.setObjectName('param_label')
-        self._sr_combo = QComboBox()
-        for r in RecordingEntity.SUPPORTED_RATES:
-            self._sr_combo.addItem(f'{r} Hz', userData=r)
-        self._sr_combo.setCurrentText(f'{SAMPLE_RATE} Hz')
-        self._sr_combo.setFixedWidth(90)
-        lbl_buf = QLabel('Buffer')
-        lbl_buf.setObjectName('param_label')
-        self._buf_combo = QComboBox()
-        for s in RecordingEntity.SUPPORTED_DISPLAY_SECONDS:
-            label = f'{int(s)}s' if s == int(s) else f'{s}s'
-            self._buf_combo.addItem(label, userData=s)
-        self._buf_combo.setCurrentText(f'{int(DISPLAY_SECONDS)}s')
-        self._buf_combo.setFixedWidth(70)
-        device_g.addWidget(lbl_ch,             1, 0)
-        device_g.addWidget(self._chan_combo,    1, 1)
-        device_g.addWidget(lbl_trig,           1, 2)
-        device_g.addWidget(self._trig_combo,   1, 3)
-        device_g.addWidget(lbl_sr,             2, 0)
-        device_g.addWidget(self._sr_combo,     2, 1)
-        device_g.addWidget(lbl_buf,            2, 2)
-        device_g.addWidget(self._buf_combo,    2, 3)
-
-        fname_box = QGroupBox('FILENAME')
-        fname_g   = QGridLayout(fname_box)
-        fname_g.setSpacing(6)
         lbl_pfx = QLabel('Prefix')
         lbl_pfx.setObjectName('param_label')
         self._prefix_edit = QLineEdit()
@@ -1929,38 +1900,84 @@ class ChirpWindow(QMainWindow):
         lbl_sfx.setObjectName('param_label')
         self._suffix_edit = QLineEdit()
         self._suffix_edit.setPlaceholderText('e.g. _cage3')
-        fname_g.addWidget(lbl_pfx,           0, 0)
-        fname_g.addWidget(self._prefix_edit, 0, 1)
-        fname_g.addWidget(lbl_sfx,           1, 0)
-        fname_g.addWidget(self._suffix_edit, 1, 1)
+        output_g.addWidget(lbl_folder,          0, 0)
+        output_g.addWidget(self._folder_edit,   0, 1, 1, 3)
+        output_g.addWidget(btn_browse,          0, 4)
+        output_g.addWidget(lbl_pfx,             1, 0)
+        output_g.addWidget(self._prefix_edit,   1, 1)
+        output_g.addWidget(lbl_sfx,             1, 2)
+        output_g.addWidget(self._suffix_edit,   1, 3)
+        output_g.setColumnStretch(1, 1)
+        output_g.setColumnStretch(3, 1)
+
+        device_box = QGroupBox('INPUT DEVICE')
+        device_v   = QVBoxLayout(device_box)
+        device_v.setSpacing(4)
+        dev_row1 = QHBoxLayout()
+        dev_row1.setSpacing(4)
+        self._device_combo = QComboBox()
+        self._device_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._populate_device_combo()
+        btn_refresh = QPushButton('Refresh')
+        btn_refresh.setObjectName('btn_browse')
+        btn_refresh.setFixedWidth(60)
+        btn_refresh.clicked.connect(self._on_refresh_devices)
+        dev_row1.addWidget(self._device_combo, stretch=1)
+        dev_row1.addWidget(btn_refresh)
+        dev_row2 = QHBoxLayout()
+        dev_row2.setSpacing(4)
+        lbl_ch = QLabel('Mode')
+        self._chan_combo = QComboBox()
+        self._chan_combo.addItems(['Mono', 'Left', 'Right', 'Stereo'])
+        self._chan_combo.setCurrentIndex(0)
+        lbl_trig = QLabel('Trigger')
+        self._trig_combo = QComboBox()
+        self._trig_combo.addItems(['Average', 'Any Channel', 'Both Channels'])
+        self._trig_combo.setCurrentIndex(0)
+        self._trig_combo.setEnabled(False)
+        lbl_sr = QLabel('Rate')
+        self._sr_combo = QComboBox()
+        for r in RecordingEntity.SUPPORTED_RATES:
+            self._sr_combo.addItem(f'{r} Hz', userData=r)
+        self._sr_combo.setCurrentText(f'{SAMPLE_RATE} Hz')
+        self._sr_combo.setFixedWidth(90)
+        for lbl in (lbl_ch, lbl_trig, lbl_sr):
+            lbl.setStyleSheet(f'color: {C["subtext"]}; font-size: 9pt;')
+        dev_row2.addWidget(lbl_ch)
+        dev_row2.addWidget(self._chan_combo)
+        dev_row2.addSpacing(8)
+        dev_row2.addWidget(lbl_trig)
+        dev_row2.addWidget(self._trig_combo)
+        dev_row2.addSpacing(8)
+        dev_row2.addWidget(lbl_sr)
+        dev_row2.addWidget(self._sr_combo)
+        dev_row2.addStretch()
+        device_v.addLayout(dev_row1)
+        device_v.addLayout(dev_row2)
 
         ref_box = QGroupBox('REFERENCE DATE')
         ref_g   = QGridLayout(ref_box)
-        ref_g.setSpacing(6)
+        ref_g.setVerticalSpacing(4)
+        ref_g.setHorizontalSpacing(6)
         self._chk_ref_date = QCheckBox('Days post hatch')
         self._date_line = QLineEdit(datetime.date.today().strftime('%Y-%m-%d'))
         self._date_line.setPlaceholderText('YYYY-MM-DD')
-        self._date_line.setMinimumWidth(100)
-        self._date_line.setEnabled(False)
+        self._date_line.setFixedWidth(90)
         self._btn_pick_date = QPushButton('\u2026')
         self._btn_pick_date.setObjectName('btn_small')
         self._btn_pick_date.setFixedSize(28, 28)
-        self._btn_pick_date.setEnabled(False)
         self._lbl_day_count = QLabel('Day: —')
-        self._lbl_day_count.setObjectName('param_label')
+        self._lbl_day_count.setStyleSheet(f'color: {C["yellow"]}; font-size: 9pt; font-weight: bold;')
         lbl_dph_pfx = QLabel('Folder prefix')
         lbl_dph_pfx.setObjectName('param_label')
         self._dph_prefix_edit = QLineEdit()
         self._dph_prefix_edit.setPlaceholderText('e.g. day_')
-        self._dph_prefix_edit.setEnabled(False)
-        self._chk_ref_date.toggled.connect(self._date_line.setEnabled)
-        self._chk_ref_date.toggled.connect(self._btn_pick_date.setEnabled)
-        self._chk_ref_date.toggled.connect(self._dph_prefix_edit.setEnabled)
         date_row = QHBoxLayout()
         date_row.setSpacing(4)
-        date_row.addWidget(self._date_line, stretch=1)
+        date_row.addWidget(self._date_line)
         date_row.addWidget(self._btn_pick_date)
         date_row.addWidget(self._lbl_day_count)
+        date_row.addStretch()
         pfx_row = QHBoxLayout()
         pfx_row.setSpacing(4)
         pfx_row.addWidget(lbl_dph_pfx)
@@ -1969,10 +1986,9 @@ class ChirpWindow(QMainWindow):
         ref_g.addLayout(date_row,            1, 0)
         ref_g.addLayout(pfx_row,             2, 0)
 
-        outer.addWidget(folder_box, stretch=3)
-        outer.addWidget(fname_box, stretch=1)
-        outer.addWidget(ref_box, stretch=1)
-        outer.addWidget(device_box, stretch=2)
+        outer.addWidget(output_box, stretch=10)
+        outer.addWidget(ref_box, stretch=3)
+        outer.addWidget(device_box, stretch=5)
         return w
 
     # ──────────────────────────────────────────────────────────────────────
@@ -2017,9 +2033,13 @@ class ChirpWindow(QMainWindow):
         self._sb_freq_hi.valueChanged  .connect(self._on_freq_filter_param)
 
         # Trigger params write-through
+        self._sl_mc  .valueChanged.connect(lambda _: self._write_trigger_params())
         self._sb_mc  .valueChanged.connect(lambda _: self._write_trigger_params())
+        self._sl_hold.valueChanged.connect(lambda _: self._write_trigger_params())
         self._sb_hold.valueChanged.connect(lambda _: self._write_trigger_params())
+        self._sl_maxr.valueChanged.connect(lambda _: self._write_trigger_params())
         self._sb_maxr.valueChanged.connect(lambda _: self._write_trigger_params())
+        self._sl_pre .valueChanged.connect(lambda _: self._write_trigger_params())
         self._sb_pre .valueChanged.connect(lambda _: self._write_trigger_params())
 
         # Spectrogram display write-through
@@ -2137,11 +2157,16 @@ class ChirpWindow(QMainWindow):
             widget.setValue(val)
             widget.blockSignals(False)
 
+        _TRIG_SCALE = 10
         _set(self._sb_thr,  e.threshold)
         _set(self._sb_mc,   e.min_cross_sec)
+        _set(self._sl_mc,   int(round(e.min_cross_sec * _TRIG_SCALE)))
         _set(self._sb_hold, e.hold_sec)
+        _set(self._sl_hold, int(round(e.hold_sec * _TRIG_SCALE)))
         _set(self._sb_maxr, e.max_rec_sec)
+        _set(self._sl_maxr, int(round(e.max_rec_sec * _TRIG_SCALE)))
         _set(self._sb_pre,  e.pre_trig_sec)
+        _set(self._sl_pre,  int(round(e.pre_trig_sec * _TRIG_SCALE)))
 
         self._chk_freq.blockSignals(True)
         self._chk_freq.setChecked(e.freq_filter_enabled)
