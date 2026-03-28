@@ -26,8 +26,14 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 ### Threshold-Triggered Recording
 - Automatic recording triggered when amplitude crosses a configurable threshold
 - **Pre-trigger buffer** captures audio before the trigger event
-- Adjustable minimum crossing duration, hold time, and maximum recording duration
+- **Hold** bridges gaps between threshold crossings — silent tails are trimmed if no re-crossing occurs
+- **Post-trigger window** extends saved audio by a configurable duration after the last crossing
+- Adjustable minimum crossing duration and maximum recording duration
 - Drag the threshold line directly on the amplitude plot
+
+### Saturation Detection
+- Real-time clipping detection when audio peaks reach ≥ 99% of full scale
+- Amplitude waveform turns **red** to alert on saturation
 
 ### Bandpass Filter
 - Optional Butterworth bandpass filter per stream
@@ -42,7 +48,8 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - **View Mode** — distraction-free monitoring of all streams with adjustable grid columns and panel height
 
 ### Settings Persistence
-- Save and load complete configurations to `.chirp` files
+- **Save** and **Save As** for configuration files (`.json` format)
+- **Load** restores complete configurations (also reads legacy `.chirp` files)
 - All parameters preserved including device names, sample rates, trigger settings, and display options
 
 ### Sync Controls

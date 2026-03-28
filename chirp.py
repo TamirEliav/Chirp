@@ -48,6 +48,7 @@ N_DISPLAY_ROWS      = 256
 DEFAULT_THRESHOLD   = 0.05
 DEFAULT_MIN_CROSS   = 0.10
 DEFAULT_HOLD        = 1.00
+DEFAULT_POST_TRIG   = 0.50
 DEFAULT_MAX_REC     = 60.0
 DEFAULT_PRE_TRIG    = 1.00
 RECORDINGS_DIR      = './recordings'
@@ -298,6 +299,7 @@ class ThresholdRecorder:
         self._pending_chunks: list = []
         self._pending_samples  = 0
         self._silent_count     = 0
+        self._last_above_idx   = 0     # index in _buf of last above-threshold chunk
         self._was_enabled      = False
         self._pre_trig_deque   = collections.deque(maxlen=1)
         self._pre_trig_maxlen  = 1
@@ -306,6 +308,7 @@ class ThresholdRecorder:
     def process_chunk(self, chunk: np.ndarray, *,
                       trigger_peak: float,
                       threshold: float, min_cross_sec: float, hold_sec: float,
+                      post_trig_sec: float,
                       max_rec_sec: float, pre_trig_sec: float,
                       output_dir: str, enabled: bool,
                       filename_prefix: str = '', filename_suffix: str = '',
@@ -365,14 +368,18 @@ class ThresholdRecorder:
 
         elif self._state == self._RECORDING:
             self._buf.append(chunk.copy())
-            if trigger_peak < threshold:
+            if trigger_peak >= threshold:
+                self._silent_count = 0
+                self._last_above_idx = len(self._buf) - 1
+            else:
                 self._silent_count += len(chunk)
                 if self._silent_count >= hold_samps:
-                    self._start_flush(self._buf, output_dir, filename_prefix, filename_suffix,
-                                      sample_rate=sample_rate, onset_time=self._onset_time)
+                    post_trig_chunks = max(0, int(post_trig_sec * sample_rate / CHUNK_FRAMES))
+                    trim_end = min(self._last_above_idx + 1 + post_trig_chunks, len(self._buf))
+                    self._start_flush(self._buf[:trim_end], output_dir, filename_prefix,
+                                      filename_suffix, sample_rate=sample_rate,
+                                      onset_time=self._onset_time)
                     self._reset()
-            else:
-                self._silent_count = 0
 
             if self._state == self._RECORDING and len(self._buf) > max_chunks:
                 self._start_flush(self._buf, output_dir, filename_prefix, filename_suffix,
@@ -386,6 +393,7 @@ class ThresholdRecorder:
         self._pending_chunks  = []
         self._pending_samples = 0
         self._silent_count    = 0
+        self._last_above_idx  = 0
         self._onset_time      = None
         self._pre_trig_deque.clear()
 
@@ -442,9 +450,9 @@ class RecordingEntity:
         self.sample_rate = sample_rate
         self.display_seconds = float(display_seconds)
 
-        # Derived sizes
-        self._total_samples = int(self.display_seconds * self.sample_rate)
-        self._n_cols        = int(self.display_seconds * self.sample_rate / CHUNK_FRAMES)
+        # Derived sizes — n_cols is authoritative; total_samples derived from it to keep sync
+        self._n_cols        = max(1, int(self.display_seconds * self.sample_rate / CHUNK_FRAMES))
+        self._total_samples = self._n_cols * CHUNK_FRAMES
 
         # Device / channel
         self.device_id    = device_id
@@ -464,6 +472,7 @@ class RecordingEntity:
         self.threshold     = DEFAULT_THRESHOLD
         self.min_cross_sec = DEFAULT_MIN_CROSS
         self.hold_sec      = DEFAULT_HOLD
+        self.post_trig_sec = DEFAULT_POST_TRIG
         self.max_rec_sec   = DEFAULT_MAX_REC
         self.pre_trig_sec  = DEFAULT_PRE_TRIG
         self.freq_filter_enabled = False
@@ -488,9 +497,11 @@ class RecordingEntity:
         self.dph_folder_prefix = ''  # optional prefix for day subfolder name
 
         # Ring buffers
-        self.n_freq_bins  = SPECTROGRAM_NPERSEG // 2 + 1
-        self.amp_buffer   = np.zeros(self._total_samples, dtype=np.float32)
-        self.amp_buffer_r = np.zeros(self._total_samples, dtype=np.float32)
+        self.n_freq_bins    = SPECTROGRAM_NPERSEG // 2 + 1
+        self.amp_buffer     = np.zeros(self._total_samples, dtype=np.float32)
+        self.amp_buffer_r   = np.zeros(self._total_samples, dtype=np.float32)
+        self.abs_amp_buffer   = np.zeros(self._total_samples, dtype=np.float32)
+        self.abs_amp_buffer_r = np.zeros(self._total_samples, dtype=np.float32)
         self.spec_buffer  = np.full(
             (self.n_freq_bins, self._n_cols), SPEC_DB_MIN, dtype=np.float32)
         self.spec_buffer_r = np.full(
@@ -499,7 +510,8 @@ class RecordingEntity:
         self.col_head   = 0
 
         # Display state
-        self.amp_ylim = 1.05  # amplitude y-axis max (persists across mode switches)
+        self.saturated  = False   # True when current chunk contains clipped audio
+        self.amp_ylim   = 1.05    # amplitude y-axis max (persists across mode switches)
 
         # Runtime
         self.acq_running = False
@@ -610,13 +622,15 @@ class RecordingEntity:
                 break
 
         self.sample_rate = new_rate
-        self._total_samples = int(self.display_seconds * new_rate)
-        self._n_cols = int(self.display_seconds * new_rate / CHUNK_FRAMES)
+        self._n_cols        = max(1, int(self.display_seconds * new_rate / CHUNK_FRAMES))
+        self._total_samples = self._n_cols * CHUNK_FRAMES
         self.display_freq_hi = min(self.display_freq_hi, float(new_rate // 2))
 
         # Rebuild buffers
-        self.amp_buffer   = np.zeros(self._total_samples, dtype=np.float32)
-        self.amp_buffer_r = np.zeros(self._total_samples, dtype=np.float32)
+        self.amp_buffer       = np.zeros(self._total_samples, dtype=np.float32)
+        self.amp_buffer_r     = np.zeros(self._total_samples, dtype=np.float32)
+        self.abs_amp_buffer   = np.zeros(self._total_samples, dtype=np.float32)
+        self.abs_amp_buffer_r = np.zeros(self._total_samples, dtype=np.float32)
         self.spec_buffer  = np.full(
             (self.n_freq_bins, self._n_cols), SPEC_DB_MIN, dtype=np.float32)
         self.spec_buffer_r = np.full(
@@ -642,12 +656,14 @@ class RecordingEntity:
         if new_secs == self.display_seconds:
             return
         self.display_seconds = float(new_secs)
-        self._total_samples = int(self.display_seconds * self.sample_rate)
-        self._n_cols = int(self.display_seconds * self.sample_rate / CHUNK_FRAMES)
+        self._n_cols        = max(1, int(self.display_seconds * self.sample_rate / CHUNK_FRAMES))
+        self._total_samples = self._n_cols * CHUNK_FRAMES
 
         # Rebuild buffers
-        self.amp_buffer   = np.zeros(self._total_samples, dtype=np.float32)
-        self.amp_buffer_r = np.zeros(self._total_samples, dtype=np.float32)
+        self.amp_buffer       = np.zeros(self._total_samples, dtype=np.float32)
+        self.amp_buffer_r     = np.zeros(self._total_samples, dtype=np.float32)
+        self.abs_amp_buffer   = np.zeros(self._total_samples, dtype=np.float32)
+        self.abs_amp_buffer_r = np.zeros(self._total_samples, dtype=np.float32)
         self.spec_buffer  = np.full(
             (self.n_freq_bins, self._n_cols), SPEC_DB_MIN, dtype=np.float32)
         self.spec_buffer_r = np.full(
@@ -734,24 +750,41 @@ class RecordingEntity:
             amp_l = filt
             amp_r = None
 
+        # Saturation detection (hard clipping in normalized float32)
+        self.saturated = trigger_peak >= 0.99
+
         # Write amplitude buffers (filtered when band filter active)
         if mode == 'Stereo':
+            abs_l = np.abs(amp_l)
+            abs_r = np.abs(amp_r)
             if end <= self._total_samples:
-                self.amp_buffer  [self.write_head:end] = amp_l
-                self.amp_buffer_r[self.write_head:end] = amp_r
+                self.amp_buffer    [self.write_head:end] = amp_l
+                self.amp_buffer_r  [self.write_head:end] = amp_r
+                self.abs_amp_buffer  [self.write_head:end] = abs_l
+                self.abs_amp_buffer_r[self.write_head:end] = abs_r
             else:
                 split = self._total_samples - self.write_head
-                self.amp_buffer  [self.write_head:] = amp_l[:split]
-                self.amp_buffer  [:end % self._total_samples] = amp_l[split:]
-                self.amp_buffer_r[self.write_head:] = amp_r[:split]
-                self.amp_buffer_r[:end % self._total_samples] = amp_r[split:]
+                wrap  = end % self._total_samples
+                self.amp_buffer    [self.write_head:] = amp_l[:split]
+                self.amp_buffer    [:wrap]            = amp_l[split:]
+                self.amp_buffer_r  [self.write_head:] = amp_r[:split]
+                self.amp_buffer_r  [:wrap]            = amp_r[split:]
+                self.abs_amp_buffer  [self.write_head:] = abs_l[:split]
+                self.abs_amp_buffer  [:wrap]            = abs_l[split:]
+                self.abs_amp_buffer_r[self.write_head:] = abs_r[:split]
+                self.abs_amp_buffer_r[:wrap]            = abs_r[split:]
         else:
+            abs_l = np.abs(amp_l)
             if end <= self._total_samples:
-                self.amp_buffer[self.write_head:end] = amp_l
+                self.amp_buffer    [self.write_head:end] = amp_l
+                self.abs_amp_buffer[self.write_head:end] = abs_l
             else:
                 split = self._total_samples - self.write_head
-                self.amp_buffer[self.write_head:] = amp_l[:split]
-                self.amp_buffer[:end % self._total_samples] = amp_l[split:]
+                wrap  = end % self._total_samples
+                self.amp_buffer    [self.write_head:] = amp_l[:split]
+                self.amp_buffer    [:wrap]            = amp_l[split:]
+                self.abs_amp_buffer[self.write_head:] = abs_l[:split]
+                self.abs_amp_buffer[:wrap]            = abs_l[split:]
 
         self.write_head = end % self._total_samples
         self.col_head   = (self.col_head + 1) % self._n_cols
@@ -768,6 +801,7 @@ class RecordingEntity:
             threshold     = self.threshold,
             min_cross_sec = self.min_cross_sec,
             hold_sec      = self.hold_sec,
+            post_trig_sec = self.post_trig_sec,
             max_rec_sec   = self.max_rec_sec,
             pre_trig_sec  = self.pre_trig_sec,
             output_dir    = out_dir,
@@ -780,7 +814,7 @@ class RecordingEntity:
     # ── Mini amplitude for sidebar ────────────────────────────────────────
 
     def get_mini_amplitude(self, n_points: int = 200) -> np.ndarray:
-        buf = np.abs(self.amp_buffer)
+        buf = self.abs_amp_buffer
         if len(buf) < n_points:
             return buf
         chunk_size = len(buf) // n_points
@@ -805,6 +839,7 @@ class RecordingEntity:
             'threshold':           self.threshold,
             'min_cross_sec':       self.min_cross_sec,
             'hold_sec':            self.hold_sec,
+            'post_trig_sec':       self.post_trig_sec,
             'max_rec_sec':         self.max_rec_sec,
             'pre_trig_sec':        self.pre_trig_sec,
             'freq_filter_enabled': self.freq_filter_enabled,
@@ -856,7 +891,7 @@ class RecordingEntity:
 
         # Scalar attributes
         for attr in ('channel_mode', 'trigger_mode', 'threshold',
-                     'min_cross_sec', 'hold_sec', 'max_rec_sec', 'pre_trig_sec',
+                     'min_cross_sec', 'hold_sec', 'post_trig_sec', 'max_rec_sec', 'pre_trig_sec',
                      'freq_filter_enabled', 'freq_lo', 'freq_hi',
                      'freq_scale', 'gain_db', 'db_floor', 'db_ceil',
                      'display_freq_lo', 'display_freq_hi',
@@ -1245,6 +1280,7 @@ class ChirpWindow(QMainWindow):
         self._selected_idx = -1
         self._next_num = 1
         self._dragging = False
+        self._current_config_path: str | None = None
 
         # View mode
         self._view_mode = False
@@ -1346,7 +1382,7 @@ class ChirpWindow(QMainWindow):
             self._spec_im_r = None
             self._cursor_spec_r = None
 
-        ts = int(disp_secs * sr)
+        ts = max(1, int(disp_secs * sr / CHUNK_FRAMES)) * CHUNK_FRAMES
         t_axis = self._get_t_axis(sr, disp_secs)
         (self._amp_line,) = self._ax_amp.plot(
             t_axis, np.zeros(ts),
@@ -1453,8 +1489,9 @@ class ChirpWindow(QMainWindow):
         key = (sr, disp_secs)
         if key != self._t_axis_key:
             self._t_axis_key = key
+            ts = max(1, int(disp_secs * sr / CHUNK_FRAMES)) * CHUNK_FRAMES
             self._t_axis = np.linspace(0.0, disp_secs,
-                                       int(disp_secs * sr),
+                                       ts,
                                        endpoint=False, dtype=np.float32)
         return self._t_axis
 
@@ -1648,15 +1685,17 @@ class ChirpWindow(QMainWindow):
             f'QPushButton:hover {{ background-color: {C["surface1"]}; }}'
         )
 
-        self._btn_save = QPushButton('\U0001f4be Save')
-        self._btn_load = QPushButton('\U0001f4c2 Load')
-        for btn in (self._btn_save, self._btn_load):
+        self._btn_save    = QPushButton('\U0001f4be Save')
+        self._btn_save_as = QPushButton('\U0001f4be Save As')
+        self._btn_load    = QPushButton('\U0001f4c2 Load')
+        for btn in (self._btn_save, self._btn_save_as, self._btn_load):
             btn.setObjectName('btn_browse')
 
         h.addWidget(acq_box)
         h.addWidget(rec_box)
         h.addWidget(self._btn_reset)
         h.addWidget(self._btn_save)
+        h.addWidget(self._btn_save_as)
         h.addWidget(self._btn_load)
         h.addWidget(self._btn_view_mode)
         h.addStretch()
@@ -1695,16 +1734,20 @@ class ChirpWindow(QMainWindow):
             sl_min=0, sl_max=600, sl_init=int(DEFAULT_HOLD * _TRIG_SCALE),
             sb_min=0.0, sb_max=60.0, sb_step=0.1, sb_dec=2, suffix=' s',
             scale=_TRIG_SCALE)
-        self._sl_maxr, self._sb_maxr = self._param_row(trig_g, 2, 0, 'Max Rec',
+        self._sl_post_trig, self._sb_post_trig = self._param_row(trig_g, 2, 0, 'Post-Trigger',
+            sl_min=0, sl_max=600, sl_init=int(DEFAULT_POST_TRIG * _TRIG_SCALE),
+            sb_min=0.0, sb_max=60.0, sb_step=0.1, sb_dec=2, suffix=' s',
+            scale=_TRIG_SCALE)
+        self._sl_maxr, self._sb_maxr = self._param_row(trig_g, 3, 0, 'Max Rec',
             sl_min=10, sl_max=36000, sl_init=int(DEFAULT_MAX_REC * _TRIG_SCALE),
             sb_min=1.0, sb_max=3600.0, sb_step=1.0, sb_dec=1, suffix=' s',
             scale=_TRIG_SCALE)
-        self._sl_pre, self._sb_pre = self._param_row(trig_g, 3, 0, 'Pre-Trigger',
+        self._sl_pre, self._sb_pre = self._param_row(trig_g, 4, 0, 'Pre-Trigger',
             sl_min=0, sl_max=600, sl_init=int(DEFAULT_PRE_TRIG * _TRIG_SCALE),
             sb_min=0.0, sb_max=60.0, sb_step=0.1, sb_dec=2, suffix=' s',
             scale=_TRIG_SCALE)
 
-        # Band filter row (row 4)
+        # Band filter row (row 5)
         self._chk_freq = QCheckBox('Band filter')
         self._chk_freq.setChecked(False)
 
@@ -1744,7 +1787,7 @@ class ChirpWindow(QMainWindow):
         filt_row.addWidget(lbl_hi)
         filt_row.addWidget(self._sb_freq_hi)
         filt_row.addStretch()
-        trig_g.addLayout(filt_row, 4, 0, 1, 3)
+        trig_g.addLayout(filt_row, 5, 0, 1, 3)
 
         outer.addWidget(trig_box)
         return w
@@ -2031,8 +2074,9 @@ class ChirpWindow(QMainWindow):
         self._sidebar.start_all_rec.connect(self._on_start_all_rec)
         self._sidebar.stop_all_rec .connect(self._on_stop_all_rec)
         self._btn_reset    .clicked.connect(self._on_reset_params)
-        self._btn_save     .clicked.connect(self._save_settings)
-        self._btn_load     .clicked.connect(self._load_settings)
+        self._btn_save    .clicked.connect(self._save_settings)
+        self._btn_save_as .clicked.connect(self._save_settings_as)
+        self._btn_load    .clicked.connect(self._load_settings)
         self._btn_view_mode.clicked.connect(self._toggle_view_mode)
 
         # Threshold (hidden spinbox, synced from amplitude graph drag)
@@ -2060,8 +2104,10 @@ class ChirpWindow(QMainWindow):
         # Trigger params write-through
         self._sl_mc  .valueChanged.connect(lambda _: self._write_trigger_params())
         self._sb_mc  .valueChanged.connect(lambda _: self._write_trigger_params())
-        self._sl_hold.valueChanged.connect(lambda _: self._write_trigger_params())
-        self._sb_hold.valueChanged.connect(lambda _: self._write_trigger_params())
+        self._sl_hold     .valueChanged.connect(lambda _: self._write_trigger_params())
+        self._sb_hold     .valueChanged.connect(lambda _: self._write_trigger_params())
+        self._sl_post_trig.valueChanged.connect(lambda _: self._write_trigger_params())
+        self._sb_post_trig.valueChanged.connect(lambda _: self._write_trigger_params())
         self._sl_maxr.valueChanged.connect(lambda _: self._write_trigger_params())
         self._sb_maxr.valueChanged.connect(lambda _: self._write_trigger_params())
         self._sl_pre .valueChanged.connect(lambda _: self._write_trigger_params())
@@ -2104,6 +2150,7 @@ class ChirpWindow(QMainWindow):
             return
         e.min_cross_sec = self._sb_mc.value()
         e.hold_sec      = self._sb_hold.value()
+        e.post_trig_sec = self._sb_post_trig.value()
         e.max_rec_sec   = self._sb_maxr.value()
         e.pre_trig_sec  = self._sb_pre.value()
 
@@ -2147,6 +2194,7 @@ class ChirpWindow(QMainWindow):
         e.threshold     = self._sb_thr.value()
         e.min_cross_sec = self._sb_mc.value()
         e.hold_sec      = self._sb_hold.value()
+        e.post_trig_sec = self._sb_post_trig.value()
         e.max_rec_sec   = self._sb_maxr.value()
         e.pre_trig_sec  = self._sb_pre.value()
         e.freq_filter_enabled = self._chk_freq.isChecked()
@@ -2186,8 +2234,10 @@ class ChirpWindow(QMainWindow):
         _set(self._sb_thr,  e.threshold)
         _set(self._sb_mc,   e.min_cross_sec)
         _set(self._sl_mc,   int(round(e.min_cross_sec * _TRIG_SCALE)))
-        _set(self._sb_hold, e.hold_sec)
-        _set(self._sl_hold, int(round(e.hold_sec * _TRIG_SCALE)))
+        _set(self._sb_hold,      e.hold_sec)
+        _set(self._sl_hold,      int(round(e.hold_sec * _TRIG_SCALE)))
+        _set(self._sb_post_trig, e.post_trig_sec)
+        _set(self._sl_post_trig, int(round(e.post_trig_sec * _TRIG_SCALE)))
         _set(self._sb_maxr, e.max_rec_sec)
         _set(self._sl_maxr, int(round(e.max_rec_sec * _TRIG_SCALE)))
         _set(self._sb_pre,  e.pre_trig_sec)
@@ -2411,11 +2461,12 @@ class ChirpWindow(QMainWindow):
         e = self._sel
         if not e:
             return
-        self._sb_thr .setValue(DEFAULT_THRESHOLD)
-        self._sb_mc  .setValue(DEFAULT_MIN_CROSS)
-        self._sb_hold.setValue(DEFAULT_HOLD)
-        self._sb_maxr.setValue(DEFAULT_MAX_REC)
-        self._sb_pre .setValue(DEFAULT_PRE_TRIG)
+        self._sb_thr      .setValue(DEFAULT_THRESHOLD)
+        self._sb_mc       .setValue(DEFAULT_MIN_CROSS)
+        self._sb_hold     .setValue(DEFAULT_HOLD)
+        self._sb_post_trig.setValue(DEFAULT_POST_TRIG)
+        self._sb_maxr     .setValue(DEFAULT_MAX_REC)
+        self._sb_pre      .setValue(DEFAULT_PRE_TRIG)
         self._chk_freq.setChecked(False)
         self._sb_freq_lo.setValue(DEFAULT_FREQ_LO)
         self._sb_freq_hi.setValue(DEFAULT_FREQ_HI)
@@ -2438,12 +2489,10 @@ class ChirpWindow(QMainWindow):
     # Save / Load settings
     # ──────────────────────────────────────────────────────────────────────
 
-    def _save_settings(self):
-        # Flush current entity so all widget values are captured
+    def _build_settings_data(self) -> dict:
         if self._selected_idx >= 0:
             self._flush_params_to_entity(self._selected_idx)
-
-        data = {
+        return {
             'version': 1,
             'view_mode': {
                 'columns': self._vm_n_cols,
@@ -2452,21 +2501,37 @@ class ChirpWindow(QMainWindow):
             'recordings': [e.to_dict() for e in self._entities],
         }
 
-        path, _ = QFileDialog.getSaveFileName(
-            self, 'Save Settings', '', 'Chirp Settings (*.chirp);;All Files (*)')
-        if not path:
-            return
-        if not path.endswith('.saprec'):
-            path += '.saprec'
+    def _write_settings_to_path(self, path: str, data: dict) -> bool:
         try:
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
+            self._current_config_path = path
+            return True
         except Exception as exc:
             QMessageBox.warning(self, 'Save Error', f'Could not save settings:\n{exc}')
+            return False
+
+    def _save_settings(self):
+        """Save to current path if known, otherwise prompt."""
+        if self._current_config_path:
+            self._write_settings_to_path(self._current_config_path, self._build_settings_data())
+        else:
+            self._save_settings_as()
+
+    def _save_settings_as(self):
+        """Always prompt for a save path."""
+        data = self._build_settings_data()
+        path, _ = QFileDialog.getSaveFileName(
+            self, 'Save Settings', '', 'Chirp Settings (*.json);;All Files (*)')
+        if not path:
+            return
+        if not path.endswith('.json'):
+            path += '.json'
+        self._write_settings_to_path(path, data)
 
     def _load_settings(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, 'Load Settings', '', 'Chirp Settings (*.chirp);;All Files (*)')
+            self, 'Load Settings', '', 'Chirp Settings (*.json *.chirp);;All Files (*)')
         if not path:
             return
         try:
@@ -2539,6 +2604,7 @@ class ChirpWindow(QMainWindow):
         if self._view_mode:
             self._setup_view_mode_axes()
 
+        self._current_config_path = path
         self._timer.start()
 
         if warnings:
@@ -2730,6 +2796,9 @@ class ChirpWindow(QMainWindow):
             e.filename_suffix = self._suffix_edit.text()
 
     def _on_ref_date_toggled(self, on: bool):
+        self._date_line.setEnabled(on)
+        self._btn_pick_date.setEnabled(on)
+        self._dph_prefix_edit.setEnabled(on)
         e = self._sel
         if e:
             if on:
@@ -2767,10 +2836,11 @@ class ChirpWindow(QMainWindow):
             d = datetime.date(qd.year(), qd.month(), qd.day())
             self._date_line.setText(d.strftime('%Y-%m-%d'))
             e = self._sel
-            if e and self._chk_ref_date.isChecked():
+            if e:
                 e.ref_date = d
-                days = (datetime.date.today() - d).days
-                self._lbl_day_count.setText(f'Day: {days}')
+                if self._chk_ref_date.isChecked():
+                    days = (datetime.date.today() - d).days
+                    self._lbl_day_count.setText(f'Day: {days}')
 
     def _on_dph_prefix_changed(self):
         e = self._sel
@@ -3082,15 +3152,7 @@ class ChirpWindow(QMainWindow):
         self._vm_panel_height = val
         self._vm_height_lbl.setText(f'{val}px')
         if self._view_mode:
-            import math
-            n = len(self._entities)
-            cols = min(self._vm_n_cols, max(n, 1))
-            rows = math.ceil(max(n, 1) / cols)
-            self._canvas.setMinimumHeight(max(300, rows * val))
-            self._fig.set_size_inches(
-                self._fig.get_size_inches()[0],
-                max(3, rows * val / self._fig.dpi))
-            self._recapture_bg()
+            self._setup_view_mode_axes()
 
     def _update_plot_view_mode(self):
         """Update all entity displays in view mode (blitting)."""
@@ -3109,9 +3171,13 @@ class ChirpWindow(QMainWindow):
             clim_lo = min(e.db_floor, e.db_ceil - 0.1)
             vm['spec_im'].set_clim(clim_lo, e.db_ceil)
 
-            vm['amp_line'].set_ydata(np.abs(e.amp_buffer))
+            amp_color_l = '#ff5555' if e.saturated else C['blue']
+            amp_color_r = '#ff5555' if e.saturated else C['pink']
+            vm['amp_line'].set_color(amp_color_l)
+            vm['amp_line'].set_ydata(e.abs_amp_buffer)
             if vm['amp_line_r'] is not None and e.channel_mode == 'Stereo':
-                vm['amp_line_r'].set_ydata(np.abs(e.amp_buffer_r))
+                vm['amp_line_r'].set_color(amp_color_r)
+                vm['amp_line_r'].set_ydata(e.abs_amp_buffer_r)
 
             vm['cursor_spec'].set_xdata([cursor_x, cursor_x])
             vm['cursor_amp'].set_xdata([cursor_x, cursor_x])
@@ -3174,11 +3240,15 @@ class ChirpWindow(QMainWindow):
             self._spec_im.set_data(e.resample_spec(e.spec_buffer))
             clim_lo = min(e.db_floor, e.db_ceil - 0.1)
             self._spec_im.set_clim(clim_lo, e.db_ceil)
-            self._amp_line.set_ydata(np.abs(e.amp_buffer))
+            amp_color_l = '#ff5555' if e.saturated else C['blue']
+            amp_color_r = '#ff5555' if e.saturated else C['pink']
+            self._amp_line.set_color(amp_color_l)
+            self._amp_line.set_ydata(e.abs_amp_buffer)
             if self._is_stereo_layout and self._spec_im_r is not None:
                 self._spec_im_r.set_data(e.resample_spec(e.spec_buffer_r))
                 self._spec_im_r.set_clim(clim_lo, e.db_ceil)
-                self._amp_line_r.set_ydata(np.abs(e.amp_buffer_r))
+                self._amp_line_r.set_color(amp_color_r)
+                self._amp_line_r.set_ydata(e.abs_amp_buffer_r)
                 self._cursor_spec_r.set_xdata([cursor_x, cursor_x])
             self._cursor_spec.set_xdata([cursor_x, cursor_x])
             self._cursor_amp .set_xdata([cursor_x, cursor_x])
