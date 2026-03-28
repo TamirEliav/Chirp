@@ -2,6 +2,8 @@
 chirp.py — Sound Analysis & Recording
 """
 
+__version__ = "1.0.0"
+
 import collections
 import datetime
 import json
@@ -1304,7 +1306,7 @@ class ChirpWindow(QMainWindow):
         self._timer.timeout.connect(self._update_plot)
         self._timer.start()
 
-        self.setWindowTitle('Chirp — Sound Analysis & Recording')
+        self.setWindowTitle(f'Chirp v{__version__} — Triggered Sound Recording')
         self.resize(1400, 850)
 
     # ──────────────────────────────────────────────────────────────────────
