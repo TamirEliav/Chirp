@@ -736,7 +736,11 @@ class RecordingEntity:
                 peak_l = float(np.max(np.abs(left)))
                 peak_r = float(np.max(np.abs(right)))
             tm = self.trigger_mode
-            if tm == 'Any Channel':
+            if tm == 'Left Channel':
+                trigger_peak = peak_l
+            elif tm == 'Right Channel':
+                trigger_peak = peak_r
+            elif tm == 'Any Channel':
                 trigger_peak = max(peak_l, peak_r)
             elif tm == 'Both Channels':
                 trigger_peak = min(peak_l, peak_r)
@@ -1791,6 +1795,49 @@ class ChirpWindow(QMainWindow):
         filt_row.addStretch()
         trig_g.addLayout(filt_row, 5, 0, 1, 3)
 
+        # Auto-calibrate row (row 6)
+        self._btn_calibrate = QPushButton('Auto Calibrate')
+        self._btn_calibrate.setObjectName('btn_small')
+        self._btn_calibrate.setFixedWidth(110)
+        self._btn_calibrate.setToolTip(
+            'Measure ambient noise for 3 seconds and set threshold automatically')
+        self._lbl_calib_status = QLabel('')
+        self._lbl_calib_status.setObjectName('param_label')
+
+        self._sb_calib_dur = QDoubleSpinBox()
+        self._sb_calib_dur.setRange(1.0, 10.0)
+        self._sb_calib_dur.setValue(3.0)
+        self._sb_calib_dur.setSingleStep(0.5)
+        self._sb_calib_dur.setDecimals(1)
+        self._sb_calib_dur.setSuffix(' s')
+        self._sb_calib_dur.setFixedWidth(80)
+        self._sb_calib_dur.setToolTip('Calibration duration')
+
+        self._sb_calib_margin = QDoubleSpinBox()
+        self._sb_calib_margin.setRange(1.1, 10.0)
+        self._sb_calib_margin.setValue(3.0)
+        self._sb_calib_margin.setSingleStep(0.5)
+        self._sb_calib_margin.setDecimals(1)
+        self._sb_calib_margin.setSuffix('x')
+        self._sb_calib_margin.setFixedWidth(75)
+        self._sb_calib_margin.setToolTip('Margin multiplier above noise floor')
+
+        lbl_dur = QLabel('Dur')
+        lbl_dur.setObjectName('param_label')
+        lbl_margin = QLabel('Margin')
+        lbl_margin.setObjectName('param_label')
+
+        calib_row = QHBoxLayout()
+        calib_row.setSpacing(8)
+        calib_row.addWidget(self._btn_calibrate)
+        calib_row.addWidget(lbl_dur)
+        calib_row.addWidget(self._sb_calib_dur)
+        calib_row.addWidget(lbl_margin)
+        calib_row.addWidget(self._sb_calib_margin)
+        calib_row.addWidget(self._lbl_calib_status)
+        calib_row.addStretch()
+        trig_g.addLayout(calib_row, 6, 0, 1, 3)
+
         outer.addWidget(trig_box)
         return w
 
@@ -2002,7 +2049,7 @@ class ChirpWindow(QMainWindow):
         self._chan_combo.setCurrentIndex(0)
         lbl_trig = QLabel('Trigger')
         self._trig_combo = QComboBox()
-        self._trig_combo.addItems(['Average', 'Any Channel', 'Both Channels'])
+        self._trig_combo.addItems(['Average', 'Any Channel', 'Both Channels', 'Left Channel', 'Right Channel'])
         self._trig_combo.setCurrentIndex(0)
         self._trig_combo.setEnabled(False)
         lbl_sr = QLabel('Rate')
@@ -2097,6 +2144,9 @@ class ChirpWindow(QMainWindow):
         self._trig_combo.currentTextChanged.connect(self._on_trigger_mode_changed)
         self._sr_combo.currentIndexChanged.connect(self._on_sample_rate_changed)
         self._buf_combo.currentIndexChanged.connect(self._on_display_buffer_changed)
+
+        # Auto-calibrate
+        self._btn_calibrate.clicked.connect(self._on_calibrate)
 
         # Freq filter write-through
         self._chk_freq  .toggled       .connect(self._on_freq_filter_toggled)
@@ -2653,6 +2703,97 @@ class ChirpWindow(QMainWindow):
         self._sb_thr.blockSignals(True)
         self._sb_thr.setValue(val)
         self._sb_thr.blockSignals(False)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Auto-calibrate threshold
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _on_calibrate(self):
+        e = self._sel
+        if not e:
+            return
+        if not e.acq_running:
+            self._lbl_calib_status.setText('Start acquisition first')
+            QTimer.singleShot(3000, lambda: self._lbl_calib_status.setText(''))
+            return
+
+        duration = self._sb_calib_dur.value()
+        self._calib_samples = []
+        self._calib_remaining = duration
+        self._btn_calibrate.setEnabled(False)
+        self._lbl_calib_status.setText(f'Calibrating... {duration:.1f}s')
+        self._lbl_calib_status.setStyleSheet(f'color: {C["yellow"]};')
+
+        self._calib_timer = QTimer()
+        self._calib_timer.setInterval(100)  # check every 100ms
+        self._calib_timer.timeout.connect(self._calib_tick)
+        self._calib_start_time = datetime.datetime.now()
+        self._calib_timer.start()
+
+    def _calib_tick(self):
+        e = self._sel
+        if not e or not e.acq_running:
+            self._calib_timer.stop()
+            self._btn_calibrate.setEnabled(True)
+            self._lbl_calib_status.setText('Acquisition stopped')
+            self._lbl_calib_status.setStyleSheet(f'color: {C["red"]};')
+            QTimer.singleShot(3000, lambda: (
+                self._lbl_calib_status.setText(''),
+                self._lbl_calib_status.setStyleSheet(''),
+            ))
+            return
+
+        duration = self._sb_calib_dur.value()
+        elapsed = (datetime.datetime.now() - self._calib_start_time).total_seconds()
+        remaining = max(0.0, duration - elapsed)
+        self._lbl_calib_status.setText(f'Calibrating... {remaining:.1f}s')
+
+        # Collect current amplitude data from the buffer
+        # We sample the most recent chunk's peak from abs_amp_buffer
+        wh = e.write_head
+        n = CHUNK_FRAMES
+        if wh >= n:
+            chunk_data = e.abs_amp_buffer[wh - n:wh]
+        else:
+            chunk_data = e.abs_amp_buffer[:max(1, wh)]
+        if len(chunk_data) > 0:
+            self._calib_samples.append(float(np.max(chunk_data)))
+
+        if elapsed >= duration:
+            self._calib_timer.stop()
+            self._finish_calibrate()
+
+    def _finish_calibrate(self):
+        e = self._sel
+        self._btn_calibrate.setEnabled(True)
+
+        if not self._calib_samples:
+            self._lbl_calib_status.setText('No data collected')
+            self._lbl_calib_status.setStyleSheet(f'color: {C["red"]};')
+            QTimer.singleShot(3000, lambda: (
+                self._lbl_calib_status.setText(''),
+                self._lbl_calib_status.setStyleSheet(''),
+            ))
+            return
+
+        # Use the 95th percentile of collected peaks as the noise floor
+        noise_floor = float(np.percentile(self._calib_samples, 95))
+        margin = self._sb_calib_margin.value()
+        new_threshold = min(1.0, noise_floor * margin)
+
+        # Apply the new threshold
+        if e:
+            e.threshold = new_threshold
+        self._set_thr_silent(new_threshold)
+        self._sync_thr_line(new_threshold)
+
+        self._lbl_calib_status.setText(
+            f'Done: noise={noise_floor:.4f}, thr={new_threshold:.3f}')
+        self._lbl_calib_status.setStyleSheet(f'color: {C["green"]};')
+        QTimer.singleShot(5000, lambda: (
+            self._lbl_calib_status.setText(''),
+            self._lbl_calib_status.setStyleSheet(''),
+        ))
 
     # ──────────────────────────────────────────────────────────────────────
     # Matplotlib mouse events
