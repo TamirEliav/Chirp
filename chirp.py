@@ -72,6 +72,7 @@ C = {
     'yellow':   '#f9e2af',
     'mauve':    '#cba6f7',
     'pink':     '#f5c2e7',
+    'teal':     '#94e2d5',
 }
 
 QSS = f"""
@@ -527,6 +528,7 @@ class RecordingEntity:
         # Display state
         self.saturated  = False   # True when current chunk contains clipped audio
         self.amp_ylim   = 1.05    # amplitude y-axis max (persists across mode switches)
+        self.display_mode = 'Spectrogram'  # 'Spectrogram', 'Waveform', or 'Both'
 
         # Runtime
         self.acq_running = False
@@ -926,6 +928,7 @@ class RecordingEntity:
             'amp_ylim':            self.amp_ylim,
             'spectral_trigger_mode': self.spectral_trigger_mode,
             'spectral_threshold':    self.spectral_threshold,
+            'display_mode':        self.display_mode,
         }
 
     @classmethod
@@ -964,7 +967,8 @@ class RecordingEntity:
                      'display_freq_lo', 'display_freq_hi',
                      'output_dir', 'filename_prefix', 'filename_suffix',
                      'dph_folder_prefix', 'amp_ylim',
-                     'spectral_trigger_mode', 'spectral_threshold'):
+                     'spectral_trigger_mode', 'spectral_threshold',
+                     'display_mode'):
             if attr in d:
                 setattr(e, attr, d[attr])
 
@@ -1412,32 +1416,68 @@ class ChirpWindow(QMainWindow):
         sr = e.sample_rate if e else SAMPLE_RATE
         disp_secs = e.display_seconds if e else DISPLAY_SECONDS
         n_cols = e._n_cols if e else int(disp_secs * sr / CHUNK_FRAMES)
+        dmode = e.display_mode if e else 'Spectrogram'
+        self._display_mode = dmode
 
-        if stereo:
-            gs = self._fig.add_gridspec(3, 1, height_ratios=[1, 1, 1], hspace=0.10)
-            self._ax_spec   = self._fig.add_subplot(gs[0])
-            self._ax_spec_r = self._fig.add_subplot(gs[1], sharex=self._ax_spec)
-            self._ax_amp    = self._fig.add_subplot(gs[2], sharex=self._ax_spec)
-        else:
-            gs = self._fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.08)
-            self._ax_spec   = self._fig.add_subplot(gs[0])
-            self._ax_spec_r = None
-            self._ax_amp    = self._fig.add_subplot(gs[1], sharex=self._ax_spec)
+        show_spec = dmode in ('Spectrogram', 'Both')
+        show_wave = dmode in ('Waveform', 'Both')
+
+        # Determine gridspec layout based on display_mode and stereo
+        if dmode == 'Spectrogram':
+            if stereo:
+                gs = self._fig.add_gridspec(3, 1, height_ratios=[1, 1, 1], hspace=0.10)
+                ax_rows = {'spec': 0, 'spec_r': 1, 'amp': 2}
+            else:
+                gs = self._fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.08)
+                ax_rows = {'spec': 0, 'amp': 1}
+        elif dmode == 'Waveform':
+            if stereo:
+                gs = self._fig.add_gridspec(3, 1, height_ratios=[1, 1, 1], hspace=0.10)
+                ax_rows = {'wave': 0, 'wave_r': 1, 'amp': 2}
+            else:
+                gs = self._fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.08)
+                ax_rows = {'wave': 0, 'amp': 1}
+        else:  # 'Both'
+            if stereo:
+                gs = self._fig.add_gridspec(4, 1, height_ratios=[1, 1, 1, 1], hspace=0.10)
+                ax_rows = {'spec': 0, 'spec_r': 1, 'wave': 2, 'amp': 3}
+            else:
+                gs = self._fig.add_gridspec(3, 1, height_ratios=[2, 1, 1], hspace=0.08)
+                ax_rows = {'spec': 0, 'wave': 1, 'amp': 2}
+
+        # Create the first (topmost) axis as the sharex anchor
+        first_key = list(ax_rows.keys())[0]
+        first_ax = self._fig.add_subplot(gs[ax_rows[first_key]])
+        axes_map = {first_key: first_ax}
+        for key in list(ax_rows.keys())[1:]:
+            axes_map[key] = self._fig.add_subplot(gs[ax_rows[key]], sharex=first_ax)
+
+        # Assign axes references
+        self._ax_spec   = axes_map.get('spec', None)
+        self._ax_spec_r = axes_map.get('spec_r', None)
+        self._ax_wave   = axes_map.get('wave', None)
+        self._ax_wave_r = axes_map.get('wave_r', None)
+        self._ax_amp    = axes_map['amp']
 
         self._fig.subplots_adjust(top=0.97, bottom=0.06, left=0.07, right=0.99)
         n_disp = N_DISPLAY_ROWS
         dummy  = np.full((n_disp, n_cols), db_floor, dtype=np.float32)
 
-        self._spec_im = self._ax_spec.imshow(
-            dummy, aspect='auto', origin='lower',
-            extent=[0.0, disp_secs, 0, n_disp],
-            vmin=db_floor, vmax=db_ceil,
-            cmap=COLORMAP, interpolation='nearest',
-        )
-        self._ax_spec.set_ylabel('Freq (Hz) \u2014 L' if stereo else 'Frequency (Hz)')
-        self._cursor_spec = self._ax_spec.axvline(x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
+        # -- Spectrogram axes --
+        if self._ax_spec is not None:
+            self._spec_im = self._ax_spec.imshow(
+                dummy, aspect='auto', origin='lower',
+                extent=[0.0, disp_secs, 0, n_disp],
+                vmin=db_floor, vmax=db_ceil,
+                cmap=COLORMAP, interpolation='nearest',
+            )
+            self._ax_spec.set_ylabel('Freq (Hz) \u2014 L' if stereo else 'Frequency (Hz)')
+            self._cursor_spec = self._ax_spec.axvline(x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
+        else:
+            self._spec_im = None
+            self._cursor_spec = None
 
-        if stereo:
+        if self._ax_spec_r is not None:
             self._spec_im_r = self._ax_spec_r.imshow(
                 dummy, aspect='auto', origin='lower',
                 extent=[0.0, disp_secs, 0, n_disp],
@@ -1450,8 +1490,63 @@ class ChirpWindow(QMainWindow):
             self._spec_im_r = None
             self._cursor_spec_r = None
 
+        # -- Waveform axes --
         ts = max(1, int(disp_secs * sr / CHUNK_FRAMES)) * CHUNK_FRAMES
         t_axis = self._get_t_axis(sr, disp_secs)
+
+        if self._ax_wave is not None:
+            amp_ylim = e.amp_ylim if e else 1.05
+            if stereo and dmode == 'Both':
+                # Overlaid L+R waveform
+                (self._wave_line,) = self._ax_wave.plot(
+                    t_axis, np.zeros(ts),
+                    color=C['teal'], linewidth=0.7, antialiased=False, label='L',
+                )
+                (self._wave_line_r,) = self._ax_wave.plot(
+                    t_axis, np.zeros(ts),
+                    color=C['pink'], linewidth=0.7, antialiased=False, label='R',
+                )
+                self._ax_wave.legend(loc='upper right', fontsize=8,
+                                     facecolor=C['mantle'], edgecolor=C['surface1'],
+                                     labelcolor=C['text'])
+            else:
+                wave_label = 'Waveform' if not stereo else 'L'
+                (self._wave_line,) = self._ax_wave.plot(
+                    t_axis, np.zeros(ts),
+                    color=C['teal'], linewidth=0.7, antialiased=False,
+                    label=wave_label if (stereo and dmode != 'Both') else None,
+                )
+                if stereo and dmode != 'Both':
+                    self._wave_line_r = None  # separate axis used
+                elif not stereo:
+                    self._wave_line_r = None
+                else:
+                    self._wave_line_r = None
+            self._ax_wave.set_xlim(0.0, disp_secs)
+            self._ax_wave.set_ylim(-amp_ylim, amp_ylim)
+            self._ax_wave.set_ylabel('Wave \u2014 L' if (stereo and dmode == 'Waveform') else 'Waveform')
+            self._cursor_wave = self._ax_wave.axvline(x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
+        else:
+            self._wave_line = None
+            self._wave_line_r = None
+            self._cursor_wave = None
+
+        if self._ax_wave_r is not None:
+            amp_ylim = e.amp_ylim if e else 1.05
+            (self._wave_line_r,) = self._ax_wave_r.plot(
+                t_axis, np.zeros(ts),
+                color=C['pink'], linewidth=0.7, antialiased=False,
+            )
+            self._ax_wave_r.set_xlim(0.0, disp_secs)
+            self._ax_wave_r.set_ylim(-amp_ylim, amp_ylim)
+            self._ax_wave_r.set_ylabel('Wave \u2014 R')
+            self._cursor_wave_r = self._ax_wave_r.axvline(x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
+        else:
+            if self._ax_wave is None:
+                self._wave_line_r = self._wave_line_r if hasattr(self, '_wave_line_r') else None
+            self._cursor_wave_r = None
+
+        # -- Amplitude envelope axis --
         (self._amp_line,) = self._ax_amp.plot(
             t_axis, np.zeros(ts),
             color=C['blue'], linewidth=0.7, antialiased=False,
@@ -1483,7 +1578,7 @@ class ChirpWindow(QMainWindow):
         )
         self._cursor_amp = self._ax_amp.axvline(x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
 
-        if e:
+        if e and self._ax_spec is not None:
             self._update_spec_yticks(e)
 
         # Mark animated artists for blitting
@@ -1494,23 +1589,37 @@ class ChirpWindow(QMainWindow):
 
     def _get_config_artists(self):
         """Return list of all animated artists in config mode."""
-        arts = [self._spec_im, self._amp_line,
-                self._cursor_spec, self._cursor_amp,
+        arts = [self._amp_line,
+                self._cursor_amp,
                 self._threshold_line, self._threshold_label]
+        if self._spec_im is not None:
+            arts.extend([self._spec_im, self._cursor_spec])
         if self._spec_im_r is not None:
             arts.extend([self._spec_im_r, self._cursor_spec_r])
         if self._amp_line_r is not None:
             arts.append(self._amp_line_r)
+        if self._wave_line is not None:
+            arts.extend([self._wave_line, self._cursor_wave])
+        if self._wave_line_r is not None:
+            arts.append(self._wave_line_r)
+            if self._cursor_wave_r is not None:
+                arts.append(self._cursor_wave_r)
         return arts
 
     @staticmethod
     def _get_vm_artists(vm: dict):
         """Return animated artists for one view-mode cell."""
-        arts = [vm['spec_im'], vm['amp_line'],
-                vm['cursor_spec'], vm['cursor_amp'],
+        arts = [vm['amp_line'],
+                vm['cursor_amp'],
                 vm['thr_line'], vm['status_text']]
+        if vm.get('spec_im') is not None:
+            arts.extend([vm['spec_im'], vm['cursor_spec']])
         if vm['amp_line_r'] is not None:
             arts.append(vm['amp_line_r'])
+        if vm.get('wave_line') is not None:
+            arts.extend([vm['wave_line'], vm['cursor_wave']])
+        if vm.get('wave_line_r') is not None:
+            arts.append(vm['wave_line_r'])
         return arts
 
     def _recapture_bg(self, event=None):
@@ -1548,7 +1657,8 @@ class ChirpWindow(QMainWindow):
         ax.set_yticklabels(labels, fontsize=7)
 
     def _update_spec_yticks(self, e: RecordingEntity):
-        self._apply_spec_yticks(self._ax_spec, e)
+        if self._ax_spec is not None:
+            self._apply_spec_yticks(self._ax_spec, e)
         if self._ax_spec_r is not None:
             self._apply_spec_yticks(self._ax_spec_r, e)
 
@@ -2039,8 +2149,18 @@ class ChirpWindow(QMainWindow):
         grid.addWidget(lbl_buf,            5, 3)
         grid.addWidget(self._buf_combo,    5, 4)
 
+        lbl_dmode = QLabel('View')
+        lbl_dmode.setObjectName('param_label')
+        lbl_dmode.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        self._combo_display_mode = QComboBox()
+        self._combo_display_mode.addItems(['Spectrogram', 'Waveform', 'Both'])
+        self._combo_display_mode.setCurrentText('Spectrogram')
+        self._combo_display_mode.setFixedWidth(90)
+        grid.addWidget(lbl_dmode,                  6, 3)
+        grid.addWidget(self._combo_display_mode,   6, 4)
+
         self._chk_shared_spec = QCheckBox('Sync across all recordings')
-        grid.addWidget(self._chk_shared_spec, 6, 0, 1, 5)
+        grid.addWidget(self._chk_shared_spec, 7, 0, 1, 5)
 
         outer.addWidget(box)
         return w
@@ -2278,6 +2398,7 @@ class ChirpWindow(QMainWindow):
         self._sb_disp_freq_lo.valueChanged.connect(self._on_disp_freq_changed)
         self._sb_disp_freq_hi.valueChanged.connect(self._on_disp_freq_changed)
         self._chk_shared_spec.toggled.connect(self._on_shared_spec_toggled)
+        self._combo_display_mode.currentTextChanged.connect(self._on_display_mode_changed)
 
         # Matplotlib events
         self._canvas.mpl_connect('button_press_event',   self._on_mpl_press)
@@ -2375,6 +2496,7 @@ class ChirpWindow(QMainWindow):
         e.device_id     = self._device_combo.currentData()
         e.spectral_trigger_mode = self._combo_detect_mode.currentText()
         e.spectral_threshold    = self._sb_entropy_thr.value()
+        e.display_mode  = self._combo_display_mode.currentText()
 
     def _load_params_from_entity(self, idx: int):
         if idx < 0 or idx >= len(self._entities):
@@ -2505,10 +2627,16 @@ class ChirpWindow(QMainWindow):
         # Update threshold line
         self._sync_thr_line(e.threshold)
 
-        # Rebuild axes if stereo layout, sample rate, or display buffer differs
+        # Display mode combo
+        self._combo_display_mode.blockSignals(True)
+        self._combo_display_mode.setCurrentText(e.display_mode)
+        self._combo_display_mode.blockSignals(False)
+
+        # Rebuild axes if stereo layout, sample rate, display buffer, or display mode differs
         want_stereo = (e.channel_mode == 'Stereo')
         axes_changed = (e.sample_rate, e.display_seconds) != self._t_axis_key
-        if want_stereo != self._is_stereo_layout or axes_changed:
+        display_mode_changed = (e.display_mode != getattr(self, '_display_mode', 'Spectrogram'))
+        if want_stereo != self._is_stereo_layout or axes_changed or display_mode_changed:
             self._setup_axes(stereo=want_stereo)
         self._update_spec_yticks(e)
 
@@ -2653,6 +2781,7 @@ class ChirpWindow(QMainWindow):
         self._chk_ref_date.setChecked(False)
         self._date_line.setText(datetime.date.today().strftime('%Y-%m-%d'))
         self._dph_prefix_edit.clear()
+        self._combo_display_mode.setCurrentText('Spectrogram')
 
     # ──────────────────────────────────────────────────────────────────────
     # Save / Load settings
@@ -2944,16 +3073,31 @@ class ChirpWindow(QMainWindow):
 
     def _on_scroll(self, event):
         if self._view_mode:
-            # Zoom whichever amplitude axis the mouse is over
+            # Zoom whichever amplitude or waveform axis the mouse is over
             for i, vm in enumerate(self._vm_axes):
-                if event.inaxes is vm['ax_amp']:
+                if event.inaxes is vm['ax_amp'] or (vm.get('ax_wave') and event.inaxes is vm['ax_wave']):
                     scale = 0.85 if event.step > 0 else 1.0 / 0.85
                     _, ymax = vm['ax_amp'].get_ylim()
                     new_ymax = max(0.01, ymax * scale)
                     vm['ax_amp'].set_ylim(0.0, new_ymax)
+                    if vm.get('ax_wave') is not None:
+                        vm['ax_wave'].set_ylim(-new_ymax, new_ymax)
                     if i < len(self._entities):
                         self._entities[i].amp_ylim = new_ymax
                     return
+            return
+        # Scroll on waveform axes adjusts waveform y-range symmetrically
+        wave_axes = [ax for ax in [getattr(self, '_ax_wave', None),
+                                    getattr(self, '_ax_wave_r', None)] if ax is not None]
+        if event.inaxes in wave_axes:
+            scale = 0.85 if event.step > 0 else 1.0 / 0.85
+            e = self._sel
+            if e:
+                new_ylim = max(0.01, e.amp_ylim * scale)
+                e.amp_ylim = new_ylim
+                for wax in wave_axes:
+                    wax.set_ylim(-new_ylim, new_ylim)
+                self._ax_amp.set_ylim(0.0, new_ylim)
             return
         if event.inaxes is not self._ax_amp:
             return
@@ -2964,6 +3108,9 @@ class ChirpWindow(QMainWindow):
         e = self._sel
         if e:
             e.amp_ylim = new_ymax
+            # Sync waveform axes too
+            for wax in wave_axes:
+                wax.set_ylim(-new_ymax, new_ymax)
 
     # ──────────────────────────────────────────────────────────────────────
     # Spectrogram display callbacks
@@ -2999,6 +3146,15 @@ class ChirpWindow(QMainWindow):
                     ent.display_freq_hi = e.display_freq_hi
                     ent.rebuild_freq_mapping()
                     ent.change_fft_params(e.spec_nperseg, e.spec_window)
+
+    def _on_display_mode_changed(self, mode: str):
+        e = self._sel
+        if not e:
+            return
+        e.display_mode = mode
+        stereo = e.channel_mode == 'Stereo'
+        self._setup_axes(stereo=stereo)
+        self._update_spec_yticks(e)
 
     def _on_freq_scale_changed(self, scale: str):
         e = self._sel
@@ -3319,7 +3475,7 @@ class ChirpWindow(QMainWindow):
         total_h = max(300, rows * self._vm_panel_height)
         self._canvas.setMinimumHeight(total_h)
 
-        # Outer grid: rows × cols, each cell has inner 2 subplots (spec + amp)
+        # Outer grid: rows × cols, each cell has inner subplots
         outer_gs = self._fig.add_gridspec(
             rows, cols, hspace=0.35, wspace=0.15,
             top=0.97, bottom=0.03, left=0.05, right=0.99)
@@ -3328,37 +3484,86 @@ class ChirpWindow(QMainWindow):
 
         for i, e in enumerate(self._entities):
             r, c = divmod(i, cols)
-            inner = outer_gs[r, c].subgridspec(2, 1, height_ratios=[3, 1], hspace=0.08)
+            dmode = e.display_mode
+            show_spec = dmode in ('Spectrogram', 'Both')
+            show_wave = dmode in ('Waveform', 'Both')
 
-            ax_spec = self._fig.add_subplot(inner[0])
-            ax_amp  = self._fig.add_subplot(inner[1], sharex=ax_spec)
+            # Determine inner gridspec layout
+            if dmode == 'Both':
+                inner = outer_gs[r, c].subgridspec(3, 1, height_ratios=[3, 1, 1], hspace=0.08)
+                inner_spec_row = 0
+                inner_wave_row = 1
+                inner_amp_row = 2
+            elif dmode == 'Waveform':
+                inner = outer_gs[r, c].subgridspec(2, 1, height_ratios=[3, 1], hspace=0.08)
+                inner_wave_row = 0
+                inner_amp_row = 1
+            else:  # Spectrogram
+                inner = outer_gs[r, c].subgridspec(2, 1, height_ratios=[3, 1], hspace=0.08)
+                inner_spec_row = 0
+                inner_amp_row = 1
 
-            db_floor = min(e.db_floor, e.db_ceil - 0.1)
-            dummy = np.full((n_disp, e._n_cols), db_floor, dtype=np.float32)
+            # Create axes based on display mode
+            ax_spec = None
+            ax_wave = None
+            spec_im = None
+            cursor_spec = None
+            wave_line = None
+            wave_line_r = None
+            cursor_wave = None
 
             e_disp = e.display_seconds
-            spec_im = ax_spec.imshow(
-                dummy, aspect='auto', origin='lower',
-                extent=[0.0, e_disp, 0, n_disp],
-                vmin=db_floor, vmax=e.db_ceil,
-                cmap=COLORMAP, interpolation='nearest',
-            )
-
-            # Name as title on the left
-            title_obj = ax_spec.set_title(e.name, loc='left', fontsize=9,
-                                          color=C['text'], fontweight='bold', pad=3)
-
-            # Status text on the right
-            status_text = ax_spec.text(
-                0.99, 1.02, '', transform=ax_spec.transAxes, fontsize=8,
-                ha='right', va='bottom', fontfamily='Consolas')
-
-            cursor_spec = ax_spec.axvline(x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
-            self._apply_spec_yticks(ax_spec, e)
-            ax_spec.tick_params(labelbottom=False)
-
             e_ts = e._total_samples
             e_t_axis = np.linspace(0.0, e_disp, e_ts, endpoint=False, dtype=np.float32)
+
+            # First axis (anchor for sharex)
+            if show_spec:
+                ax_spec = self._fig.add_subplot(inner[inner_spec_row])
+                first_ax = ax_spec
+            elif show_wave:
+                ax_wave = self._fig.add_subplot(inner[inner_wave_row])
+                first_ax = ax_wave
+
+            if show_spec:
+                db_floor = min(e.db_floor, e.db_ceil - 0.1)
+                dummy = np.full((n_disp, e._n_cols), db_floor, dtype=np.float32)
+                spec_im = ax_spec.imshow(
+                    dummy, aspect='auto', origin='lower',
+                    extent=[0.0, e_disp, 0, n_disp],
+                    vmin=db_floor, vmax=e.db_ceil,
+                    cmap=COLORMAP, interpolation='nearest',
+                )
+                cursor_spec = ax_spec.axvline(x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
+                self._apply_spec_yticks(ax_spec, e)
+                ax_spec.tick_params(labelbottom=False)
+                ax_spec.set_ylabel('Freq', fontsize=7)
+
+            if show_wave:
+                if ax_wave is None:
+                    ax_wave = self._fig.add_subplot(inner[inner_wave_row], sharex=first_ax)
+                amp_ylim = e.amp_ylim
+                (wave_line,) = ax_wave.plot(
+                    e_t_axis, np.zeros(e_ts),
+                    color=C['teal'], linewidth=0.6, antialiased=False,
+                    label='L' if e.channel_mode == 'Stereo' else None,
+                )
+                wave_line_r = None
+                if e.channel_mode == 'Stereo':
+                    (wave_line_r,) = ax_wave.plot(
+                        e_t_axis, np.zeros(e_ts),
+                        color=C['pink'], linewidth=0.6, antialiased=False, label='R',
+                    )
+                    ax_wave.legend(loc='upper right', fontsize=7,
+                                   facecolor=C['mantle'], edgecolor=C['surface1'],
+                                   labelcolor=C['text'])
+                ax_wave.set_xlim(0.0, e_disp)
+                ax_wave.set_ylim(-amp_ylim, amp_ylim)
+                cursor_wave = ax_wave.axvline(x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
+                ax_wave.tick_params(labelbottom=False)
+                ax_wave.set_ylabel('Wave', fontsize=7)
+
+            ax_amp = self._fig.add_subplot(inner[inner_amp_row], sharex=first_ax)
+
             (amp_line,) = ax_amp.plot(
                 e_t_axis, np.zeros(e_ts),
                 color=C['blue'], linewidth=0.6, antialiased=False,
@@ -3384,14 +3589,23 @@ class ChirpWindow(QMainWindow):
             else:
                 ax_amp.set_xlabel('Time (s)', fontsize=7)
 
-            ax_spec.set_ylabel('Freq', fontsize=7)
             ax_amp.set_ylabel('Amp', fontsize=7)
 
+            # Title and status on the topmost axis
+            top_ax = ax_spec if ax_spec is not None else ax_wave
+            title_obj = top_ax.set_title(e.name, loc='left', fontsize=9,
+                                         color=C['text'], fontweight='bold', pad=3)
+            status_text = top_ax.text(
+                0.99, 1.02, '', transform=top_ax.transAxes, fontsize=8,
+                ha='right', va='bottom', fontfamily='Consolas')
+
             self._vm_axes.append({
-                'ax_spec': ax_spec, 'ax_amp': ax_amp,
+                'ax_spec': ax_spec, 'ax_amp': ax_amp, 'ax_wave': ax_wave,
                 'spec_im': spec_im,
                 'amp_line': amp_line, 'amp_line_r': amp_line_r,
+                'wave_line': wave_line, 'wave_line_r': wave_line_r,
                 'cursor_spec': cursor_spec, 'cursor_amp': cursor_amp,
+                'cursor_wave': cursor_wave,
                 'thr_line': thr_line,
                 'title': title_obj, 'status_text': status_text,
             })
@@ -3427,19 +3641,34 @@ class ChirpWindow(QMainWindow):
             vm = self._vm_axes[i]
             cursor_x = (e.write_head / e.sample_rate) % e.display_seconds
 
-            vm['spec_im'].set_data(e.resample_spec(e.spec_buffer))
-            clim_lo = min(e.db_floor, e.db_ceil - 0.1)
-            vm['spec_im'].set_clim(clim_lo, e.db_ceil)
-
             amp_color_l = '#ff5555' if e.saturated else C['blue']
             amp_color_r = '#ff5555' if e.saturated else C['pink']
+
+            # Spectrogram
+            if vm.get('spec_im') is not None:
+                vm['spec_im'].set_data(e.resample_spec(e.spec_buffer))
+                clim_lo = min(e.db_floor, e.db_ceil - 0.1)
+                vm['spec_im'].set_clim(clim_lo, e.db_ceil)
+                vm['cursor_spec'].set_xdata([cursor_x, cursor_x])
+
+            # Waveform
+            if vm.get('wave_line') is not None:
+                wave_color_l = '#ff5555' if e.saturated else C['teal']
+                vm['wave_line'].set_color(wave_color_l)
+                vm['wave_line'].set_ydata(e.amp_buffer)
+                vm['cursor_wave'].set_xdata([cursor_x, cursor_x])
+            if vm.get('wave_line_r') is not None and e.channel_mode == 'Stereo':
+                wave_color_r = '#ff5555' if e.saturated else C['pink']
+                vm['wave_line_r'].set_color(wave_color_r)
+                vm['wave_line_r'].set_ydata(e.amp_buffer_r)
+
+            # Amplitude envelope
             vm['amp_line'].set_color(amp_color_l)
             vm['amp_line'].set_ydata(e.abs_amp_buffer)
             if vm['amp_line_r'] is not None and e.channel_mode == 'Stereo':
                 vm['amp_line_r'].set_color(amp_color_r)
                 vm['amp_line_r'].set_ydata(e.abs_amp_buffer_r)
 
-            vm['cursor_spec'].set_xdata([cursor_x, cursor_x])
             vm['cursor_amp'].set_xdata([cursor_x, cursor_x])
             vm['thr_line'].set_ydata([e.threshold, e.threshold])
 
@@ -3497,20 +3726,40 @@ class ChirpWindow(QMainWindow):
         e = self._sel
         if e and self._bg is not None:
             cursor_x = (e.write_head / e.sample_rate) % e.display_seconds
-            self._spec_im.set_data(e.resample_spec(e.spec_buffer))
-            clim_lo = min(e.db_floor, e.db_ceil - 0.1)
-            self._spec_im.set_clim(clim_lo, e.db_ceil)
             amp_color_l = '#ff5555' if e.saturated else C['blue']
             amp_color_r = '#ff5555' if e.saturated else C['pink']
-            self._amp_line.set_color(amp_color_l)
-            self._amp_line.set_ydata(e.abs_amp_buffer)
+
+            # Spectrogram
+            if self._spec_im is not None:
+                self._spec_im.set_data(e.resample_spec(e.spec_buffer))
+                clim_lo = min(e.db_floor, e.db_ceil - 0.1)
+                self._spec_im.set_clim(clim_lo, e.db_ceil)
+                self._cursor_spec.set_xdata([cursor_x, cursor_x])
             if self._is_stereo_layout and self._spec_im_r is not None:
                 self._spec_im_r.set_data(e.resample_spec(e.spec_buffer_r))
+                clim_lo = min(e.db_floor, e.db_ceil - 0.1)
                 self._spec_im_r.set_clim(clim_lo, e.db_ceil)
+                self._cursor_spec_r.set_xdata([cursor_x, cursor_x])
+
+            # Waveform
+            if self._wave_line is not None:
+                wave_color_l = '#ff5555' if e.saturated else C['teal']
+                self._wave_line.set_color(wave_color_l)
+                self._wave_line.set_ydata(e.amp_buffer)
+                self._cursor_wave.set_xdata([cursor_x, cursor_x])
+            if self._wave_line_r is not None:
+                wave_color_r = '#ff5555' if e.saturated else C['pink']
+                self._wave_line_r.set_color(wave_color_r)
+                self._wave_line_r.set_ydata(e.amp_buffer_r)
+                if self._cursor_wave_r is not None:
+                    self._cursor_wave_r.set_xdata([cursor_x, cursor_x])
+
+            # Amplitude envelope
+            self._amp_line.set_color(amp_color_l)
+            self._amp_line.set_ydata(e.abs_amp_buffer)
+            if self._is_stereo_layout and self._amp_line_r is not None:
                 self._amp_line_r.set_color(amp_color_r)
                 self._amp_line_r.set_ydata(e.abs_amp_buffer_r)
-                self._cursor_spec_r.set_xdata([cursor_x, cursor_x])
-            self._cursor_spec.set_xdata([cursor_x, cursor_x])
             self._cursor_amp .set_xdata([cursor_x, cursor_x])
 
             self._canvas.restore_region(self._bg)
