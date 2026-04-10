@@ -73,6 +73,7 @@ C = {
     'mauve':    '#cba6f7',
     'pink':     '#f5c2e7',
     'teal':     '#94e2d5',
+    'peach':    '#fab387',
 }
 
 QSS = f"""
@@ -522,6 +523,7 @@ class RecordingEntity:
             (self.n_freq_bins, self._n_cols), SPEC_DB_MIN, dtype=np.float32)
         self.spec_buffer_r = np.full(
             (self.n_freq_bins, self._n_cols), SPEC_DB_MIN, dtype=np.float32)
+        self.entropy_buffer = np.ones(self._n_cols, dtype=np.float32)
         self.write_head = 0
         self.col_head   = 0
 
@@ -548,6 +550,7 @@ class RecordingEntity:
         self.amp_buffer_r[:]  = 0.0
         self.spec_buffer[:]   = SPEC_DB_MIN
         self.spec_buffer_r[:] = SPEC_DB_MIN
+        self.entropy_buffer[:] = 1.0
         self.write_head = 0
         self.col_head   = 0
 
@@ -652,6 +655,7 @@ class RecordingEntity:
             (self.n_freq_bins, self._n_cols), SPEC_DB_MIN, dtype=np.float32)
         self.spec_buffer_r = np.full(
             (self.n_freq_bins, self._n_cols), SPEC_DB_MIN, dtype=np.float32)
+        self.entropy_buffer = np.ones(self._n_cols, dtype=np.float32)
         self.write_head = 0
         self.col_head   = 0
 
@@ -685,6 +689,7 @@ class RecordingEntity:
             (self.n_freq_bins, self._n_cols), SPEC_DB_MIN, dtype=np.float32)
         self.spec_buffer_r = np.full(
             (self.n_freq_bins, self._n_cols), SPEC_DB_MIN, dtype=np.float32)
+        self.entropy_buffer = np.ones(self._n_cols, dtype=np.float32)
         self.write_head = 0
         self.col_head   = 0
 
@@ -806,6 +811,7 @@ class RecordingEntity:
         else:
             entropy = entropy_l
         self.spectral_entropy = entropy
+        self.entropy_buffer[self.col_head] = entropy
 
         # ── Apply spectral trigger mode ───────────────────────────────
         stm = self.spectral_trigger_mode
@@ -1352,6 +1358,7 @@ class ChirpWindow(QMainWindow):
         self._selected_idx = -1
         self._next_num = 1
         self._dragging = False
+        self._dragging_entropy = False
         self._current_config_path: str | None = None
 
         # View mode
@@ -1421,29 +1428,31 @@ class ChirpWindow(QMainWindow):
 
         show_spec = dmode in ('Spectrogram', 'Both')
         show_wave = dmode in ('Waveform', 'Both')
+        show_entropy = (e.spectral_trigger_mode != 'Amplitude Only') if e else False
 
-        # Determine gridspec layout based on display_mode and stereo
-        if dmode == 'Spectrogram':
+        # Build ordered list of subplot rows
+        rows_list = []
+        ratios = []
+        if show_spec:
+            rows_list.append('spec')
+            ratios.append(2 if dmode == 'Both' else 1)
             if stereo:
-                gs = self._fig.add_gridspec(3, 1, height_ratios=[1, 1, 1], hspace=0.10)
-                ax_rows = {'spec': 0, 'spec_r': 1, 'amp': 2}
-            else:
-                gs = self._fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.08)
-                ax_rows = {'spec': 0, 'amp': 1}
-        elif dmode == 'Waveform':
-            if stereo:
-                gs = self._fig.add_gridspec(3, 1, height_ratios=[1, 1, 1], hspace=0.10)
-                ax_rows = {'wave': 0, 'wave_r': 1, 'amp': 2}
-            else:
-                gs = self._fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.08)
-                ax_rows = {'wave': 0, 'amp': 1}
-        else:  # 'Both'
-            if stereo:
-                gs = self._fig.add_gridspec(4, 1, height_ratios=[1, 1, 1, 1], hspace=0.10)
-                ax_rows = {'spec': 0, 'spec_r': 1, 'wave': 2, 'amp': 3}
-            else:
-                gs = self._fig.add_gridspec(3, 1, height_ratios=[2, 1, 1], hspace=0.08)
-                ax_rows = {'spec': 0, 'wave': 1, 'amp': 2}
+                rows_list.append('spec_r')
+                ratios.append(2 if dmode == 'Both' else 1)
+        if show_wave:
+            rows_list.append('wave')
+            ratios.append(1)
+            if stereo and dmode == 'Waveform':
+                rows_list.append('wave_r')
+                ratios.append(1)
+        rows_list.append('amp')
+        ratios.append(1)
+        if show_entropy:
+            rows_list.append('entropy')
+            ratios.append(1)
+
+        gs = self._fig.add_gridspec(len(rows_list), 1, height_ratios=ratios, hspace=0.10)
+        ax_rows = {key: i for i, key in enumerate(rows_list)}
 
         # Create the first (topmost) axis as the sharex anchor
         first_key = list(ax_rows.keys())[0]
@@ -1453,11 +1462,12 @@ class ChirpWindow(QMainWindow):
             axes_map[key] = self._fig.add_subplot(gs[ax_rows[key]], sharex=first_ax)
 
         # Assign axes references
-        self._ax_spec   = axes_map.get('spec', None)
-        self._ax_spec_r = axes_map.get('spec_r', None)
-        self._ax_wave   = axes_map.get('wave', None)
-        self._ax_wave_r = axes_map.get('wave_r', None)
-        self._ax_amp    = axes_map['amp']
+        self._ax_spec    = axes_map.get('spec', None)
+        self._ax_spec_r  = axes_map.get('spec_r', None)
+        self._ax_wave    = axes_map.get('wave', None)
+        self._ax_wave_r  = axes_map.get('wave_r', None)
+        self._ax_amp     = axes_map['amp']
+        self._ax_entropy = axes_map.get('entropy', None)
 
         self._fig.subplots_adjust(top=0.97, bottom=0.06, left=0.07, right=0.99)
         n_disp = N_DISPLAY_ROWS
@@ -1578,6 +1588,36 @@ class ChirpWindow(QMainWindow):
         )
         self._cursor_amp = self._ax_amp.axvline(x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
 
+        # -- Entropy axes --
+        if self._ax_entropy is not None:
+            ent_n_cols = e._n_cols if e else n_cols
+            ent_t = np.linspace(0.0, disp_secs, ent_n_cols, endpoint=False, dtype=np.float32)
+            ent_thr = e.spectral_threshold if e else 0.5
+            (self._entropy_line,) = self._ax_entropy.plot(
+                ent_t, np.ones(ent_n_cols),
+                color=C['mauve'], linewidth=0.9, antialiased=False,
+            )
+            self._ax_entropy.set_xlim(0.0, disp_secs)
+            self._ax_entropy.set_ylim(0.0, 1.05)
+            self._ax_entropy.set_xlabel('Time (s)')
+            self._ax_entropy.set_ylabel('Entropy')
+            self._ax_amp.set_xlabel('')  # move x-label to entropy axis
+            self._entropy_thr_line = self._ax_entropy.axhline(
+                y=ent_thr, color=C['peach'], linewidth=1.5, linestyle=(0, (6, 3)),
+            )
+            self._entropy_thr_label = self._ax_entropy.text(
+                0.005, ent_thr + 0.03, f'ent = {ent_thr:.3f}',
+                transform=self._ax_entropy.get_yaxis_transform(),
+                color=C['peach'], fontsize=8,
+            )
+            self._cursor_entropy = self._ax_entropy.axvline(
+                x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
+        else:
+            self._entropy_line = None
+            self._entropy_thr_line = None
+            self._entropy_thr_label = None
+            self._cursor_entropy = None
+
         if e and self._ax_spec is not None:
             self._update_spec_yticks(e)
 
@@ -1604,6 +1644,9 @@ class ChirpWindow(QMainWindow):
             arts.append(self._wave_line_r)
             if self._cursor_wave_r is not None:
                 arts.append(self._cursor_wave_r)
+        if self._entropy_line is not None:
+            arts.extend([self._entropy_line, self._cursor_entropy,
+                         self._entropy_thr_line, self._entropy_thr_label])
         return arts
 
     @staticmethod
@@ -1620,6 +1663,9 @@ class ChirpWindow(QMainWindow):
             arts.extend([vm['wave_line'], vm['cursor_wave']])
         if vm.get('wave_line_r') is not None:
             arts.append(vm['wave_line_r'])
+        if vm.get('entropy_line') is not None:
+            arts.extend([vm['entropy_line'], vm['cursor_entropy'],
+                         vm['entropy_thr_line']])
         return arts
 
     def _recapture_bg(self, event=None):
@@ -1997,10 +2043,7 @@ class ChirpWindow(QMainWindow):
         self._sl_entropy_thr.setEnabled(False)
         self._sb_entropy_thr.setEnabled(False)
 
-        self._combo_detect_mode.currentTextChanged.connect(lambda m: (
-            self._sl_entropy_thr.setEnabled(m != 'Amplitude Only'),
-            self._sb_entropy_thr.setEnabled(m != 'Amplitude Only'),
-        ))
+        self._combo_detect_mode.currentTextChanged.connect(self._on_detect_mode_changed)
 
         # Auto-calibrate row (row 8)
         self._btn_calibrate = QPushButton('Auto Calibrate')
@@ -2632,11 +2675,13 @@ class ChirpWindow(QMainWindow):
         self._combo_display_mode.setCurrentText(e.display_mode)
         self._combo_display_mode.blockSignals(False)
 
-        # Rebuild axes if stereo layout, sample rate, display buffer, or display mode differs
+        # Rebuild axes if stereo layout, sample rate, display buffer, display mode, or entropy visibility differs
         want_stereo = (e.channel_mode == 'Stereo')
         axes_changed = (e.sample_rate, e.display_seconds) != self._t_axis_key
         display_mode_changed = (e.display_mode != getattr(self, '_display_mode', 'Spectrogram'))
-        if want_stereo != self._is_stereo_layout or axes_changed or display_mode_changed:
+        want_entropy = (e.spectral_trigger_mode != 'Amplitude Only')
+        has_entropy = (self._ax_entropy is not None)
+        if want_stereo != self._is_stereo_layout or axes_changed or display_mode_changed or want_entropy != has_entropy:
             self._setup_axes(stereo=want_stereo)
         self._update_spec_yticks(e)
 
@@ -2945,6 +2990,13 @@ class ChirpWindow(QMainWindow):
         self._threshold_label.set_text(f'thr = {val:.3f}')
         self._canvas.draw_idle()
 
+    def _sync_entropy_thr_line(self, val: float):
+        if self._entropy_thr_line is not None:
+            self._entropy_thr_line.set_ydata([val, val])
+            self._entropy_thr_label.set_y(val + 0.03)
+            self._entropy_thr_label.set_text(f'ent = {val:.3f}')
+            self._canvas.draw_idle()
+
     def _set_thr_silent(self, val: float):
         self._sb_thr.blockSignals(True)
         self._sb_thr.setValue(val)
@@ -3049,26 +3101,45 @@ class ChirpWindow(QMainWindow):
         if self._view_mode:
             return
         e = self._sel
-        if not e or event.inaxes is not self._ax_amp or event.button != 1:
+        if not e or event.button != 1:
             return
-        _, y_disp = self._ax_amp.transData.transform((0.0, e.threshold))
-        if abs(event.y - y_disp) <= 12:
-            self._dragging = True
-            self._timer.stop()
+        if event.inaxes is self._ax_amp:
+            _, y_disp = self._ax_amp.transData.transform((0.0, e.threshold))
+            if abs(event.y - y_disp) <= 12:
+                self._dragging = True
+                self._timer.stop()
+        elif self._ax_entropy is not None and event.inaxes is self._ax_entropy:
+            _, y_disp = self._ax_entropy.transData.transform((0.0, e.spectral_threshold))
+            if abs(event.y - y_disp) <= 12:
+                self._dragging_entropy = True
+                self._timer.stop()
 
     def _on_mpl_motion(self, event):
-        if not self._dragging or event.inaxes is not self._ax_amp:
-            return
-        val = float(np.clip(event.ydata, 0.0, 1.0))
-        e = self._sel
-        if e:
-            e.threshold = val
-        self._set_thr_silent(val)
-        self._sync_thr_line(val)
+        if self._dragging:
+            if event.inaxes is not self._ax_amp:
+                return
+            val = float(np.clip(event.ydata, 0.0, 1.0))
+            e = self._sel
+            if e:
+                e.threshold = val
+            self._set_thr_silent(val)
+            self._sync_thr_line(val)
+        elif self._dragging_entropy:
+            if self._ax_entropy is None or event.inaxes is not self._ax_entropy:
+                return
+            val = float(np.clip(event.ydata, 0.0, 1.0))
+            e = self._sel
+            if e:
+                e.spectral_threshold = val
+            self._sb_entropy_thr.blockSignals(True)
+            self._sb_entropy_thr.setValue(val)
+            self._sb_entropy_thr.blockSignals(False)
+            self._sync_entropy_thr_line(val)
 
     def _on_mpl_release(self, event):
-        if self._dragging:
+        if self._dragging or self._dragging_entropy:
             self._dragging = False
+            self._dragging_entropy = False
             self._timer.start()
 
     def _on_scroll(self, event):
@@ -3155,6 +3226,16 @@ class ChirpWindow(QMainWindow):
         stereo = e.channel_mode == 'Stereo'
         self._setup_axes(stereo=stereo)
         self._update_spec_yticks(e)
+
+    def _on_detect_mode_changed(self, mode: str):
+        self._sl_entropy_thr.setEnabled(mode != 'Amplitude Only')
+        self._sb_entropy_thr.setEnabled(mode != 'Amplitude Only')
+        self._write_trigger_params()
+        e = self._sel
+        if e:
+            stereo = e.channel_mode == 'Stereo'
+            self._setup_axes(stereo=stereo)
+            self._update_spec_yticks(e)
 
     def _on_freq_scale_changed(self, scale: str):
         e = self._sel
@@ -3487,21 +3568,26 @@ class ChirpWindow(QMainWindow):
             dmode = e.display_mode
             show_spec = dmode in ('Spectrogram', 'Both')
             show_wave = dmode in ('Waveform', 'Both')
+            show_entropy = (e.spectral_trigger_mode != 'Amplitude Only')
 
-            # Determine inner gridspec layout
-            if dmode == 'Both':
-                inner = outer_gs[r, c].subgridspec(3, 1, height_ratios=[3, 1, 1], hspace=0.08)
-                inner_spec_row = 0
-                inner_wave_row = 1
-                inner_amp_row = 2
-            elif dmode == 'Waveform':
-                inner = outer_gs[r, c].subgridspec(2, 1, height_ratios=[3, 1], hspace=0.08)
-                inner_wave_row = 0
-                inner_amp_row = 1
-            else:  # Spectrogram
-                inner = outer_gs[r, c].subgridspec(2, 1, height_ratios=[3, 1], hspace=0.08)
-                inner_spec_row = 0
-                inner_amp_row = 1
+            # Build inner subplot rows
+            inner_rows = []
+            inner_ratios = []
+            if show_spec:
+                inner_rows.append('spec')
+                inner_ratios.append(3)
+            if show_wave:
+                inner_rows.append('wave')
+                inner_ratios.append(1 if show_spec else 3)
+            inner_rows.append('amp')
+            inner_ratios.append(1)
+            if show_entropy:
+                inner_rows.append('entropy')
+                inner_ratios.append(1)
+
+            inner = outer_gs[r, c].subgridspec(
+                len(inner_rows), 1, height_ratios=inner_ratios, hspace=0.08)
+            inner_idx = {key: idx for idx, key in enumerate(inner_rows)}
 
             # Create axes based on display mode
             ax_spec = None
@@ -3511,6 +3597,10 @@ class ChirpWindow(QMainWindow):
             wave_line = None
             wave_line_r = None
             cursor_wave = None
+            ax_entropy = None
+            entropy_line = None
+            entropy_thr_line = None
+            cursor_entropy = None
 
             e_disp = e.display_seconds
             e_ts = e._total_samples
@@ -3518,10 +3608,10 @@ class ChirpWindow(QMainWindow):
 
             # First axis (anchor for sharex)
             if show_spec:
-                ax_spec = self._fig.add_subplot(inner[inner_spec_row])
+                ax_spec = self._fig.add_subplot(inner[inner_idx['spec']])
                 first_ax = ax_spec
             elif show_wave:
-                ax_wave = self._fig.add_subplot(inner[inner_wave_row])
+                ax_wave = self._fig.add_subplot(inner[inner_idx['wave']])
                 first_ax = ax_wave
 
             if show_spec:
@@ -3540,7 +3630,7 @@ class ChirpWindow(QMainWindow):
 
             if show_wave:
                 if ax_wave is None:
-                    ax_wave = self._fig.add_subplot(inner[inner_wave_row], sharex=first_ax)
+                    ax_wave = self._fig.add_subplot(inner[inner_idx['wave']], sharex=first_ax)
                 amp_ylim = e.amp_ylim
                 (wave_line,) = ax_wave.plot(
                     e_t_axis, np.zeros(e_ts),
@@ -3562,7 +3652,7 @@ class ChirpWindow(QMainWindow):
                 ax_wave.tick_params(labelbottom=False)
                 ax_wave.set_ylabel('Wave', fontsize=7)
 
-            ax_amp = self._fig.add_subplot(inner[inner_amp_row], sharex=first_ax)
+            ax_amp = self._fig.add_subplot(inner[inner_idx['amp']], sharex=first_ax)
 
             (amp_line,) = ax_amp.plot(
                 e_t_axis, np.zeros(e_ts),
@@ -3591,6 +3681,31 @@ class ChirpWindow(QMainWindow):
 
             ax_amp.set_ylabel('Amp', fontsize=7)
 
+            # Entropy subplot
+            if show_entropy:
+                ax_entropy = self._fig.add_subplot(inner[inner_idx['entropy']], sharex=first_ax)
+                ent_t = np.linspace(0.0, e_disp, e._n_cols, endpoint=False, dtype=np.float32)
+                (entropy_line,) = ax_entropy.plot(
+                    ent_t, np.ones(e._n_cols),
+                    color=C['mauve'], linewidth=0.6, antialiased=False,
+                )
+                ax_entropy.set_xlim(0.0, e_disp)
+                ax_entropy.set_ylim(0.0, 1.05)
+                entropy_thr_line = ax_entropy.axhline(
+                    y=e.spectral_threshold, color=C['peach'], linewidth=1.0,
+                    linestyle=(0, (6, 3)),
+                )
+                cursor_entropy = ax_entropy.axvline(
+                    x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
+                ax_entropy.set_ylabel('Ent', fontsize=7)
+                ax_entropy.tick_params(labelbottom=False)
+                # Move x-label from amp to entropy
+                ax_amp.tick_params(labelbottom=False)
+                if r >= rows - 1:
+                    ax_entropy.tick_params(labelbottom=True)
+                    ax_entropy.set_xlabel('Time (s)', fontsize=7)
+                    ax_amp.set_xlabel('')
+
             # Title and status on the topmost axis
             top_ax = ax_spec if ax_spec is not None else ax_wave
             title_obj = top_ax.set_title(e.name, loc='left', fontsize=9,
@@ -3601,12 +3716,14 @@ class ChirpWindow(QMainWindow):
 
             self._vm_axes.append({
                 'ax_spec': ax_spec, 'ax_amp': ax_amp, 'ax_wave': ax_wave,
+                'ax_entropy': ax_entropy,
                 'spec_im': spec_im,
                 'amp_line': amp_line, 'amp_line_r': amp_line_r,
                 'wave_line': wave_line, 'wave_line_r': wave_line_r,
+                'entropy_line': entropy_line,
                 'cursor_spec': cursor_spec, 'cursor_amp': cursor_amp,
-                'cursor_wave': cursor_wave,
-                'thr_line': thr_line,
+                'cursor_wave': cursor_wave, 'cursor_entropy': cursor_entropy,
+                'thr_line': thr_line, 'entropy_thr_line': entropy_thr_line,
                 'title': title_obj, 'status_text': status_text,
             })
 
@@ -3671,6 +3788,13 @@ class ChirpWindow(QMainWindow):
 
             vm['cursor_amp'].set_xdata([cursor_x, cursor_x])
             vm['thr_line'].set_ydata([e.threshold, e.threshold])
+
+            # Entropy
+            if vm.get('entropy_line') is not None:
+                col_cursor_x = (e.col_head / e._n_cols) * e.display_seconds
+                vm['entropy_line'].set_ydata(e.entropy_buffer)
+                vm['cursor_entropy'].set_xdata([col_cursor_x, col_cursor_x])
+                vm['entropy_thr_line'].set_ydata([e.spectral_threshold, e.spectral_threshold])
 
             # Status text
             parts = []
@@ -3762,6 +3886,15 @@ class ChirpWindow(QMainWindow):
                 self._amp_line_r.set_ydata(e.abs_amp_buffer_r)
             self._cursor_amp .set_xdata([cursor_x, cursor_x])
 
+            # Entropy trace
+            if self._entropy_line is not None:
+                col_cursor_x = (e.col_head / e._n_cols) * e.display_seconds
+                self._entropy_line.set_ydata(e.entropy_buffer)
+                self._cursor_entropy.set_xdata([col_cursor_x, col_cursor_x])
+                self._entropy_thr_line.set_ydata([e.spectral_threshold, e.spectral_threshold])
+                self._entropy_thr_label.set_y(e.spectral_threshold + 0.03)
+                self._entropy_thr_label.set_text(f'ent = {e.spectral_threshold:.3f}')
+
             self._canvas.restore_region(self._bg)
             for a in self._get_config_artists():
                 a.axes.draw_artist(a)
@@ -3799,10 +3932,10 @@ class ChirpWindow(QMainWindow):
                 self._lbl_entropy.setStyleSheet(f'color: {C["green"]}; font-size: 10pt;')
             else:
                 self._lbl_entropy.setText(f'ENT  {ent_val:.3f}')
-                self._lbl_entropy.setStyleSheet(f'color: {C["subtext0"]}; font-size: 10pt;')
+                self._lbl_entropy.setStyleSheet(f'color: {C["subtext"]}; font-size: 10pt;')
         else:
             self._lbl_entropy.setText('ENT  \u2014')
-            self._lbl_entropy.setStyleSheet(f'color: {C["subtext0"]}; font-size: 10pt;')
+            self._lbl_entropy.setStyleSheet(f'color: {C["subtext"]}; font-size: 10pt;')
 
     # ──────────────────────────────────────────────────────────────────────
 
