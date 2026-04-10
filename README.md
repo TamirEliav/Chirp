@@ -138,7 +138,9 @@ python chirp.py
 
 ## User Manual
 
-A detailed HTML manual covering all features, settings, and workflows is available at `manual.html` in the repository root.
+A detailed HTML manual covering all features, settings, and workflows is included in this repository.
+
+**[Open User Manual](https://htmlpreview.github.io/?https://github.com/TamirEliav/Chirp/blob/master/manual.html)**
 
 ---
 
