@@ -236,12 +236,19 @@ class SpectrogramAccumulator:
         self._overlap = np.zeros(self._n, dtype=np.float32)
         self._window  = scipy.signal.windows.get_window(window, self._n).astype(np.float32)
 
-    def compute_column(self, chunk: np.ndarray) -> np.ndarray:
+    def compute_column(self, chunk: np.ndarray):
+        """Return (dB_column, linear_magnitude).
+
+        *dB_column* is the log-magnitude spectrogram column (float32).
+        *linear_magnitude* is the raw |FFT| before dB conversion (float32),
+        useful for computing spectral entropy.
+        """
         combined    = np.concatenate([self._overlap, chunk])
         window_data = combined[-self._n:]
         self._overlap = window_data.copy()
         fft_mag = np.abs(np.fft.rfft(window_data * self._window))
-        return (20.0 * np.log10(fft_mag + 1e-10)).astype(np.float32)
+        db_col  = (20.0 * np.log10(fft_mag + 1e-10)).astype(np.float32)
+        return db_col, fft_mag
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -480,6 +487,12 @@ class RecordingEntity:
         self.freq_filter_enabled = False
         self.freq_lo       = DEFAULT_FREQ_LO
         self.freq_hi       = DEFAULT_FREQ_HI
+
+        # Spectral trigger params
+        self.spectral_trigger_mode = 'Amplitude Only'  # 'Amplitude Only', 'Spectral Only', 'Amp AND Spectral', 'Amp OR Spectral'
+        self.spectral_threshold    = 0.5                # entropy threshold (trigger when below)
+        self.spectral_entropy      = 1.0                # current entropy value (display only)
+        self.spectral_entropy_r    = 1.0                # right channel entropy (stereo)
 
         # Spectrogram display
         self.spec_nperseg = SPECTROGRAM_NPERSEG
@@ -720,9 +733,11 @@ class RecordingEntity:
         end = self.write_head + n
 
         # Spectrogram always uses unfiltered signal
-        self.spec_buffer[:, self.col_head] = self.spec_acc.compute_column(display)
+        db_col, lin_mag = self.spec_acc.compute_column(display)
+        self.spec_buffer[:, self.col_head] = db_col
         if mode == 'Stereo':
-            self.spec_buffer_r[:, self.col_head] = self.spec_acc_r.compute_column(right)
+            db_col_r, lin_mag_r = self.spec_acc_r.compute_column(right)
+            self.spec_buffer_r[:, self.col_head] = db_col_r
 
         # Trigger peak + filtered signal for amplitude display
         freq_on = self.freq_filter_enabled
@@ -758,6 +773,50 @@ class RecordingEntity:
 
         # Saturation detection (hard clipping in normalized float32)
         self.saturated = trigger_peak >= 0.99
+
+        # ── Spectral entropy computation ──────────────────────────────
+        def _entropy(mag):
+            s = mag.sum()
+            if s < 1e-30:
+                return 1.0
+            p = mag / s
+            p = p[p > 0]
+            n = len(mag)
+            h = -float(np.sum(p * np.log2(p)))
+            return h / np.log2(n) if n > 1 else 0.0
+
+        entropy_l = _entropy(lin_mag)
+        if mode == 'Stereo':
+            entropy_r = _entropy(lin_mag_r)
+            self.spectral_entropy_r = entropy_r
+            # Combine entropy per trigger_mode (same logic as amplitude)
+            tm = self.trigger_mode
+            if tm == 'Left Channel':
+                entropy = entropy_l
+            elif tm == 'Right Channel':
+                entropy = entropy_r
+            elif tm == 'Any Channel':
+                entropy = min(entropy_l, entropy_r)   # min = most tonal
+            elif tm == 'Both Channels':
+                entropy = max(entropy_l, entropy_r)   # max = both must be tonal
+            else:  # Average
+                entropy = (entropy_l + entropy_r) * 0.5
+        else:
+            entropy = entropy_l
+        self.spectral_entropy = entropy
+
+        # ── Apply spectral trigger mode ───────────────────────────────
+        stm = self.spectral_trigger_mode
+        if stm != 'Amplitude Only':
+            spec_triggered = (entropy < self.spectral_threshold)
+            if stm == 'Spectral Only':
+                trigger_peak = self.threshold if spec_triggered else 0.0
+            elif stm == 'Amp AND Spectral':
+                if not spec_triggered:
+                    trigger_peak = 0.0
+            elif stm == 'Amp OR Spectral':
+                if spec_triggered and trigger_peak < self.threshold:
+                    trigger_peak = self.threshold
 
         # Write amplitude buffers (filtered when band filter active)
         if mode == 'Stereo':
@@ -865,6 +924,8 @@ class RecordingEntity:
             'ref_date':            self.ref_date.isoformat() if self.ref_date else None,
             'dph_folder_prefix':   self.dph_folder_prefix,
             'amp_ylim':            self.amp_ylim,
+            'spectral_trigger_mode': self.spectral_trigger_mode,
+            'spectral_threshold':    self.spectral_threshold,
         }
 
     @classmethod
@@ -902,7 +963,8 @@ class RecordingEntity:
                      'freq_scale', 'gain_db', 'db_floor', 'db_ceil',
                      'display_freq_lo', 'display_freq_hi',
                      'output_dir', 'filename_prefix', 'filename_suffix',
-                     'dph_folder_prefix', 'amp_ylim'):
+                     'dph_folder_prefix', 'amp_ylim',
+                     'spectral_trigger_mode', 'spectral_threshold'):
             if attr in d:
                 setattr(e, attr, d[attr])
 
@@ -1668,15 +1730,19 @@ class ChirpWindow(QMainWindow):
         self._lbl_acq_status  = QLabel('ACQ  \u25cf  STOPPED')
         self._lbl_rec_status  = QLabel('REC  \u25cf  STOPPED')
         self._lbl_trig_status = QLabel('TRIG \u25cf  IDLE')
+        self._lbl_entropy     = QLabel('ENT  —')
         self._lbl_acq_status .setObjectName('status_off')
         self._lbl_rec_status .setObjectName('status_off')
         self._lbl_trig_status.setObjectName('trig_idle')
+        self._lbl_entropy    .setObjectName('trig_idle')
         mono = QFont('Consolas', 10)
-        for lbl in (self._lbl_acq_status, self._lbl_rec_status, self._lbl_trig_status):
+        for lbl in (self._lbl_acq_status, self._lbl_rec_status, self._lbl_trig_status,
+                     self._lbl_entropy):
             lbl.setFont(mono)
         status_v.addWidget(self._lbl_acq_status)
         status_v.addWidget(self._lbl_rec_status)
         status_v.addWidget(self._lbl_trig_status)
+        status_v.addWidget(self._lbl_entropy)
         self._blink_counter = 0
 
         self._btn_reset = QPushButton('Reset Params')
@@ -1795,7 +1861,38 @@ class ChirpWindow(QMainWindow):
         filt_row.addStretch()
         trig_g.addLayout(filt_row, 5, 0, 1, 3)
 
-        # Auto-calibrate row (row 6)
+        # Detect mode row (row 6)
+        lbl_detect = QLabel('Detect Mode')
+        lbl_detect.setObjectName('param_label')
+        lbl_detect.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        self._combo_detect_mode = QComboBox()
+        self._combo_detect_mode.setFixedWidth(160)
+        for dm in ('Amplitude Only', 'Spectral Only', 'Amp AND Spectral', 'Amp OR Spectral'):
+            self._combo_detect_mode.addItem(dm)
+        self._combo_detect_mode.setCurrentText('Amplitude Only')
+
+        detect_row = QHBoxLayout()
+        detect_row.setSpacing(8)
+        detect_row.addWidget(lbl_detect)
+        detect_row.addWidget(self._combo_detect_mode)
+        detect_row.addStretch()
+        trig_g.addLayout(detect_row, 6, 0, 1, 3)
+
+        # Entropy threshold row (row 7)
+        _ENTROPY_SCALE = 100  # slider integer ticks per unit
+        self._sl_entropy_thr, self._sb_entropy_thr = self._param_row(trig_g, 7, 0, 'Entropy Thr',
+            sl_min=0, sl_max=100, sl_init=50,
+            sb_min=0.0, sb_max=1.0, sb_step=0.01, sb_dec=2, suffix='',
+            scale=_ENTROPY_SCALE)
+        self._sl_entropy_thr.setEnabled(False)
+        self._sb_entropy_thr.setEnabled(False)
+
+        self._combo_detect_mode.currentTextChanged.connect(lambda m: (
+            self._sl_entropy_thr.setEnabled(m != 'Amplitude Only'),
+            self._sb_entropy_thr.setEnabled(m != 'Amplitude Only'),
+        ))
+
+        # Auto-calibrate row (row 8)
         self._btn_calibrate = QPushButton('Auto Calibrate')
         self._btn_calibrate.setObjectName('btn_small')
         self._btn_calibrate.setFixedWidth(110)
@@ -1836,7 +1933,7 @@ class ChirpWindow(QMainWindow):
         calib_row.addWidget(self._sb_calib_margin)
         calib_row.addWidget(self._lbl_calib_status)
         calib_row.addStretch()
-        trig_g.addLayout(calib_row, 6, 0, 1, 3)
+        trig_g.addLayout(calib_row, 8, 0, 1, 3)
 
         outer.addWidget(trig_box)
         return w
@@ -2164,6 +2261,9 @@ class ChirpWindow(QMainWindow):
         self._sb_maxr.valueChanged.connect(lambda _: self._write_trigger_params())
         self._sl_pre .valueChanged.connect(lambda _: self._write_trigger_params())
         self._sb_pre .valueChanged.connect(lambda _: self._write_trigger_params())
+        self._combo_detect_mode.currentTextChanged.connect(lambda _: self._write_trigger_params())
+        self._sl_entropy_thr.valueChanged.connect(lambda _: self._write_trigger_params())
+        self._sb_entropy_thr.valueChanged.connect(lambda _: self._write_trigger_params())
 
         # Spectrogram display write-through
         self._sl_gain .valueChanged.connect(lambda _: self._write_spec_params())
@@ -2205,6 +2305,8 @@ class ChirpWindow(QMainWindow):
         e.post_trig_sec = self._sb_post_trig.value()
         e.max_rec_sec   = self._sb_maxr.value()
         e.pre_trig_sec  = self._sb_pre.value()
+        e.spectral_trigger_mode = self._combo_detect_mode.currentText()
+        e.spectral_threshold    = self._sb_entropy_thr.value()
 
     def _write_spec_params(self):
         e = self._sel
@@ -2271,6 +2373,8 @@ class ChirpWindow(QMainWindow):
         e.channel_mode  = self._chan_combo.currentText()
         e.trigger_mode  = self._trig_combo.currentText()
         e.device_id     = self._device_combo.currentData()
+        e.spectral_trigger_mode = self._combo_detect_mode.currentText()
+        e.spectral_threshold    = self._sb_entropy_thr.value()
 
     def _load_params_from_entity(self, idx: int):
         if idx < 0 or idx >= len(self._entities):
@@ -2367,6 +2471,17 @@ class ChirpWindow(QMainWindow):
         self._trig_combo.setCurrentText(e.trigger_mode)
         self._trig_combo.blockSignals(False)
         self._trig_combo.setEnabled(e.channel_mode == 'Stereo')
+
+        # Spectral trigger mode
+        self._combo_detect_mode.blockSignals(True)
+        self._combo_detect_mode.setCurrentText(e.spectral_trigger_mode)
+        self._combo_detect_mode.blockSignals(False)
+        _ENTROPY_SCALE = 100
+        _set(self._sb_entropy_thr, e.spectral_threshold)
+        _set(self._sl_entropy_thr, int(round(e.spectral_threshold * _ENTROPY_SCALE)))
+        ent_on = (e.spectral_trigger_mode != 'Amplitude Only')
+        self._sl_entropy_thr.setEnabled(ent_on)
+        self._sb_entropy_thr.setEnabled(ent_on)
 
         # Sample rate combo
         self._sr_combo.blockSignals(True)
@@ -2522,6 +2637,8 @@ class ChirpWindow(QMainWindow):
         self._chk_freq.setChecked(False)
         self._sb_freq_lo.setValue(DEFAULT_FREQ_LO)
         self._sb_freq_hi.setValue(DEFAULT_FREQ_HI)
+        self._combo_detect_mode.setCurrentText('Amplitude Only')
+        self._sb_entropy_thr.setValue(0.5)
         self._sb_gain .setValue(0.0)
         self._sb_floor.setValue(SPEC_DB_MIN)
         self._sb_ceil .setValue(SPEC_DB_MAX)
@@ -3423,6 +3540,20 @@ class ChirpWindow(QMainWindow):
             self._lbl_trig_status.setObjectName('trig_idle')
         self._lbl_trig_status.style().unpolish(self._lbl_trig_status)
         self._lbl_trig_status.style().polish(self._lbl_trig_status)
+
+        # 7. Entropy display
+        if e and e.acq_running:
+            ent_val = e.spectral_entropy
+            below = ent_val < e.spectral_threshold
+            if e.spectral_trigger_mode != 'Amplitude Only' and below:
+                self._lbl_entropy.setText(f'ENT  {ent_val:.3f} \u25bc')
+                self._lbl_entropy.setStyleSheet(f'color: {C["green"]}; font-size: 10pt;')
+            else:
+                self._lbl_entropy.setText(f'ENT  {ent_val:.3f}')
+                self._lbl_entropy.setStyleSheet(f'color: {C["subtext0"]}; font-size: 10pt;')
+        else:
+            self._lbl_entropy.setText('ENT  \u2014')
+            self._lbl_entropy.setStyleSheet(f'color: {C["subtext0"]}; font-size: 10pt;')
 
     # ──────────────────────────────────────────────────────────────────────
 
