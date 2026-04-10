@@ -4,7 +4,7 @@
 
 Chirp is a desktop application for multi-stream audio monitoring, visualization, and threshold-triggered recording. It was designed with bioacoustics research in mind but works for any audio analysis task.
 
-![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
+![Version](https://img.shields.io/badge/Version-v2.0.0-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 ---
 
@@ -18,10 +18,12 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 
 ### Real-Time Visualization
 - **Spectrogram** display with configurable FFT size, window function, and frequency scale (Linear / Log / Mel)
-- **Amplitude waveform** with scrollable Y-axis zoom
+- **Amplitude envelope** with scrollable Y-axis zoom
+- **Raw waveform** display showing signed audio samples (teal color)
 - Adjustable display buffer duration (5s – 60s)
 - Gain, dB floor, and dB ceiling controls for spectrogram contrast
 - Configurable frequency display range
+- Scroll-wheel zoom on waveform and spectrogram axes (centered on mouse position)
 
 ### Threshold-Triggered Recording
 - Automatic recording triggered when amplitude crosses a configurable threshold
@@ -30,6 +32,18 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - **Post-trigger window** extends saved audio by a configurable duration after the last crossing
 - Adjustable minimum crossing duration and maximum recording duration
 - Drag the threshold line directly on the amplitude plot
+- **Stereo channel selection** — trigger on Left Channel, Right Channel, Average, Any Channel, or Both Channels
+- **Auto-Calibrate** — automatically measure ambient noise and set threshold with configurable calibration duration and margin multiplier
+
+### Spectral Entropy Trigger
+- Detect tonal sounds by monitoring spectral entropy computed from FFT magnitudes
+- Normalized Shannon entropy: 0 = pure tone, 1 = white noise
+- **Four detection modes**: Amplitude Only (default), Spectral Only, Amp AND Spectral, Amp OR Spectral
+- Configurable entropy threshold (triggers when entropy falls **below** the threshold)
+- Real-time entropy trace plot (appears when a spectral mode is active)
+- Draggable entropy threshold line on the plot
+- Live entropy readout in the status panel
+- Shares the same FFT window as the spectrogram for efficiency
 
 ### Saturation Detection
 - Real-time clipping detection when audio peaks reach ≥ 99% of full scale
@@ -43,9 +57,19 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - Custom output folder, filename prefix, and suffix per stream
 - **Reference date tracking** with automatic day-count subfolder naming (e.g., for days post-hatch)
 
+### Three Visualization Modes
+- Selectable via the **View** combo in the Display panel:
+  - **Spectrogram** (default) — spectrogram + amplitude envelope
+  - **Waveform** — raw signed audio waveform (teal) + amplitude envelope
+  - **Both** — spectrogram + waveform + amplitude envelope
+- Works in stereo and in View Mode
+
 ### Two Display Modes
 - **Config Mode** — full control panel for adjusting all parameters
 - **View Mode** — distraction-free monitoring of all streams with adjustable grid columns and panel height
+
+### Theme
+- **Catppuccin Mocha** dark theme with teal and peach accent colors
 
 ### Settings Persistence
 - **Save** and **Save As** for configuration files (`.json` format)
@@ -107,8 +131,14 @@ python chirp.py
 - Switch to **View Mode** for a clean multi-stream monitoring layout
 
 ### Saving Your Setup
-- Use **Save Settings** to export your full configuration to a `.chirp` file
-- Use **Load Settings** to restore it later
+- Use **Save Settings** to export your full configuration to a `.json` file
+- Use **Load Settings** to restore it later (also reads legacy `.chirp` files)
+
+---
+
+## User Manual
+
+A detailed HTML manual covering all features, settings, and workflows is available at `manual.html` in the repository root.
 
 ---
 

@@ -1,0 +1,942 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chirp v2.0.0 — User Manual</title>
+<style>
+  :root {
+    --base: #1e1e2e;
+    --mantle: #181825;
+    --crust: #11111b;
+    --surface0: #313244;
+    --surface1: #45475a;
+    --surface2: #585b70;
+    --overlay0: #6c7086;
+    --text: #cdd6f4;
+    --subtext0: #a6adc8;
+    --subtext1: #bac2de;
+    --blue: #89b4fa;
+    --green: #a6e3a1;
+    --yellow: #f9e2af;
+    --red: #f38ba8;
+    --mauve: #cba6f7;
+    --peach: #fab387;
+    --teal: #94e2d5;
+    --lavender: #b4befe;
+    --pink: #f5c2e7;
+    --sky: #89dceb;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html { scroll-behavior: smooth; font-size: 16px; }
+
+  body {
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    background: var(--base);
+    color: var(--text);
+    line-height: 1.7;
+    display: flex;
+    min-height: 100vh;
+  }
+
+  /* ── Sidebar Navigation ── */
+  nav.sidebar {
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    width: 260px;
+    min-width: 260px;
+    background: var(--mantle);
+    border-right: 1px solid var(--surface0);
+    overflow-y: auto;
+    padding: 1.5rem 0;
+    z-index: 100;
+  }
+
+  nav.sidebar .logo {
+    text-align: center;
+    padding: 0 1rem 1.25rem;
+    border-bottom: 1px solid var(--surface0);
+    margin-bottom: 1rem;
+  }
+
+  nav.sidebar .logo h1 {
+    font-size: 1.5rem;
+    color: var(--blue);
+    font-weight: 700;
+    letter-spacing: 0.05em;
+  }
+
+  nav.sidebar .logo span {
+    font-size: 0.75rem;
+    color: var(--overlay0);
+    display: block;
+    margin-top: 0.15rem;
+  }
+
+  nav.sidebar ul { list-style: none; }
+
+  nav.sidebar > ul > li > a {
+    display: block;
+    padding: 0.4rem 1.25rem;
+    color: var(--subtext0);
+    text-decoration: none;
+    font-size: 0.85rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    transition: color 0.15s, background 0.15s;
+  }
+
+  nav.sidebar > ul > li > a:hover { color: var(--blue); background: var(--surface0); }
+
+  nav.sidebar > ul > li > ul { margin-bottom: 0.5rem; }
+
+  nav.sidebar > ul > li > ul > li > a {
+    display: block;
+    padding: 0.25rem 1.25rem 0.25rem 2rem;
+    color: var(--subtext0);
+    text-decoration: none;
+    font-size: 0.8rem;
+    transition: color 0.15s, background 0.15s;
+  }
+
+  nav.sidebar > ul > li > ul > li > a:hover { color: var(--green); background: var(--surface0); }
+
+  /* ── Main Content ── */
+  main {
+    flex: 1;
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 2.5rem 3rem 4rem;
+  }
+
+  h2 {
+    color: var(--blue);
+    font-size: 1.6rem;
+    margin: 2.5rem 0 0.75rem;
+    padding-bottom: 0.35rem;
+    border-bottom: 2px solid var(--surface0);
+  }
+
+  h3 {
+    color: var(--lavender);
+    font-size: 1.15rem;
+    margin: 1.5rem 0 0.5rem;
+  }
+
+  h4 {
+    color: var(--teal);
+    font-size: 1rem;
+    margin: 1.2rem 0 0.4rem;
+  }
+
+  p { margin-bottom: 0.75rem; }
+
+  a { color: var(--blue); text-decoration: underline; text-underline-offset: 2px; }
+  a:hover { color: var(--sky); }
+
+  code {
+    font-family: "Cascadia Code", "Fira Code", "Consolas", monospace;
+    background: var(--surface0);
+    padding: 0.15em 0.4em;
+    border-radius: 4px;
+    font-size: 0.9em;
+  }
+
+  pre {
+    background: var(--mantle);
+    border: 1px solid var(--surface0);
+    border-radius: 6px;
+    padding: 1rem 1.25rem;
+    overflow-x: auto;
+    margin: 0.75rem 0 1rem;
+    font-size: 0.88rem;
+    line-height: 1.5;
+  }
+
+  pre code { background: none; padding: 0; }
+
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; }
+  li { margin-bottom: 0.3rem; }
+
+  /* ── Tables ── */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0.75rem 0 1.25rem;
+    font-size: 0.9rem;
+  }
+
+  th {
+    background: var(--surface0);
+    color: var(--blue);
+    text-align: left;
+    padding: 0.6rem 0.75rem;
+    font-weight: 600;
+  }
+
+  td {
+    padding: 0.5rem 0.75rem;
+    border-bottom: 1px solid var(--surface0);
+  }
+
+  tr:hover td { background: rgba(137, 180, 250, 0.04); }
+
+  /* ── Callout Boxes ── */
+  .callout {
+    border-left: 4px solid var(--blue);
+    background: rgba(137, 180, 250, 0.06);
+    padding: 0.75rem 1rem;
+    border-radius: 0 6px 6px 0;
+    margin: 0.75rem 0 1rem;
+    font-size: 0.92rem;
+  }
+
+  .callout.tip { border-left-color: var(--green); background: rgba(166, 227, 161, 0.06); }
+  .callout.warning { border-left-color: var(--yellow); background: rgba(249, 226, 175, 0.06); }
+  .callout.danger { border-left-color: var(--red); background: rgba(243, 139, 168, 0.06); }
+
+  .callout strong { color: var(--blue); }
+  .callout.tip strong { color: var(--green); }
+  .callout.warning strong { color: var(--yellow); }
+  .callout.danger strong { color: var(--red); }
+
+  /* ── Collapsible Sections ── */
+  details {
+    background: var(--mantle);
+    border: 1px solid var(--surface0);
+    border-radius: 6px;
+    margin: 0.75rem 0;
+    transition: background 0.2s;
+  }
+
+  details[open] { background: var(--base); }
+
+  summary {
+    padding: 0.65rem 1rem;
+    cursor: pointer;
+    font-weight: 600;
+    color: var(--subtext1);
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    user-select: none;
+  }
+
+  summary::-webkit-details-marker { display: none; }
+
+  summary::before {
+    content: "\25B6";
+    font-size: 0.65rem;
+    color: var(--overlay0);
+    transition: transform 0.2s;
+  }
+
+  details[open] > summary::before { transform: rotate(90deg); }
+
+  details > div { padding: 0 1rem 0.75rem; }
+
+  /* ── Keyboard shortcuts ── */
+  kbd {
+    background: var(--surface0);
+    border: 1px solid var(--surface1);
+    border-radius: 4px;
+    padding: 0.1em 0.45em;
+    font-family: inherit;
+    font-size: 0.85em;
+    box-shadow: 0 1px 0 var(--surface1);
+  }
+
+  /* ── Header banner ── */
+  .hero {
+    text-align: center;
+    padding: 2rem 0 1.5rem;
+    border-bottom: 1px solid var(--surface0);
+    margin-bottom: 1.5rem;
+  }
+
+  .hero h1 { font-size: 2.2rem; color: var(--blue); margin-bottom: 0.25rem; }
+  .hero .subtitle { color: var(--subtext0); font-size: 1rem; }
+  .hero .version {
+    display: inline-block;
+    margin-top: 0.5rem;
+    background: var(--surface0);
+    color: var(--green);
+    padding: 0.2rem 0.7rem;
+    border-radius: 999px;
+    font-size: 0.78rem;
+    font-weight: 600;
+  }
+
+  /* ── Print styles ── */
+  @media print {
+    nav.sidebar { display: none; }
+    body { background: #fff; color: #222; display: block; }
+    main { max-width: 100%; padding: 1rem; }
+    h2 { color: #1a5fb4; border-bottom-color: #ccc; }
+    h3 { color: #333; }
+    .callout { border-left-color: #888; background: #f5f5f5; }
+    details { border-color: #ccc; }
+    details[open] { background: #fff; }
+    pre { background: #f5f5f5; border-color: #ccc; }
+    code { background: #eee; }
+    a { color: #1a5fb4; }
+    th { background: #eee; color: #1a5fb4; }
+    td { border-bottom-color: #ddd; }
+    .hero { border-bottom-color: #ccc; }
+  }
+
+  @media (max-width: 800px) {
+    nav.sidebar { display: none; }
+    main { padding: 1.5rem 1.25rem; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<!-- SIDEBAR NAVIGATION                                                 -->
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<nav class="sidebar">
+  <div class="logo">
+    <h1>Chirp</h1>
+    <span>User Manual &mdash; v2.0.0</span>
+  </div>
+  <ul>
+    <li><a href="#overview">Overview</a></li>
+    <li><a href="#installation">Installation</a></li>
+    <li>
+      <a href="#ui-layout">Interface Layout</a>
+      <ul>
+        <li><a href="#sidebar-panel">Sidebar</a></li>
+        <li><a href="#canvas">Canvas</a></li>
+        <li><a href="#transport-bar">Transport Bar</a></li>
+        <li><a href="#trigger-panel">Trigger Panel</a></li>
+        <li><a href="#display-panel">Display Panel</a></li>
+        <li><a href="#settings-panel">Settings Panel</a></li>
+      </ul>
+    </li>
+    <li>
+      <a href="#visualization">Visualization</a>
+      <ul>
+        <li><a href="#view-spectrogram">Spectrogram</a></li>
+        <li><a href="#view-waveform">Waveform</a></li>
+        <li><a href="#view-both">Both</a></li>
+        <li><a href="#stereo-display">Stereo Display</a></li>
+      </ul>
+    </li>
+    <li>
+      <a href="#triggered-recording">Triggered Recording</a>
+      <ul>
+        <li><a href="#state-machine">State Machine</a></li>
+        <li><a href="#trigger-params">Parameters</a></li>
+        <li><a href="#output-files">Output Files</a></li>
+      </ul>
+    </li>
+    <li>
+      <a href="#spectral-entropy">Spectral Entropy</a>
+      <ul>
+        <li><a href="#detect-modes">Detect Modes</a></li>
+        <li><a href="#entropy-plot">Entropy Plot</a></li>
+      </ul>
+    </li>
+    <li><a href="#auto-calibrate">Auto-Calibrate</a></li>
+    <li><a href="#bandpass-filter">Bandpass Filter</a></li>
+    <li><a href="#channels">Channel Modes</a></li>
+    <li><a href="#view-mode">View Mode</a></li>
+    <li><a href="#settings-mgmt">Settings Management</a></li>
+    <li><a href="#interactions">Mouse &amp; Keyboard</a></li>
+    <li><a href="#tips">Tips &amp; Best Practices</a></li>
+  </ul>
+</nav>
+
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<!-- MAIN CONTENT                                                       -->
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<main>
+
+<!-- Hero -->
+<header class="hero">
+  <h1>Chirp</h1>
+  <p class="subtitle">Real-Time Audio Monitoring, Visualization &amp; Triggered Recording</p>
+  <span class="version">v2.0.0</span>
+</header>
+
+<!-- ── 1. Overview ── -->
+<section id="overview">
+  <h2>Overview</h2>
+  <p>
+    Chirp is a desktop application built with Python, PyQt5, and matplotlib for real-time audio
+    monitoring, spectral visualization, and threshold-triggered recording. It was designed for
+    bioacoustics research but is suitable for any scenario requiring continuous audio surveillance
+    with automatic capture of events of interest.
+  </p>
+  <h3>Key Capabilities</h3>
+  <ul>
+    <li>Live spectrogram, waveform, and amplitude visualization</li>
+    <li>Threshold-triggered recording with configurable pre- and post-trigger buffers</li>
+    <li>Spectral entropy trigger for tonal sound detection</li>
+    <li>Multi-stream support &mdash; monitor several audio devices simultaneously</li>
+    <li>Stereo channel analysis with per-channel trigger logic</li>
+    <li>Optional bandpass filtering for frequency-specific triggering</li>
+    <li>Configurable display: FFT size, window function, frequency scale, view modes</li>
+    <li>Dark-themed UI using the Catppuccin Mocha color palette</li>
+    <li>Save and load full session configurations as JSON</li>
+  </ul>
+  <p>
+    The entire application is contained in a single Python file (<code>chirp.py</code>), making
+    deployment and modification straightforward.
+  </p>
+</section>
+
+<!-- ── 2. Installation ── -->
+<section id="installation">
+  <h2>Installation</h2>
+  <h3>Requirements</h3>
+  <ul>
+    <li>Python 3.11 or later</li>
+    <li><code>sounddevice</code> &mdash; audio I/O via PortAudio</li>
+    <li><code>numpy</code> &mdash; numerical computation</li>
+    <li><code>scipy</code> &mdash; signal processing (bandpass filter)</li>
+    <li><code>matplotlib</code> &mdash; plotting engine</li>
+    <li><code>PyQt5</code> &mdash; GUI framework</li>
+  </ul>
+  <h3>Quick Start</h3>
+  <pre><code># Create and activate a conda environment (recommended)
+conda create -n chirp python=3.11 -y
+conda activate chirp
+
+# Install dependencies
+pip install sounddevice numpy scipy matplotlib PyQt5
+
+# Launch
+python chirp.py</code></pre>
+  <div class="callout tip">
+    <strong>Tip:</strong> A conda or venv environment is recommended to avoid dependency conflicts
+    with other Python projects on your system.
+  </div>
+</section>
+
+<!-- ── 3. Interface Layout ── -->
+<section id="ui-layout">
+  <h2>Interface Layout</h2>
+  <p>
+    The main window is divided into five functional areas: the sidebar, the central canvas,
+    the transport bar, and two configuration panels at the bottom (trigger and display), plus
+    a settings panel.
+  </p>
+
+  <h3 id="sidebar-panel">Sidebar (Left)</h3>
+  <p>
+    The sidebar lists all configured recording streams. Each entry displays:
+  </p>
+  <ul>
+    <li><strong>Status indicators</strong> &mdash; colored dots showing stream state:
+      <span style="color:var(--green)">ACQ</span> (acquiring, green),
+      <span style="color:var(--green)">REC</span> (recording, green),
+      <span style="color:var(--red)">TRIG</span> (triggered, red)</li>
+    <li><strong>Mini amplitude preview</strong> &mdash; a small real-time level meter</li>
+    <li><strong>Reorder buttons</strong> &mdash; move streams up or down in the list</li>
+    <li><strong>Delete button</strong> &mdash; remove a stream</li>
+  </ul>
+  <p>
+    Click <strong>Add Recording</strong> at the bottom of the sidebar to create a new stream.
+    Right-click the sidebar background for <em>Start All</em> and <em>Stop All</em> context actions.
+  </p>
+
+  <h3 id="canvas">Canvas (Center)</h3>
+  <p>
+    The central area hosts the matplotlib figure showing the spectrogram, waveform, and amplitude
+    plots for the currently selected stream. A vertical green cursor line indicates the current
+    write position in the circular buffer.
+  </p>
+
+  <h3 id="transport-bar">Transport Bar</h3>
+  <table>
+    <thead><tr><th>Button</th><th>Action</th></tr></thead>
+    <tbody>
+      <tr><td>Start Acq</td><td>Begin audio acquisition (fills buffer, enables display)</td></tr>
+      <tr><td>Stop Acq</td><td>Stop acquisition and clear the buffer</td></tr>
+      <tr><td>Start Rec</td><td>Arm threshold-triggered recording</td></tr>
+      <tr><td>Stop Rec</td><td>Disarm recording (finishes any in-progress file)</td></tr>
+      <tr><td>Reset Params</td><td>Restore all parameters to defaults</td></tr>
+      <tr><td>Save / Save As</td><td>Save current configuration to JSON</td></tr>
+      <tr><td>Load</td><td>Load a previously saved configuration</td></tr>
+      <tr><td>View Mode</td><td>Switch to multi-stream grid view</td></tr>
+    </tbody>
+  </table>
+  <p>
+    Status indicators in the transport bar show the global state:
+    <span style="color:var(--green)">ACQ</span>,
+    <span style="color:var(--green)">REC</span>, and
+    <span style="color:var(--red)">TRIG</span>.
+  </p>
+
+  <h3 id="trigger-panel">Trigger Panel (Bottom Left)</h3>
+  <p>Controls that govern when and how recordings are triggered:</p>
+  <table>
+    <thead><tr><th>Control</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td>Threshold</td><td>Amplitude level that triggers recording. Also draggable on the plot.</td></tr>
+      <tr><td>Min Cross</td><td>Minimum duration the signal must stay above threshold to confirm a trigger.</td></tr>
+      <tr><td>Hold</td><td>Duration to keep recording after the signal drops below threshold.</td></tr>
+      <tr><td>Post-Trigger</td><td>Additional time appended after the last threshold crossing.</td></tr>
+      <tr><td>Max Rec</td><td>Maximum duration of a single recording segment (auto-splits if exceeded).</td></tr>
+      <tr><td>Pre-Trigger</td><td>Duration of audio captured before the threshold crossing via ring buffer.</td></tr>
+      <tr><td>Band Lo / Hi Hz</td><td>Bandpass filter frequency range for trigger analysis.</td></tr>
+      <tr><td>Detect Mode</td><td>Trigger detection strategy (see <a href="#detect-modes">Spectral Entropy</a>).</td></tr>
+      <tr><td>Entropy Threshold</td><td>Spectral entropy level below which a tonal trigger fires.</td></tr>
+      <tr><td>Auto Calibrate</td><td>Automatically set threshold from ambient noise measurement.</td></tr>
+    </tbody>
+  </table>
+
+  <h3 id="display-panel">Display Panel (Bottom Right)</h3>
+  <table>
+    <thead><tr><th>Control</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td>Gain</td><td>Amplification applied to the input signal for display.</td></tr>
+      <tr><td>dB Floor / Ceil</td><td>Dynamic range limits for the spectrogram colormap.</td></tr>
+      <tr><td>FFT Size</td><td>Number of FFT points (256, 512, 1024, 2048, or 4096).</td></tr>
+      <tr><td>Window</td><td>FFT window function: Hann, Hamming, Blackman, Bartlett, or Flattop.</td></tr>
+      <tr><td>Freq Scale</td><td>Frequency axis mapping: Linear, Logarithmic, or Mel.</td></tr>
+      <tr><td>Display Lo / Hi</td><td>Visible frequency range on the spectrogram.</td></tr>
+      <tr><td>Buffer Duration</td><td>Length of the circular display buffer (5 to 60 seconds).</td></tr>
+      <tr><td>View</td><td>Visualization mode: Spectrogram, Waveform, or Both.</td></tr>
+      <tr><td>Sync</td><td>Synchronize display parameters across all streams.</td></tr>
+    </tbody>
+  </table>
+
+  <h3 id="settings-panel">Settings Panel (Bottom)</h3>
+  <table>
+    <thead><tr><th>Control</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td>Output Folder</td><td>Directory where WAV recordings are saved.</td></tr>
+      <tr><td>Prefix / Suffix</td><td>Custom text prepended/appended to recording filenames.</td></tr>
+      <tr><td>Input Device</td><td>Audio input device selector with refresh button.</td></tr>
+      <tr><td>Channel Mode</td><td>Mono, Left, Right, or Stereo.</td></tr>
+      <tr><td>Trigger Mode</td><td>Channel logic for stereo triggering (Average, Any, Both, Left, Right).</td></tr>
+      <tr><td>Sample Rate</td><td>Audio sample rate from 8,000 Hz to 96,000 Hz.</td></tr>
+      <tr><td>Reference Date</td><td>Base date for day-count subfolder naming (e.g., days post hatch).</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ── 4. Visualization ── -->
+<section id="visualization">
+  <h2>Visualization Modes</h2>
+  <p>
+    The <strong>View</strong> combo box in the Display panel selects which plots are shown on the canvas.
+    All modes include an amplitude envelope subplot at the bottom.
+  </p>
+
+  <h3 id="view-spectrogram">Spectrogram</h3>
+  <p>
+    The default mode. The upper subplot shows a scrolling spectrogram rendered with matplotlib's
+    <code>imshow</code> using the <em>inferno</em> colormap. The lower subplot shows the amplitude
+    envelope (absolute sample values) as a blue line. A yellow dashed threshold line is drawn when
+    recording is armed.
+  </p>
+
+  <h3 id="view-waveform">Waveform</h3>
+  <p>
+    The upper subplot displays the raw signed waveform as a teal line. The lower subplot shows the
+    amplitude envelope, identical to spectrogram mode. This view is useful for inspecting transient
+    shape and polarity.
+  </p>
+
+  <h3 id="view-both">Both</h3>
+  <p>
+    Three subplots stacked vertically: spectrogram on top, waveform in the middle, and amplitude
+    envelope at the bottom. This provides the most complete picture at the cost of vertical space.
+  </p>
+
+  <h3 id="stereo-display">Stereo Display</h3>
+  <p>
+    When the channel mode is set to <strong>Stereo</strong>, an additional subplot is added for the
+    right channel spectrogram or waveform. The amplitude plot combines both channels: left in blue,
+    right in pink.
+  </p>
+
+  <h4>Visual Indicators</h4>
+  <ul>
+    <li><strong>Cursor line</strong> (green) &mdash; marks the current write position in the circular buffer.</li>
+    <li><strong>Saturation warning</strong> &mdash; the waveform and amplitude lines turn red when
+        the signal reaches 99% of full scale or higher.</li>
+  </ul>
+
+  <div class="callout warning">
+    <strong>Saturation:</strong> Persistent red lines indicate clipping. Reduce the input gain on
+    your audio interface or move the microphone further from the source.
+  </div>
+</section>
+
+<!-- ── 5. Triggered Recording ── -->
+<section id="triggered-recording">
+  <h2>Threshold-Triggered Recording</h2>
+  <p>
+    Chirp continuously monitors the amplitude envelope and automatically records audio segments
+    when the signal exceeds a configurable threshold. This enables unattended data collection
+    over extended periods.
+  </p>
+
+  <h3 id="state-machine">State Machine</h3>
+  <p>Recording progresses through three states:</p>
+  <ol>
+    <li><strong>IDLE</strong> &mdash; Acquisition is running but recording is not armed, or the
+        signal is below threshold.</li>
+    <li><strong>PENDING</strong> &mdash; The signal has crossed the threshold but the
+        <em>Min Cross</em> duration has not yet elapsed. If the signal drops back below threshold
+        before this duration, the trigger is cancelled (false-trigger rejection).</li>
+    <li><strong>RECORDING</strong> &mdash; A confirmed trigger. Audio is being written to a WAV
+        file. Recording continues until the signal has been below threshold for the <em>Hold</em>
+        duration, plus any <em>Post-Trigger</em> extension, or until <em>Max Rec</em> is reached.</li>
+  </ol>
+
+  <h3 id="trigger-params">Parameter Reference</h3>
+  <details>
+    <summary>Threshold</summary>
+    <div>
+      <p>The amplitude level that initiates the trigger sequence. This can be set numerically or by
+      dragging the yellow dashed line directly on the amplitude plot. Values are in linear amplitude
+      (0.0 to 1.0 of full scale).</p>
+    </div>
+  </details>
+  <details>
+    <summary>Min Cross</summary>
+    <div>
+      <p>The minimum continuous duration (in seconds) the signal must remain above the threshold
+      before a trigger is confirmed. This prevents brief transient spikes (e.g., a click or bump)
+      from creating recordings. Typical values range from 0.01 s to 0.5 s.</p>
+    </div>
+  </details>
+  <details>
+    <summary>Pre-Trigger Buffer</summary>
+    <div>
+      <p>Duration of audio (in seconds) captured <em>before</em> the threshold crossing. A ring
+      buffer continuously stores recent audio so that the onset of a vocalization is not lost.
+      The pre-trigger audio is prepended to each recording file.</p>
+    </div>
+  </details>
+  <details>
+    <summary>Hold</summary>
+    <div>
+      <p>How long (in seconds) recording continues after the signal drops below the threshold.
+      This bridges short pauses within a single vocalization to avoid splitting it into many small
+      files.</p>
+    </div>
+  </details>
+  <details>
+    <summary>Post-Trigger</summary>
+    <div>
+      <p>An additional duration (in seconds) appended after the last threshold crossing. Unlike
+      Hold, Post-Trigger always adds this full duration once the hold period has expired, capturing
+      any trailing reverberation or echo.</p>
+    </div>
+  </details>
+  <details>
+    <summary>Max Rec</summary>
+    <div>
+      <p>The maximum allowed duration (in seconds) of a single recording segment. If a continuous
+      sound exceeds this limit, the current file is closed and a new one is started immediately.
+      This prevents runaway recordings from filling disk space.</p>
+    </div>
+  </details>
+
+  <h3 id="output-files">Output Files</h3>
+  <p>Recordings are saved as uncompressed WAV files (PCM 16-bit) with the following naming pattern:</p>
+  <pre><code>&lt;prefix&gt;_&lt;epochMs&gt;_YYYYMMDD_HHMMSS_mmm_&lt;suffix&gt;.wav</code></pre>
+  <p>
+    Where <code>epochMs</code> is the Unix epoch in milliseconds, and the timestamp reflects local
+    time down to the millisecond. Files are written in a background thread to avoid blocking the
+    audio processing pipeline.
+  </p>
+  <div class="callout tip">
+    <strong>Tip:</strong> The epoch timestamp ensures filenames are unique even if the system clock
+    is adjusted during a recording session.
+  </div>
+</section>
+
+<!-- ── 6. Spectral Entropy ── -->
+<section id="spectral-entropy">
+  <h2>Spectral Entropy Trigger</h2>
+  <p>
+    Introduced in v2.0, the spectral entropy trigger provides a frequency-domain criterion for
+    identifying sounds of interest. It computes the normalized Shannon entropy of the FFT magnitude
+    spectrum, producing a value between 0 and 1:
+  </p>
+  <ul>
+    <li><strong>0</strong> &mdash; pure tone (all energy at a single frequency)</li>
+    <li><strong>1</strong> &mdash; white noise (energy uniformly spread across all frequencies)</li>
+  </ul>
+  <p>
+    Tonal vocalizations (birdsong, bat calls, whale sounds) produce low entropy values. The trigger
+    fires when entropy falls <em>below</em> the configured threshold, meaning a structured tonal
+    signal has been detected.
+  </p>
+
+  <h3 id="detect-modes">Detect Modes</h3>
+  <p>The <strong>Detect Mode</strong> dropdown in the Trigger panel selects how amplitude and
+  spectral entropy criteria are combined:</p>
+  <table>
+    <thead><tr><th>Mode</th><th>Trigger Condition</th></tr></thead>
+    <tbody>
+      <tr><td>Amplitude Only</td><td>Legacy behavior. Only amplitude threshold is checked.</td></tr>
+      <tr><td>Spectral Only</td><td>Only entropy is checked. Amplitude threshold is ignored.</td></tr>
+      <tr><td>Amp AND Spectral</td><td>Both conditions must be met simultaneously.</td></tr>
+      <tr><td>Amp OR Spectral</td><td>Either condition alone is sufficient to trigger.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout tip">
+    <strong>Tip:</strong> In noisy environments, use <em>Amp AND Spectral</em> mode to dramatically
+    reduce false triggers. Broadband noise has high entropy and will not satisfy the spectral
+    condition.
+  </div>
+
+  <h3 id="entropy-plot">Entropy Trace Plot</h3>
+  <p>
+    When any spectral mode is active, an additional subplot appears below the amplitude plot
+    showing the real-time entropy trace:
+  </p>
+  <ul>
+    <li><strong>Mauve line</strong> &mdash; current entropy value over time</li>
+    <li><strong>Peach dashed line</strong> &mdash; entropy threshold (draggable, like the amplitude threshold)</li>
+    <li><strong>Scroll-wheel zoom</strong> &mdash; adjusts Y-axis range, centered on the mouse cursor position</li>
+  </ul>
+  <p>
+    A numeric entropy display label in the status area shows the current instantaneous value.
+    For stereo streams, per-channel entropy values are combined using the same logic as the channel
+    trigger mode setting (Average, Any, Both, Left, or Right).
+  </p>
+</section>
+
+<!-- ── 7. Auto-Calibrate ── -->
+<section id="auto-calibrate">
+  <h2>Auto-Calibrate</h2>
+  <p>
+    The <strong>Auto Calibrate</strong> button in the Trigger panel measures the ambient noise
+    floor and automatically sets the amplitude threshold above it.
+  </p>
+  <h3>How It Works</h3>
+  <ol>
+    <li>Acquisition must already be running.</li>
+    <li>Click Auto Calibrate. The system records ambient levels for a configurable duration
+        (1 to 10 seconds).</li>
+    <li>The threshold is set to the 95th percentile of measured amplitude, multiplied by a
+        safety margin.</li>
+  </ol>
+  <div class="callout warning">
+    <strong>Note:</strong> Ensure the target sound source is silent during calibration. Any
+    vocalizations during the measurement period will raise the threshold unnecessarily.
+  </div>
+</section>
+
+<!-- ── 8. Bandpass Filter ── -->
+<section id="bandpass-filter">
+  <h2>Bandpass Filter</h2>
+  <p>
+    Each stream can optionally apply a 4th-order Butterworth bandpass filter. When enabled,
+    the amplitude measurement used for threshold triggering is computed from the filtered
+    signal, focusing detection on a specific frequency band.
+  </p>
+  <ul>
+    <li>Set the <strong>Lo Hz</strong> and <strong>Hi Hz</strong> fields in the Trigger panel to
+        define the passband.</li>
+    <li>The spectrogram always displays the <em>unfiltered</em> signal so you retain full spectral
+        context.</li>
+    <li>The filter is particularly useful when the target vocalization occupies a narrow frequency
+        band but the environment contains broadband noise.</li>
+  </ul>
+</section>
+
+<!-- ── 9. Channel Modes ── -->
+<section id="channels">
+  <h2>Channel Modes</h2>
+  <h3>Input Channel Selection</h3>
+  <table>
+    <thead><tr><th>Mode</th><th>Behavior</th></tr></thead>
+    <tbody>
+      <tr><td>Mono</td><td>Uses a single-channel input.</td></tr>
+      <tr><td>Left</td><td>Extracts the left channel from a stereo device.</td></tr>
+      <tr><td>Right</td><td>Extracts the right channel from a stereo device.</td></tr>
+      <tr><td>Stereo</td><td>Uses both channels. Dual spectrograms are displayed (left in blue, right in pink).</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Stereo Trigger Modes</h3>
+  <p>When operating in stereo, the <strong>Trigger Mode</strong> control determines how per-channel
+  amplitude values are combined for threshold comparison:</p>
+  <table>
+    <thead><tr><th>Trigger Mode</th><th>Logic</th></tr></thead>
+    <tbody>
+      <tr><td>Average</td><td>Mean of left and right amplitudes must exceed threshold.</td></tr>
+      <tr><td>Any Channel</td><td>Either channel exceeding threshold is sufficient.</td></tr>
+      <tr><td>Both Channels</td><td>Both channels must independently exceed threshold.</td></tr>
+      <tr><td>Left Channel</td><td>Only the left channel is evaluated.</td></tr>
+      <tr><td>Right Channel</td><td>Only the right channel is evaluated.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ── 10. View Mode ── -->
+<section id="view-mode">
+  <h2>View Mode</h2>
+  <p>
+    Click <strong>View Mode</strong> in the transport bar to switch from the single-stream
+    configuration view to a multi-stream monitoring grid.
+  </p>
+  <ul>
+    <li>All active streams are displayed simultaneously in a configurable grid (1 to 6 columns).</li>
+    <li>Each cell shows a compact spectrogram or waveform, amplitude plot, threshold line, and
+        status text.</li>
+    <li>The sidebar and configuration panels are hidden to maximize display area.</li>
+    <li>Panel height is adjustable for each stream.</li>
+    <li>Click <strong>Config Mode</strong> to return to the single-stream editing view.</li>
+  </ul>
+  <div class="callout tip">
+    <strong>Tip:</strong> View Mode is ideal for unattended multi-device monitoring sessions. Set up
+    your streams, arm recording, switch to View Mode, and leave the system running.
+  </div>
+</section>
+
+<!-- ── 11. Settings Management ── -->
+<section id="settings-mgmt">
+  <h2>Settings Management</h2>
+  <p>
+    All configuration parameters can be saved to and loaded from JSON files using the
+    <strong>Save</strong>, <strong>Save As</strong>, and <strong>Load</strong> buttons in the
+    transport bar.
+  </p>
+  <h3>What Is Saved</h3>
+  <ul>
+    <li>Audio device names and sample rates</li>
+    <li>All trigger parameters (threshold, timings, band filter, detect mode, entropy settings)</li>
+    <li>Display options (FFT size, window, frequency scale, view mode, gain, dB range)</li>
+    <li>Channel and trigger mode selections</li>
+    <li>Output folder, prefix, suffix, and reference date</li>
+  </ul>
+  <h3>Device Resolution</h3>
+  <p>
+    When loading a configuration, Chirp resolves audio devices by name. If an exact match is not
+    found, it attempts a partial string match. This allows configurations to be portable across
+    systems where devices may have slightly different names.
+  </p>
+  <h3>Reference Date &amp; Subfolder Naming</h3>
+  <p>
+    The <strong>Reference Date</strong> field enables automatic subfolder naming based on the number
+    of days elapsed since a reference event. For example, in bird vocalization studies, you can set
+    the hatch date. Recordings are then saved into subfolders named by the day count (e.g.,
+    <code>day_042/</code>), simplifying longitudinal data organization.
+  </p>
+</section>
+
+<!-- ── 12. Mouse & Keyboard ── -->
+<section id="interactions">
+  <h2>Mouse &amp; Keyboard Interactions</h2>
+  <table>
+    <thead><tr><th>Action</th><th>Target</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td>Click &amp; drag</td><td>Amplitude threshold line</td><td>Adjust amplitude trigger threshold</td></tr>
+      <tr><td>Click &amp; drag</td><td>Entropy threshold line</td><td>Adjust spectral entropy threshold</td></tr>
+      <tr><td>Scroll wheel</td><td>Amplitude plot</td><td>Zoom Y-axis (anchored at zero)</td></tr>
+      <tr><td>Scroll wheel</td><td>Waveform plot</td><td>Zoom Y-axis (symmetric around zero)</td></tr>
+      <tr><td>Scroll wheel</td><td>Entropy plot</td><td>Zoom Y-axis (centered on mouse cursor)</td></tr>
+      <tr><td>Scroll wheel</td><td>Spectrogram</td><td>No effect (use Display panel frequency controls)</td></tr>
+      <tr><td>Right-click</td><td>Sidebar background</td><td>Context menu: Start All / Stop All</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ── 13. Tips ── -->
+<section id="tips">
+  <h2>Tips &amp; Best Practices</h2>
+
+  <details>
+    <summary>Setting the Threshold</summary>
+    <div>
+      <p>Use <strong>Auto-Calibrate</strong> to quickly set a threshold above the ambient noise floor.
+      Fine-tune by dragging the yellow threshold line on the amplitude plot while monitoring a live
+      signal.</p>
+    </div>
+  </details>
+
+  <details>
+    <summary>Capturing Complete Vocalizations</summary>
+    <div>
+      <p>Set a generous <strong>Pre-Trigger</strong> buffer (0.5&ndash;2 s) to ensure you capture
+      the onset of each vocalization. Use <strong>Hold</strong> to bridge short pauses within a
+      phrase, and <strong>Post-Trigger</strong> to capture trailing echoes or reverberation.</p>
+    </div>
+  </details>
+
+  <details>
+    <summary>Reducing False Triggers</summary>
+    <div>
+      <p>Increase <strong>Min Cross</strong> to reject brief transients. Enable the bandpass filter
+      to ignore out-of-band noise. In environments with broadband noise, switch to
+      <em>Amp AND Spectral</em> detect mode so that only tonal sounds trigger recording.</p>
+    </div>
+  </details>
+
+  <details>
+    <summary>Frequency Scale Selection</summary>
+    <div>
+      <p>Use <strong>Mel</strong> frequency scale for bioacoustics work. Mel spacing approximates
+      perceptual frequency resolution and provides better visual separation of harmonics in
+      birdsong and other animal vocalizations. Use <strong>Log</strong> for general-purpose
+      analysis and <strong>Linear</strong> when precise frequency measurements are needed.</p>
+    </div>
+  </details>
+
+  <details>
+    <summary>Multi-Stream Monitoring</summary>
+    <div>
+      <p>Configure all your streams in Config Mode, arm recording on each, then switch to
+      <strong>View Mode</strong> for a clean monitoring display. Use the <strong>Sync</strong>
+      checkbox to keep display parameters consistent across streams.</p>
+    </div>
+  </details>
+
+  <details>
+    <summary>Long Recording Sessions</summary>
+    <div>
+      <p>Always <strong>save your configuration</strong> before starting a long session. Set
+      <strong>Max Rec</strong> to a reasonable limit (e.g., 300 s) to prevent individual files from
+      growing too large. Monitor available disk space&mdash;uncompressed WAV files consume
+      approximately 176 KB/s per channel at 44,100 Hz.</p>
+    </div>
+  </details>
+
+  <details>
+    <summary>Reference Date for Experiments</summary>
+    <div>
+      <p>If you are tracking development over time (e.g., days post hatch in bird research), set
+      the <strong>Reference Date</strong> to the start event. Recordings will be automatically
+      organized into day-count subfolders, making longitudinal analysis straightforward.</p>
+    </div>
+  </details>
+
+  <details>
+    <summary>FFT Settings</summary>
+    <div>
+      <p>Larger FFT sizes (2048, 4096) provide finer frequency resolution but coarser time
+      resolution. Smaller sizes (256, 512) give better time resolution at the expense of frequency
+      detail. For birdsong, 1024 is usually a good compromise at 44,100 Hz sample rate.
+      The <strong>Flattop</strong> window is best for accurate amplitude measurement of pure tones;
+      <strong>Hann</strong> is the best general-purpose choice.</p>
+    </div>
+  </details>
+</section>
+
+<!-- Footer -->
+<footer style="margin-top:3rem; padding-top:1.5rem; border-top:1px solid var(--surface0); text-align:center; color:var(--overlay0); font-size:0.82rem;">
+  <p>Chirp v2.0.0 &mdash; User Manual</p>
+  <p>Designed for bioacoustics research. Built with Python, PyQt5, and matplotlib.</p>
+</footer>
+
+</main>
+</body>
+</html>
