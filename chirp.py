@@ -3142,59 +3142,73 @@ class ChirpWindow(QMainWindow):
             self._dragging_entropy = False
             self._timer.start()
 
+    @staticmethod
+    def _zoom_axis_centered(ax, event_ydata, step, anchor_zero=False):
+        """Zoom an axis centered on the mouse Y position. Returns (new_lo, new_hi).
+        If anchor_zero, the lower limit is pinned at 0."""
+        scale = 0.85 if step > 0 else 1.0 / 0.85
+        ylo, yhi = ax.get_ylim()
+        if anchor_zero:
+            new_hi = max(0.01, yhi * scale)
+            ax.set_ylim(0.0, new_hi)
+            return 0.0, new_hi
+        # Zoom centered on mouse position
+        y = event_ydata if event_ydata is not None else (ylo + yhi) / 2
+        new_lo = y - (y - ylo) * scale
+        new_hi = y + (yhi - y) * scale
+        if new_hi - new_lo < 0.01:
+            new_hi = new_lo + 0.01
+        ax.set_ylim(new_lo, new_hi)
+        return new_lo, new_hi
+
     def _on_scroll(self, event):
         if self._view_mode:
-            # Zoom whichever amplitude or waveform axis the mouse is over
             for i, vm in enumerate(self._vm_axes):
                 if event.inaxes is vm['ax_amp'] or (vm.get('ax_wave') and event.inaxes is vm['ax_wave']):
-                    scale = 0.85 if event.step > 0 else 1.0 / 0.85
-                    _, ymax = vm['ax_amp'].get_ylim()
-                    new_ymax = max(0.01, ymax * scale)
-                    vm['ax_amp'].set_ylim(0.0, new_ymax)
+                    _, new_ymax = self._zoom_axis_centered(vm['ax_amp'], event.ydata, event.step, anchor_zero=True)
                     if vm.get('ax_wave') is not None:
                         vm['ax_wave'].set_ylim(-new_ymax, new_ymax)
                     if i < len(self._entities):
                         self._entities[i].amp_ylim = new_ymax
+                    self._recapture_bg()
                     return
                 if vm.get('ax_entropy') is not None and event.inaxes is vm['ax_entropy']:
-                    scale = 0.85 if event.step > 0 else 1.0 / 0.85
-                    _, ymax = vm['ax_entropy'].get_ylim()
-                    new_ymax = max(0.05, ymax * scale)
-                    vm['ax_entropy'].set_ylim(0.0, new_ymax)
+                    self._zoom_axis_centered(vm['ax_entropy'], event.ydata, event.step)
+                    self._recapture_bg()
                     return
             return
-        # Scroll on entropy axis
+
+        # Config mode — entropy axis (centered zoom)
         if self._ax_entropy is not None and event.inaxes is self._ax_entropy:
-            scale = 0.85 if event.step > 0 else 1.0 / 0.85
-            _, ymax = self._ax_entropy.get_ylim()
-            new_ymax = max(0.05, ymax * scale)
-            self._ax_entropy.set_ylim(0.0, new_ymax)
+            self._zoom_axis_centered(self._ax_entropy, event.ydata, event.step)
+            self._recapture_bg()
             return
-        # Scroll on waveform axes adjusts waveform y-range symmetrically
+
+        # Config mode — waveform axes (symmetric around zero)
         wave_axes = [ax for ax in [getattr(self, '_ax_wave', None),
                                     getattr(self, '_ax_wave_r', None)] if ax is not None]
         if event.inaxes in wave_axes:
-            scale = 0.85 if event.step > 0 else 1.0 / 0.85
             e = self._sel
             if e:
+                scale = 0.85 if event.step > 0 else 1.0 / 0.85
                 new_ylim = max(0.01, e.amp_ylim * scale)
                 e.amp_ylim = new_ylim
                 for wax in wave_axes:
                     wax.set_ylim(-new_ylim, new_ylim)
                 self._ax_amp.set_ylim(0.0, new_ylim)
+                self._recapture_bg()
             return
+
+        # Config mode — amplitude axis (anchored at zero)
         if event.inaxes is not self._ax_amp:
             return
-        scale = 0.85 if event.step > 0 else 1.0 / 0.85
-        _, ymax = self._ax_amp.get_ylim()
-        new_ymax = max(0.01, ymax * scale)
-        self._ax_amp.set_ylim(0.0, new_ymax)
+        _, new_ymax = self._zoom_axis_centered(self._ax_amp, event.ydata, event.step, anchor_zero=True)
         e = self._sel
         if e:
             e.amp_ylim = new_ymax
-            # Sync waveform axes too
             for wax in wave_axes:
                 wax.set_ylim(-new_ymax, new_ymax)
+        self._recapture_bg()
 
     # ──────────────────────────────────────────────────────────────────────
     # Spectrogram display callbacks
