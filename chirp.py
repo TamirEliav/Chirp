@@ -3156,6 +3156,19 @@ class ChirpWindow(QMainWindow):
                     if i < len(self._entities):
                         self._entities[i].amp_ylim = new_ymax
                     return
+                if vm.get('ax_entropy') is not None and event.inaxes is vm['ax_entropy']:
+                    scale = 0.85 if event.step > 0 else 1.0 / 0.85
+                    _, ymax = vm['ax_entropy'].get_ylim()
+                    new_ymax = max(0.05, ymax * scale)
+                    vm['ax_entropy'].set_ylim(0.0, new_ymax)
+                    return
+            return
+        # Scroll on entropy axis
+        if self._ax_entropy is not None and event.inaxes is self._ax_entropy:
+            scale = 0.85 if event.step > 0 else 1.0 / 0.85
+            _, ymax = self._ax_entropy.get_ylim()
+            new_ymax = max(0.05, ymax * scale)
+            self._ax_entropy.set_ylim(0.0, new_ymax)
             return
         # Scroll on waveform axes adjusts waveform y-range symmetrically
         wave_axes = [ax for ax in [getattr(self, '_ax_wave', None),
