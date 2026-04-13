@@ -379,13 +379,20 @@ class ThresholdRecorder:
 
         elif self._state == self._RECORDING:
             self._buf.append(chunk.copy())
+            # Keep the pre-trigger rolling buffer populated during RECORDING too,
+            # so a new event firing right after this one still has full pre-trigger context.
+            self._pre_trig_deque.append(chunk.copy())
             if trigger_peak >= threshold:
                 self._silent_count = 0
                 self._last_above_idx = len(self._buf) - 1
             else:
                 self._silent_count += len(chunk)
-                if self._silent_count >= hold_samps:
-                    post_trig_chunks = max(0, int(post_trig_sec * sample_rate / CHUNK_FRAMES))
+                post_trig_chunks = max(0, int(post_trig_sec * sample_rate / CHUNK_FRAMES))
+                chunks_since_last_above = len(self._buf) - 1 - self._last_above_idx
+                # Event is "over" once hold elapsed; then keep buffering until we have a
+                # full post-trigger tail after last_above before flushing.
+                if (self._silent_count >= hold_samps and
+                        chunks_since_last_above >= post_trig_chunks):
                     trim_end = min(self._last_above_idx + 1 + post_trig_chunks, len(self._buf))
                     self._start_flush(self._buf[:trim_end], output_dir, filename_prefix,
                                       filename_suffix, sample_rate=sample_rate,
@@ -406,7 +413,9 @@ class ThresholdRecorder:
         self._silent_count    = 0
         self._last_above_idx  = 0
         self._onset_time      = None
-        self._pre_trig_deque.clear()
+        # Do NOT clear the pre-trigger rolling buffer — keeping it populated ensures the
+        # next event (even one firing immediately after this flush) gets a full pre-trigger
+        # window, per issue #9.
 
     @property
     def is_recording(self) -> bool:
@@ -1095,14 +1104,19 @@ class RecordingSidebarItem(QWidget):
         row1.setSpacing(6)
         self._name_label = QLabel(name)
         self._name_label.setStyleSheet(f'color: {C["text"]}; font-weight: bold; font-size: 9pt; border: none;')
+        self._name_label.setToolTip('Double-click to rename this recording')
         self._name_edit = QLineEdit(name)
         self._name_edit.setStyleSheet(f'background: {C["surface0"]}; font-size: 9pt; min-height: 20px; padding: 1px 4px;')
         self._name_edit.hide()
+        self._name_edit.setToolTip('Press Enter to confirm the new name')
         self._name_edit.editingFinished.connect(self._finish_edit)
 
         self._lbl_acq  = QLabel('\u25cf')
         self._lbl_rec  = QLabel('\u25cf')
         self._lbl_trig = QLabel('\u25cf')
+        self._lbl_acq .setToolTip('Acquisition status (live monitoring)')
+        self._lbl_rec .setToolTip('Recording status (threshold-triggered WAV saving enabled)')
+        self._lbl_trig.setToolTip('Trigger status (currently writing to a WAV file)')
         for lbl in (self._lbl_acq, self._lbl_rec, self._lbl_trig):
             lbl.setFixedWidth(12)
             lbl.setStyleSheet(f'color: {C["surface2"]}; font-size: 8pt;')
@@ -1128,6 +1142,9 @@ class RecordingSidebarItem(QWidget):
         for b in (btn_up, btn_dn, btn_del):
             b.setObjectName('btn_small')
             b.setFixedSize(24, 20)
+        btn_up .setToolTip('Move this recording up in the list')
+        btn_dn .setToolTip('Move this recording down in the list')
+        btn_del.setToolTip('Delete this recording')
         btn_up.clicked.connect(lambda: self.move_up.emit(self._index))
         btn_dn.clicked.connect(lambda: self.move_down.emit(self._index))
         btn_del.clicked.connect(lambda: self.delete.emit(self._index))
@@ -1237,6 +1254,8 @@ class RecordingSidebar(QWidget):
         for b in (btn_sa, btn_xa):
             b.setFixedHeight(28)
             b.setStyleSheet(b.styleSheet() + 'min-width: 0px; padding: 4px 8px; font-size: 9pt;')
+        btn_sa.setToolTip('Start audio acquisition (live monitoring) for all recordings')
+        btn_xa.setToolTip('Stop audio acquisition for all recordings')
         btn_sa.clicked.connect(self.start_all_acq.emit)
         btn_xa.clicked.connect(self.stop_all_acq.emit)
         all_row1.addWidget(btn_sa)
@@ -1252,6 +1271,8 @@ class RecordingSidebar(QWidget):
         for b in (btn_sr, btn_xr):
             b.setFixedHeight(28)
             b.setStyleSheet(b.styleSheet() + 'min-width: 0px; padding: 4px 8px; font-size: 9pt;')
+        btn_sr.setToolTip('Enable threshold-triggered WAV recording for all recordings')
+        btn_xr.setToolTip('Disable threshold-triggered WAV recording for all recordings')
         btn_sr.clicked.connect(self.start_all_rec.emit)
         btn_xr.clicked.connect(self.stop_all_rec.emit)
         all_row2.addWidget(btn_sr)
@@ -1261,6 +1282,7 @@ class RecordingSidebar(QWidget):
         btn_add = QPushButton('+  Add Recording')
         btn_add.setObjectName('btn_browse')
         btn_add.setFixedHeight(32)
+        btn_add.setToolTip('Add a new recording stream')
         btn_add.clicked.connect(self.add_requested.emit)
         vbox.addWidget(btn_add)
 
@@ -1802,6 +1824,7 @@ class ChirpWindow(QMainWindow):
         h.setSpacing(14)
 
         self._btn_config_mode = QPushButton('\u2190  Config Mode')
+        self._btn_config_mode.setToolTip('Return to Config mode to edit parameters')
         self._btn_config_mode.setStyleSheet(
             f'QPushButton {{ background-color: {C["surface0"]}; color: {C["green"]}; '
             f'border: 1px solid {C["green"]}; border-radius: 5px; '
@@ -1817,6 +1840,7 @@ class ChirpWindow(QMainWindow):
         lbl_c.setStyleSheet(f'color: {C["subtext"]}; font-size: 9pt;')
         h.addWidget(lbl_c)
         self._vm_cols_spin = QSpinBox()
+        self._vm_cols_spin.setToolTip('Number of columns in the View mode grid')
         self._vm_cols_spin.setRange(1, 6)
         self._vm_cols_spin.setValue(1)
         self._vm_cols_spin.setFixedWidth(50)
@@ -1833,6 +1857,7 @@ class ChirpWindow(QMainWindow):
         lbl_h.setStyleSheet(f'color: {C["subtext"]}; font-size: 9pt;')
         h.addWidget(lbl_h)
         self._vm_height_sl = QSlider(Qt.Horizontal)
+        self._vm_height_sl.setToolTip('Row height for each recording tile in View mode')
         self._vm_height_sl.setRange(120, 700)
         self._vm_height_sl.setValue(self._vm_panel_height)
         self._vm_height_sl.setFixedWidth(180)
@@ -1867,6 +1892,8 @@ class ChirpWindow(QMainWindow):
         self._btn_stop_acq  = QPushButton('Stop Acq')
         self._btn_start_acq.setObjectName('btn_start_acq')
         self._btn_stop_acq .setObjectName('btn_stop_acq')
+        self._btn_start_acq.setToolTip('Start audio acquisition (live monitoring) for the selected recording')
+        self._btn_stop_acq .setToolTip('Stop audio acquisition for the selected recording')
         acq_h.addWidget(self._btn_start_acq)
         acq_h.addWidget(self._btn_stop_acq)
 
@@ -1877,6 +1904,8 @@ class ChirpWindow(QMainWindow):
         self._btn_stop_rec  = QPushButton('Stop Rec')
         self._btn_start_rec.setObjectName('btn_start_rec')
         self._btn_stop_rec .setObjectName('btn_stop_rec')
+        self._btn_start_rec.setToolTip('Enable threshold-triggered WAV recording for the selected recording')
+        self._btn_stop_rec .setToolTip('Disable threshold-triggered WAV recording for the selected recording')
         rec_h.addWidget(self._btn_start_rec)
         rec_h.addWidget(self._btn_stop_rec)
 
@@ -1903,9 +1932,11 @@ class ChirpWindow(QMainWindow):
 
         self._btn_reset = QPushButton('Reset Params')
         self._btn_reset.setObjectName('btn_browse')
+        self._btn_reset.setToolTip('Reset all trigger and display parameters to their defaults')
 
         self._btn_view_mode = QPushButton('\u25a3  View Mode')
         self._btn_view_mode.setObjectName('btn_view_mode')
+        self._btn_view_mode.setToolTip('Switch to View mode — a read-only monitoring grid of all recordings')
         self._btn_view_mode.setStyleSheet(
             f'QPushButton {{ background-color: {C["surface0"]}; color: {C["mauve"]}; '
             f'border: 1px solid {C["mauve"]}; border-radius: 5px; '
@@ -1916,6 +1947,9 @@ class ChirpWindow(QMainWindow):
         self._btn_save    = QPushButton('\U0001f4be Save')
         self._btn_save_as = QPushButton('\U0001f4be Save As')
         self._btn_load    = QPushButton('\U0001f4c2 Load')
+        self._btn_save   .setToolTip('Save configuration to the current file')
+        self._btn_save_as.setToolTip('Save configuration to a new file')
+        self._btn_load   .setToolTip('Load configuration from a file (.json or legacy .chirp)')
         for btn in (self._btn_save, self._btn_save_as, self._btn_load):
             btn.setObjectName('btn_browse')
 
@@ -1975,9 +2009,21 @@ class ChirpWindow(QMainWindow):
             sb_min=0.0, sb_max=60.0, sb_step=0.1, sb_dec=2, suffix=' s',
             scale=_TRIG_SCALE)
 
+        for _tw in (self._sl_mc, self._sb_mc):
+            _tw.setToolTip('Min Cross: minimum time the signal must stay above the threshold to start a recording')
+        for _tw in (self._sl_hold, self._sb_hold):
+            _tw.setToolTip('Hold: duration of silence after the signal drops before a recording is considered finished')
+        for _tw in (self._sl_post_trig, self._sb_post_trig):
+            _tw.setToolTip('Post-Trigger: audio kept after the last above-threshold sample (tail of the saved WAV)')
+        for _tw in (self._sl_maxr, self._sb_maxr):
+            _tw.setToolTip('Max Rec: maximum length of a single WAV segment — longer events are split')
+        for _tw in (self._sl_pre, self._sb_pre):
+            _tw.setToolTip('Pre-Trigger: audio kept before the trigger point (lookback saved to the WAV)')
+
         # Band filter row (row 5)
         self._chk_freq = QCheckBox('Band filter')
         self._chk_freq.setChecked(False)
+        self._chk_freq.setToolTip('Apply a 4th-order Butterworth band-pass filter to the trigger signal and spectrogram input')
 
         self._sb_freq_lo = QDoubleSpinBox()
         self._sb_freq_lo.setRange(1.0, SAMPLE_RATE / 2 - 1)
@@ -1987,6 +2033,7 @@ class ChirpWindow(QMainWindow):
         self._sb_freq_lo.setSuffix(' Hz')
         self._sb_freq_lo.setFixedWidth(100)
         self._sb_freq_lo.setEnabled(False)
+        self._sb_freq_lo.setToolTip('Band-pass filter low cutoff (Hz)')
 
         self._sb_freq_hi = QDoubleSpinBox()
         self._sb_freq_hi.setRange(1.0, SAMPLE_RATE / 2 - 1)
@@ -1996,6 +2043,7 @@ class ChirpWindow(QMainWindow):
         self._sb_freq_hi.setSuffix(' Hz')
         self._sb_freq_hi.setFixedWidth(100)
         self._sb_freq_hi.setEnabled(False)
+        self._sb_freq_hi.setToolTip('Band-pass filter high cutoff (Hz)')
 
         self._chk_freq.toggled.connect(lambda on: (
             self._sb_freq_lo.setEnabled(on),
@@ -2026,6 +2074,12 @@ class ChirpWindow(QMainWindow):
         for dm in ('Amplitude Only', 'Spectral Only', 'Amp AND Spectral', 'Amp OR Spectral'):
             self._combo_detect_mode.addItem(dm)
         self._combo_detect_mode.setCurrentText('Amplitude Only')
+        self._combo_detect_mode.setToolTip(
+            'Trigger detection mode:\n'
+            '  • Amplitude Only — trigger when signal amplitude exceeds threshold\n'
+            '  • Spectral Only — trigger when spectral entropy falls below threshold (tonal sound)\n'
+            '  • Amp AND Spectral — both conditions must be met\n'
+            '  • Amp OR Spectral — either condition triggers')
 
         detect_row = QHBoxLayout()
         detect_row.setSpacing(8)
@@ -2042,6 +2096,8 @@ class ChirpWindow(QMainWindow):
             scale=_ENTROPY_SCALE)
         self._sl_entropy_thr.setEnabled(False)
         self._sb_entropy_thr.setEnabled(False)
+        for _tw in (self._sl_entropy_thr, self._sb_entropy_thr):
+            _tw.setToolTip('Spectral entropy threshold — triggers when entropy falls below this value (0 = pure tone, 1 = white noise)')
 
         self._combo_detect_mode.currentTextChanged.connect(self._on_detect_mode_changed)
 
@@ -2115,6 +2171,7 @@ class ChirpWindow(QMainWindow):
             self._buf_combo.addItem(label, userData=s)
         self._buf_combo.setCurrentText(f'{int(DISPLAY_SECONDS)}s')
         self._buf_combo.setFixedWidth(90)
+        self._buf_combo.setToolTip('Length of visible history (seconds) in the live display')
 
         self._sl_gain, self._sb_gain = self._param_row(grid, 0, 0, 'Gain',
             sl_min=-200, sl_max=600, sl_init=0,
@@ -2131,6 +2188,13 @@ class ChirpWindow(QMainWindow):
             sb_min=-120.0, sb_max=0.0, sb_step=1.0, sb_dec=1, suffix=' dB',
             scale=self._DB_SCALE)
 
+        for _tw in (self._sl_gain, self._sb_gain):
+            _tw.setToolTip('Gain applied to the spectrogram (dB) — brightens or darkens the image')
+        for _tw in (self._sl_floor, self._sb_floor):
+            _tw.setToolTip('Minimum dB value shown in the spectrogram colormap')
+        for _tw in (self._sl_ceil, self._sb_ceil):
+            _tw.setToolTip('Maximum dB value shown in the spectrogram colormap')
+
         lbl_fft = QLabel('FFT')
         lbl_fft.setObjectName('param_label')
         lbl_fft.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
@@ -2139,6 +2203,7 @@ class ChirpWindow(QMainWindow):
         for sz in SpectrogramAccumulator.FFT_SIZES:
             self._combo_fft.addItem(str(sz), userData=sz)
         self._combo_fft.setCurrentText(str(SPECTROGRAM_NPERSEG))
+        self._combo_fft.setToolTip('FFT size (nperseg). Larger = better frequency resolution, worse time resolution')
 
         lbl_win = QLabel('Win')
         lbl_win.setObjectName('param_label')
@@ -2148,6 +2213,7 @@ class ChirpWindow(QMainWindow):
         for wn in SpectrogramAccumulator.WINDOW_TYPES:
             self._combo_win.addItem(wn.capitalize(), userData=wn)
         self._combo_win.setCurrentIndex(0)
+        self._combo_win.setToolTip('FFT window function')
 
         lbl_fscale = QLabel('Scale')
         lbl_fscale.setObjectName('param_label')
@@ -2156,6 +2222,7 @@ class ChirpWindow(QMainWindow):
         self._combo_fscale.setFixedWidth(90)
         self._combo_fscale.addItems(['Linear', 'Log', 'Mel'])
         self._combo_fscale.setCurrentText('Mel')
+        self._combo_fscale.setToolTip('Frequency axis scale for the spectrogram: Linear, Log, or Mel')
 
         lbl_dfl = QLabel('Lo')
         lbl_dfl.setObjectName('param_label')
@@ -2167,6 +2234,7 @@ class ChirpWindow(QMainWindow):
         self._sb_disp_freq_lo.setDecimals(0)
         self._sb_disp_freq_lo.setSuffix(' Hz')
         self._sb_disp_freq_lo.setFixedWidth(90)
+        self._sb_disp_freq_lo.setToolTip('Lowest frequency shown in the spectrogram (Hz)')
 
         lbl_dfh = QLabel('Hi')
         lbl_dfh.setObjectName('param_label')
@@ -2178,6 +2246,7 @@ class ChirpWindow(QMainWindow):
         self._sb_disp_freq_hi.setDecimals(0)
         self._sb_disp_freq_hi.setSuffix(' Hz')
         self._sb_disp_freq_hi.setFixedWidth(90)
+        self._sb_disp_freq_hi.setToolTip('Highest frequency shown in the spectrogram (Hz)')
 
         grid.addWidget(lbl_fft,            0, 3)
         grid.addWidget(self._combo_fft,    0, 4)
@@ -2199,10 +2268,12 @@ class ChirpWindow(QMainWindow):
         self._combo_display_mode.addItems(['Spectrogram', 'Waveform', 'Both'])
         self._combo_display_mode.setCurrentText('Spectrogram')
         self._combo_display_mode.setFixedWidth(90)
+        self._combo_display_mode.setToolTip('Visualization mode — Spectrogram, raw Waveform, or Both')
         grid.addWidget(lbl_dmode,                  6, 3)
         grid.addWidget(self._combo_display_mode,   6, 4)
 
         self._chk_shared_spec = QCheckBox('Sync across all recordings')
+        self._chk_shared_spec.setToolTip('When enabled, display settings (gain, FFT, scale, etc.) apply to all recordings')
         grid.addWidget(self._chk_shared_spec, 7, 0, 1, 5)
 
         outer.addWidget(box)
@@ -2265,18 +2336,22 @@ class ChirpWindow(QMainWindow):
         lbl_folder.setObjectName('param_label')
         self._folder_edit = QLineEdit(RECORDINGS_DIR)
         self._folder_edit.setPlaceholderText('Path to recordings folder...')
+        self._folder_edit.setToolTip('Output folder where triggered WAV files are saved')
         btn_browse = QPushButton('Browse...')
         btn_browse.setObjectName('btn_browse')
         btn_browse.setFixedWidth(70)
+        btn_browse.setToolTip('Browse for the output folder')
         btn_browse.clicked.connect(self._on_browse)
         lbl_pfx = QLabel('Prefix')
         lbl_pfx.setObjectName('param_label')
         self._prefix_edit = QLineEdit()
         self._prefix_edit.setPlaceholderText('e.g. bird1_')
+        self._prefix_edit.setToolTip('Optional prefix added to the start of each saved WAV filename')
         lbl_sfx = QLabel('Suffix')
         lbl_sfx.setObjectName('param_label')
         self._suffix_edit = QLineEdit()
         self._suffix_edit.setPlaceholderText('e.g. _cage3')
+        self._suffix_edit.setToolTip('Optional suffix added to the end of each saved WAV filename')
         output_g.addWidget(lbl_folder,          0, 0)
         output_g.addWidget(self._folder_edit,   0, 1, 1, 3)
         output_g.addWidget(btn_browse,          0, 4)
@@ -2294,10 +2369,12 @@ class ChirpWindow(QMainWindow):
         dev_row1.setSpacing(4)
         self._device_combo = QComboBox()
         self._device_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._device_combo.setToolTip('Audio input device used by this recording')
         self._populate_device_combo()
         btn_refresh = QPushButton('Refresh')
         btn_refresh.setObjectName('btn_browse')
         btn_refresh.setFixedWidth(60)
+        btn_refresh.setToolTip('Rescan available audio devices')
         btn_refresh.clicked.connect(self._on_refresh_devices)
         dev_row1.addWidget(self._device_combo, stretch=1)
         dev_row1.addWidget(btn_refresh)
@@ -2307,17 +2384,20 @@ class ChirpWindow(QMainWindow):
         self._chan_combo = QComboBox()
         self._chan_combo.addItems(['Mono', 'Left', 'Right', 'Stereo'])
         self._chan_combo.setCurrentIndex(0)
+        self._chan_combo.setToolTip('Channel mode: Mono, single channel (Left/Right), or Stereo (both)')
         lbl_trig = QLabel('Trigger')
         self._trig_combo = QComboBox()
         self._trig_combo.addItems(['Average', 'Any Channel', 'Both Channels', 'Left Channel', 'Right Channel'])
         self._trig_combo.setCurrentIndex(0)
         self._trig_combo.setEnabled(False)
+        self._trig_combo.setToolTip('How the stereo trigger is computed (only used in Stereo mode)')
         lbl_sr = QLabel('Rate')
         self._sr_combo = QComboBox()
         for r in RecordingEntity.SUPPORTED_RATES:
             self._sr_combo.addItem(f'{r} Hz', userData=r)
         self._sr_combo.setCurrentText(f'{SAMPLE_RATE} Hz')
         self._sr_combo.setFixedWidth(90)
+        self._sr_combo.setToolTip('Audio sample rate — changing this rebuilds the audio pipeline')
         for lbl in (lbl_ch, lbl_trig, lbl_sr):
             lbl.setStyleSheet(f'color: {C["subtext"]}; font-size: 9pt;')
         dev_row2.addWidget(lbl_ch)
@@ -2337,18 +2417,22 @@ class ChirpWindow(QMainWindow):
         ref_g.setVerticalSpacing(4)
         ref_g.setHorizontalSpacing(6)
         self._chk_ref_date = QCheckBox('Days post hatch')
+        self._chk_ref_date.setToolTip('When enabled, saved files are organized into day-post-hatch subfolders')
         self._date_line = QLineEdit(datetime.date.today().strftime('%Y-%m-%d'))
         self._date_line.setPlaceholderText('YYYY-MM-DD')
         self._date_line.setFixedWidth(90)
+        self._date_line.setToolTip('Reference (hatch) date in YYYY-MM-DD format')
         self._btn_pick_date = QPushButton('\u2026')
         self._btn_pick_date.setObjectName('btn_small')
         self._btn_pick_date.setFixedSize(28, 28)
+        self._btn_pick_date.setToolTip('Pick the reference date from a calendar')
         self._lbl_day_count = QLabel('Day: —')
         self._lbl_day_count.setStyleSheet(f'color: {C["yellow"]}; font-size: 9pt; font-weight: bold;')
         lbl_dph_pfx = QLabel('Folder prefix')
         lbl_dph_pfx.setObjectName('param_label')
         self._dph_prefix_edit = QLineEdit()
         self._dph_prefix_edit.setPlaceholderText('e.g. day_')
+        self._dph_prefix_edit.setToolTip('Optional prefix added to the day-post-hatch subfolder name')
         date_row = QHBoxLayout()
         date_row.setSpacing(4)
         date_row.addWidget(self._date_line)
