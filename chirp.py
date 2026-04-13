@@ -300,21 +300,28 @@ class BandpassFilter:
 # ThresholdRecorder
 # ──────────────────────────────────────────────────────────────────────────────
 class ThresholdRecorder:
-    _IDLE      = 'IDLE'
-    _PENDING   = 'PENDING'
-    _RECORDING = 'RECORDING'
+    """
+    Multi-event threshold recorder.
+
+    Parameter semantics:
+      • min_cross  — consecutive time above threshold required to start an event.
+      • pre_trig   — audio kept before the trigger point (rolling lookback buffer).
+      • hold       — silence duration after the last above-threshold sample that marks
+                     the end of an event (hold=0 → event ends on the first below chunk).
+      • post_trig  — audio kept after the event-end point, appended as tail to the WAV.
+      • max_rec    — hard cap on the length of a single saved WAV; events longer are split.
+
+    Multiple events can be active simultaneously: if a new above-threshold burst starts
+    while an older event is still collecting its post-trigger tail, it begins a new event
+    and the two are saved as separate WAV files whose audio windows overlap in time.
+    """
 
     def __init__(self):
-        self._state            = self._IDLE
-        self._buf: list        = []
-        self._pending_chunks: list = []
-        self._pending_samples  = 0
-        self._silent_count     = 0
-        self._last_above_idx   = 0     # index in _buf of last above-threshold chunk
-        self._was_enabled      = False
-        self._pre_trig_deque   = collections.deque(maxlen=1)
-        self._pre_trig_maxlen  = 1
-        self._onset_time       = None  # precise onset timestamp
+        self._was_enabled     = False
+        self._pre_trig_deque  = collections.deque(maxlen=1)
+        self._pre_trig_maxlen = 1
+        self._above_streak    = 0   # consecutive above-threshold samples
+        self._active_events: list = []
 
     def process_chunk(self, chunk: np.ndarray, *,
                       trigger_peak: float,
@@ -324,102 +331,105 @@ class ThresholdRecorder:
                       output_dir: str, enabled: bool,
                       filename_prefix: str = '', filename_suffix: str = '',
                       sample_rate: int = SAMPLE_RATE):
-        if self._was_enabled and not enabled:
-            if self._state == self._RECORDING and self._buf:
-                self._start_flush(self._buf, output_dir, filename_prefix, filename_suffix,
-                                  sample_rate=sample_rate, onset_time=self._onset_time)
-            self._reset()
-        self._was_enabled = enabled
 
-        needed = max(1, int(pre_trig_sec * sample_rate / CHUNK_FRAMES))
+        # ── Resize pre-trigger rolling buffer ─────────────────────────────
+        # Size it to (pre_trig + min_cross) so the event snapshot at the moment
+        # of min-cross confirmation still contains a full pre_trig_sec of lookback
+        # before the *first* above-threshold chunk.
+        needed = max(1, int((pre_trig_sec + min_cross_sec) * sample_rate / CHUNK_FRAMES) + 1)
         if needed != self._pre_trig_maxlen:
             old = list(self._pre_trig_deque)
             self._pre_trig_deque  = collections.deque(old[-needed:], maxlen=needed)
             self._pre_trig_maxlen = needed
 
+        # Always feed the rolling lookback buffer
+        self._pre_trig_deque.append(chunk.copy())
+
+        # ── Enable/disable transitions ────────────────────────────────────
+        if self._was_enabled and not enabled:
+            for ev in self._active_events:
+                self._start_flush(ev['buf'], output_dir, filename_prefix,
+                                  filename_suffix, sample_rate=sample_rate,
+                                  onset_time=ev['onset_time'])
+            self._active_events = []
+            self._above_streak  = 0
+        self._was_enabled = enabled
+
         if not enabled:
-            self._pre_trig_deque.append(chunk.copy())
             return
 
-        min_cross_samps = int(min_cross_sec * sample_rate)
-        hold_samps      = int(hold_sec      * sample_rate)
-        max_chunks      = max(1, int(max_rec_sec * sample_rate / CHUNK_FRAMES))
+        # ── Parameter conversions ─────────────────────────────────────────
+        min_cross_samps  = int(min_cross_sec * sample_rate)
+        hold_samps       = int(hold_sec      * sample_rate)
+        post_trig_chunks = max(0, int(post_trig_sec * sample_rate / CHUNK_FRAMES))
+        max_chunks       = max(1, int(max_rec_sec * sample_rate / CHUNK_FRAMES))
 
-        if self._state == self._IDLE:
-            if trigger_peak >= threshold:
-                self._state           = self._PENDING
-                self._pending_chunks  = [chunk.copy()]
-                self._pending_samples = len(chunk)
-                # Capture precise onset: this chunk is the first above threshold
-                self._onset_time      = datetime.datetime.now()
-            else:
-                self._pre_trig_deque.append(chunk.copy())
+        above = trigger_peak >= threshold
+        if above:
+            self._above_streak += len(chunk)
+        else:
+            self._above_streak = 0
 
-        elif self._state == self._PENDING:
-            if trigger_peak >= threshold:
-                self._pending_chunks.append(chunk.copy())
-                self._pending_samples += len(chunk)
-                if self._pending_samples >= min_cross_samps:
-                    self._state        = self._RECORDING
-                    self._buf          = list(self._pre_trig_deque) + self._pending_chunks
-                    # Adjust onset for pre-trigger samples
-                    pre_trig_samples = sum(len(c) for c in self._pre_trig_deque)
-                    self._onset_time -= datetime.timedelta(
-                        seconds=pre_trig_samples / sample_rate)
-                    self._pending_chunks  = []
-                    self._pending_samples = 0
-                    self._silent_count = 0
-            else:
-                for c in self._pending_chunks:
-                    self._pre_trig_deque.append(c)
-                self._pre_trig_deque.append(chunk.copy())
-                self._pending_chunks  = []
-                self._pending_samples = 0
-                self._state = self._IDLE
+        # ── Start a new event if we have sustained above-threshold and
+        #    no currently-open (non-ended) event is already capturing it ──
+        has_open = any(not ev['ended'] for ev in self._active_events)
+        just_created = None
+        if (not has_open) and above and self._above_streak >= min_cross_samps:
+            buf_init = [c.copy() for c in self._pre_trig_deque]
+            n_init   = sum(len(c) for c in buf_init)
+            onset    = datetime.datetime.now() - datetime.timedelta(
+                seconds=n_init / sample_rate)
+            just_created = {
+                'buf':            buf_init,
+                'ended':          False,
+                'silent_samps':   0,
+                'last_above_idx': len(buf_init) - 1,
+                'tail_remaining': 0,
+                'onset_time':     onset,
+            }
+            self._active_events.append(just_created)
 
-        elif self._state == self._RECORDING:
-            self._buf.append(chunk.copy())
-            # Keep the pre-trigger rolling buffer populated during RECORDING too,
-            # so a new event firing right after this one still has full pre-trigger context.
-            self._pre_trig_deque.append(chunk.copy())
-            if trigger_peak >= threshold:
-                self._silent_count = 0
-                self._last_above_idx = len(self._buf) - 1
-            else:
-                self._silent_count += len(chunk)
-                post_trig_chunks = max(0, int(post_trig_sec * sample_rate / CHUNK_FRAMES))
-                chunks_since_last_above = len(self._buf) - 1 - self._last_above_idx
-                # Event is "over" once hold elapsed; then keep buffering until we have a
-                # full post-trigger tail after last_above before flushing.
-                if (self._silent_count >= hold_samps and
-                        chunks_since_last_above >= post_trig_chunks):
-                    trim_end = min(self._last_above_idx + 1 + post_trig_chunks, len(self._buf))
-                    self._start_flush(self._buf[:trim_end], output_dir, filename_prefix,
-                                      filename_suffix, sample_rate=sample_rate,
-                                      onset_time=self._onset_time)
-                    self._reset()
+        # ── Update every active event with this chunk ─────────────────────
+        to_remove = []
+        for ev in self._active_events:
+            if ev is not just_created:
+                ev['buf'].append(chunk.copy())
+                if not ev['ended']:
+                    if above:
+                        ev['silent_samps']   = 0
+                        ev['last_above_idx'] = len(ev['buf']) - 1
+                    else:
+                        ev['silent_samps'] += len(chunk)
+                        if ev['silent_samps'] >= hold_samps:
+                            ev['ended'] = True
+                            chunks_since_last = len(ev['buf']) - 1 - ev['last_above_idx']
+                            ev['tail_remaining'] = max(0, post_trig_chunks - chunks_since_last)
+                else:
+                    ev['tail_remaining'] -= 1
 
-            if self._state == self._RECORDING and len(self._buf) > max_chunks:
-                self._start_flush(self._buf, output_dir, filename_prefix, filename_suffix,
-                                  sample_rate=sample_rate, onset_time=self._onset_time)
-                self._buf = []
-                self._onset_time = datetime.datetime.now()  # new segment starts now
+            # Flush when the post-trigger tail is fully captured
+            if ev['ended'] and ev['tail_remaining'] <= 0:
+                trim_end = min(ev['last_above_idx'] + 1 + post_trig_chunks, len(ev['buf']))
+                self._start_flush(ev['buf'][:trim_end], output_dir, filename_prefix,
+                                  filename_suffix, sample_rate=sample_rate,
+                                  onset_time=ev['onset_time'])
+                to_remove.append(ev)
+                continue
 
-    def _reset(self):
-        self._state           = self._IDLE
-        self._buf             = []
-        self._pending_chunks  = []
-        self._pending_samples = 0
-        self._silent_count    = 0
-        self._last_above_idx  = 0
-        self._onset_time      = None
-        # Do NOT clear the pre-trigger rolling buffer — keeping it populated ensures the
-        # next event (even one firing immediately after this flush) gets a full pre-trigger
-        # window, per issue #9.
+            # Force-split events longer than max_rec
+            if len(ev['buf']) >= max_chunks:
+                self._start_flush(ev['buf'], output_dir, filename_prefix,
+                                  filename_suffix, sample_rate=sample_rate,
+                                  onset_time=ev['onset_time'])
+                to_remove.append(ev)
+
+        for ev in to_remove:
+            if ev in self._active_events:
+                self._active_events.remove(ev)
 
     @property
     def is_recording(self) -> bool:
-        return self._state == self._RECORDING
+        return any(not ev['ended'] for ev in self._active_events)
 
     @staticmethod
     def _start_flush(buf_snapshot: list, output_dir: str,
