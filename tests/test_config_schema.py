@@ -118,6 +118,46 @@ def test_single_entity_roundtrip_preserves_scalar_params():
     assert warnings == []
 
 
+# ── #22 / c17: versioning + unknown-key warnings ───────────────────────────
+
+def test_unknown_top_level_key_warns():
+    raw = {"version": 1, "recordings": [], "view_mode": {},
+           "totally_made_up_key": 42}
+    entities, vm, warnings = load_settings_dict(raw)
+    assert entities == []
+    assert any("totally_made_up_key" in w for w in warnings)
+
+
+def test_unknown_view_mode_key_warns():
+    raw = {"version": 1, "recordings": [],
+           "view_mode": {"columns": 2, "panel_height": 100, "weird": "?"}}
+    _, vm, warnings = load_settings_dict(raw)
+    assert vm["columns"] == 2
+    assert any("weird" in w for w in warnings)
+
+
+def test_unknown_recording_key_warns():
+    raw = {
+        "version": 1,
+        "recordings": [{"name": "X", "future_field": 9001}],
+    }
+    entities, _, warnings = load_settings_dict(raw)
+    assert len(entities) == 1
+    assert any("future_field" in w for w in warnings)
+
+
+def test_missing_version_treated_as_v1_with_warning():
+    raw = {"recordings": []}
+    _, _, warnings = load_settings_dict(raw)
+    assert any("version" in w for w in warnings)
+
+
+def test_future_version_raises():
+    import pytest
+    with pytest.raises(ValueError, match="newer Chirp"):
+        load_settings_dict({"version": 9999, "recordings": []})
+
+
 def test_multiple_entities_preserve_order():
     e1 = _fresh_entity(name="First")
     e2 = _fresh_entity(name="Second")

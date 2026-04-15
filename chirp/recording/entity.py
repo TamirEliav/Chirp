@@ -617,11 +617,14 @@ class RecordingEntity:
             if attr in d:
                 setattr(e, attr, d[attr])
 
-        # Spec params that may need rebuild
+        # Spec params: always apply, even when they happen to equal the
+        # defaults. The pre-c17 shortcut "skip if defaults" was a bug —
+        # if the constructor's defaults ever change, an old config file
+        # would silently snap to the new defaults instead of preserving
+        # the user's original intent (#22 / c17).
         nperseg = d.get('spec_nperseg', SPECTROGRAM_NPERSEG)
         window  = d.get('spec_window', 'hann')
-        if nperseg != SPECTROGRAM_NPERSEG or window != 'hann':
-            e.change_fft_params(nperseg, window)
+        e.change_fft_params(nperseg, window)
 
         # Ref date
         ref = d.get('ref_date')
