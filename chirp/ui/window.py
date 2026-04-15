@@ -2784,6 +2784,44 @@ class ChirpWindow(QMainWindow):
                 event.ignore()
                 return
         self._timer.stop()
+
+        # #17 / c16: flush any in-flight trigger events to the writer
+        # pool, then drain the pool so non-daemon worker threads finish
+        # writing before the interpreter exits. Without this, daemon
+        # threads from the old launcher would be killed mid-write and
+        # the most recent WAV would be left truncated on disk.
+        from chirp.recording import writer as _writer
+        for e in self._entities:
+            try:
+                e.recorder.flush_all(
+                    output_dir=e.output_dir,
+                    filename_prefix=e.filename_prefix,
+                    filename_suffix=e.filename_suffix,
+                    sample_rate=e.sample_rate,
+                    filename_stream=e.name,
+                    reason='app shutdown',
+                )
+            except Exception as exc:
+                print(f'[Chirp] flush_all failed for {e.name}: {exc}')
+
+        pending = _writer.pending()
+        if pending:
+            # Show a non-cancellable modal so the user knows we're
+            # waiting on disk I/O and not just frozen.
+            try:
+                msg = QMessageBox(self)
+                msg.setIcon(QMessageBox.Information)
+                msg.setWindowTitle('Chirp')
+                msg.setText(f'Finishing {pending} pending recording(s)…')
+                msg.setStandardButtons(QMessageBox.NoButton)
+                msg.show()
+                QApplication.processEvents()
+                _writer.drain(timeout=30.0)
+                msg.close()
+            except Exception:
+                _writer.drain(timeout=30.0)
+        _writer.shutdown(timeout=5.0)
+
         for e in self._entities:
             e.close()
         super().closeEvent(event)

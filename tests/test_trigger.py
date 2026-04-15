@@ -323,6 +323,23 @@ def test_monotonic_anchor_resets_on_disable(captured_flushes):
     assert rec._mono_anchor is None
 
 
+def test_flush_all_drains_active_events(captured_flushes):
+    """`flush_all` writes every pending event and resets state (#17)."""
+    rec = ThresholdRecorder()
+    p = _params(hold_sec=10.0)  # huge hold so the event stays open
+    rec.process_chunk(_loud(0.5), trigger_peak=0.5, **p)
+    rec.process_chunk(_loud(0.5), trigger_peak=0.5, **p)
+    assert rec.is_recording
+    assert len(captured_flushes) == 0
+    n = rec.flush_all(output_dir='/tmp/x', filename_stream='Mic_A',
+                      reason='test')
+    assert n == 1
+    assert len(captured_flushes) == 1
+    assert captured_flushes[0]["filename_stream"] == 'Mic_A'
+    assert not rec.is_recording
+    assert rec._mono_anchor is None
+
+
 def test_filename_stream_kwarg_forwarded(captured_flushes):
     """The `filename_stream` kwarg flows through to the flush callback."""
     rec = ThresholdRecorder()

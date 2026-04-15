@@ -197,6 +197,32 @@ class ThresholdRecorder:
     def is_recording(self) -> bool:
         return any(not ev['ended'] for ev in self._active_events)
 
+    def flush_all(self, output_dir: str,
+                  filename_prefix: str = '', filename_suffix: str = '',
+                  sample_rate: int = SAMPLE_RATE,
+                  filename_stream: str = '',
+                  reason: str = '') -> int:
+        """Flush every active event regardless of state (#17 / c16).
+
+        Used by `ChirpWindow.closeEvent` to make sure no in-flight
+        recording is lost when the user quits mid-event. Returns the
+        number of events flushed. The state machine is reset.
+        """
+        n = len(self._active_events)
+        if n and reason:
+            print(f'[REC] flush_all ({reason}): {n} event(s) pending')
+        for ev in self._active_events:
+            self._start_flush(ev['buf'], output_dir, filename_prefix,
+                              filename_suffix, sample_rate=sample_rate,
+                              onset_time=ev['onset_time'],
+                              filename_stream=filename_stream)
+        self._active_events = []
+        self._above_streak  = 0
+        self._was_enabled   = False
+        self._mono_anchor   = None
+        self._wall_anchor   = None
+        return n
+
     @staticmethod
     def _start_flush(buf_snapshot: list, output_dir: str,
                      prefix: str = '', suffix: str = '', sample_rate: int = SAMPLE_RATE,

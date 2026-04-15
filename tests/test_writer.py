@@ -32,6 +32,28 @@ def test_filename_includes_stream_token(tmp_path):
     assert name.endswith(".wav")
 
 
+def test_writer_pool_drains_pending_writes(tmp_path):
+    """`submit` followed by `drain` should leave every WAV on disk
+    before drain returns (#17 / c16). Worker threads are non-daemon
+    so this guarantees survival across interpreter shutdown.
+    """
+    from chirp.recording import writer
+
+    # Use a fresh pool to avoid interference with module-level state.
+    writer.shutdown(timeout=1.0)
+    n = 5
+    onset = datetime.datetime(2024, 1, 1, 0, 0, 0)
+    for i in range(n):
+        writer.submit([np.zeros(512, dtype=np.float32)], str(tmp_path),
+                      sample_rate=44100, onset_time=onset,
+                      filename_stream=f'stream{i}')
+    assert writer.drain(timeout=10.0) is True
+    assert writer.pending() == 0
+    files = list(tmp_path.glob('*.wav'))
+    assert len(files) == n
+    writer.shutdown(timeout=1.0)
+
+
 def test_filename_omits_token_when_blank(tmp_path):
     onset = datetime.datetime(2024, 1, 2, 3, 4, 5, 678000)
     audio = np.zeros(1024, dtype=np.float32)
