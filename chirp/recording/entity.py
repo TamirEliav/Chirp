@@ -498,6 +498,7 @@ class RecordingEntity:
             filename_suffix = self.filename_suffix,
             sample_rate   = self.sample_rate,
             should_trigger = should_trigger,
+            filename_stream = self.name,
         )
 
     # ── Mini amplitude for sidebar ────────────────────────────────────────

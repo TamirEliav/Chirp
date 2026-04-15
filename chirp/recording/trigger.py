@@ -21,6 +21,7 @@ c18 will rewrite this state machine to be sample-accurate.
 
 import collections
 import datetime
+import time
 
 import numpy as np
 
@@ -51,6 +52,11 @@ class ThresholdRecorder:
         self._pre_trig_maxlen = 1
         self._above_streak    = 0   # consecutive above-threshold samples
         self._active_events: list = []
+        # #23 / c13: monotonic + wall anchor pair, established lazily
+        # on the first chunk after enable. Wall-clock onsets are derived
+        # by adding a monotonic delta — immune to NTP/DST jumps.
+        self._mono_anchor: float | None = None
+        self._wall_anchor: datetime.datetime | None = None
 
     def process_chunk(self, chunk: np.ndarray, *,
                       trigger_peak: float,
@@ -60,7 +66,8 @@ class ThresholdRecorder:
                       output_dir: str, enabled: bool,
                       filename_prefix: str = '', filename_suffix: str = '',
                       sample_rate: int = SAMPLE_RATE,
-                      should_trigger: bool | None = None):
+                      should_trigger: bool | None = None,
+                      filename_stream: str = ''):
         """Drive the state machine with one audio chunk.
 
         `should_trigger` (c12 / #16): if not None, the caller has already
@@ -87,13 +94,26 @@ class ThresholdRecorder:
             for ev in self._active_events:
                 self._start_flush(ev['buf'], output_dir, filename_prefix,
                                   filename_suffix, sample_rate=sample_rate,
-                                  onset_time=ev['onset_time'])
+                                  onset_time=ev['onset_time'],
+                                  filename_stream=filename_stream)
             self._active_events = []
             self._above_streak  = 0
+            # Clear monotonic anchor so the next enable establishes a
+            # fresh one (#23 / c13).
+            self._mono_anchor = None
+            self._wall_anchor = None
         self._was_enabled = enabled
 
         if not enabled:
             return
+
+        # Lazily anchor the monotonic + wall clocks the first time we
+        # see an enabled chunk. All event onsets in this enabled span
+        # are derived from monotonic deltas off this pair so NTP/DST
+        # jumps cannot move the timestamps around (#23 / c13).
+        if self._mono_anchor is None:
+            self._mono_anchor = time.monotonic()
+            self._wall_anchor = datetime.datetime.now()
 
         # ── Parameter conversions ─────────────────────────────────────────
         min_cross_samps  = int(min_cross_sec * sample_rate)
@@ -117,8 +137,12 @@ class ThresholdRecorder:
         if (not has_open) and above and self._above_streak >= min_cross_samps:
             buf_init = [c.copy() for c in self._pre_trig_deque]
             n_init   = sum(len(c) for c in buf_init)
-            onset    = datetime.datetime.now() - datetime.timedelta(
-                seconds=n_init / sample_rate)
+            # Onset derived from the monotonic anchor — stable across
+            # NTP/DST jumps (#23 / c13).
+            mono_delta = time.monotonic() - self._mono_anchor
+            onset = (self._wall_anchor
+                     + datetime.timedelta(seconds=mono_delta)
+                     - datetime.timedelta(seconds=n_init / sample_rate))
             just_created = {
                 'buf':            buf_init,
                 'ended':          False,
@@ -152,7 +176,8 @@ class ThresholdRecorder:
                 trim_end = min(ev['last_above_idx'] + 1 + post_trig_chunks, len(ev['buf']))
                 self._start_flush(ev['buf'][:trim_end], output_dir, filename_prefix,
                                   filename_suffix, sample_rate=sample_rate,
-                                  onset_time=ev['onset_time'])
+                                  onset_time=ev['onset_time'],
+                                  filename_stream=filename_stream)
                 to_remove.append(ev)
                 continue
 
@@ -160,7 +185,8 @@ class ThresholdRecorder:
             if len(ev['buf']) >= max_chunks:
                 self._start_flush(ev['buf'], output_dir, filename_prefix,
                                   filename_suffix, sample_rate=sample_rate,
-                                  onset_time=ev['onset_time'])
+                                  onset_time=ev['onset_time'],
+                                  filename_stream=filename_stream)
                 to_remove.append(ev)
 
         for ev in to_remove:
@@ -174,7 +200,7 @@ class ThresholdRecorder:
     @staticmethod
     def _start_flush(buf_snapshot: list, output_dir: str,
                      prefix: str = '', suffix: str = '', sample_rate: int = SAMPLE_RATE,
-                     onset_time=None):
+                     onset_time=None, filename_stream: str = ''):
         """Legacy daemon-thread launcher — delegates to
         `chirp.recording.writer.start_flush_thread`. Kept as a
         staticmethod on the class so the existing test monkeypatch
@@ -184,4 +210,5 @@ class ThresholdRecorder:
         _writer.start_flush_thread(
             buf_snapshot, output_dir, prefix, suffix,
             sample_rate=sample_rate, onset_time=onset_time,
+            filename_stream=filename_stream,
         )

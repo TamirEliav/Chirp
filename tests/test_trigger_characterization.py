@@ -39,7 +39,8 @@ def captured_flushes(monkeypatch):
     flushes: list[dict] = []
 
     def _capture(buf_snapshot, output_dir, prefix='', suffix='',
-                 sample_rate=chirp.SAMPLE_RATE, onset_time=None):
+                 sample_rate=chirp.SAMPLE_RATE, onset_time=None,
+                 filename_stream=''):
         flushes.append({
             "audio": np.concatenate(list(buf_snapshot)),
             "n_chunks": len(buf_snapshot),

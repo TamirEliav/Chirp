@@ -26,10 +26,19 @@ import scipy.io.wavfile
 from chirp.constants import SAMPLE_RATE
 
 
+_FILENAME_SAFE = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._")
+
+
+def _sanitize_token(s: str) -> str:
+    """Strip filename-hostile characters from a stream-name token."""
+    return ''.join(c if c in _FILENAME_SAFE else '_' for c in s).strip('_')
+
+
 def write_wav_sync(buf_snapshot: list, output_dir: str,
                    prefix: str = '', suffix: str = '',
                    sample_rate: int = SAMPLE_RATE,
-                   onset_time=None) -> str:
+                   onset_time=None,
+                   filename_stream: str = '') -> str:
     """Concatenate chunks and write a 16-bit PCM WAV synchronously.
 
     Returns the output path. Raises on I/O failure — the legacy
@@ -48,7 +57,8 @@ def write_wav_sync(buf_snapshot: list, output_dir: str,
         onset = datetime.datetime.now() - datetime.timedelta(seconds=audio_dur)
     epoch_ms = int(onset.timestamp() * 1000)
     local_ts = onset.strftime('%Y%m%d_%H%M%S_%f')[:-3]
-    parts = [p for p in [prefix.rstrip('_'), str(epoch_ms), local_ts,
+    stream_tok = _sanitize_token(filename_stream) if filename_stream else ''
+    parts = [p for p in [prefix.rstrip('_'), stream_tok, str(epoch_ms), local_ts,
                          suffix.lstrip('_')] if p]
     fname = '_'.join(parts) + '.wav'
     path  = os.path.join(output_dir, fname)
@@ -61,7 +71,8 @@ def write_wav_sync(buf_snapshot: list, output_dir: str,
 def start_flush_thread(buf_snapshot: list, output_dir: str,
                        prefix: str = '', suffix: str = '',
                        sample_rate: int = SAMPLE_RATE,
-                       onset_time=None) -> None:
+                       onset_time=None,
+                       filename_stream: str = '') -> None:
     """Legacy fire-and-forget daemon-thread writer.
 
     c16 (#17) will replace this with a bounded worker pool that can be
@@ -69,6 +80,7 @@ def start_flush_thread(buf_snapshot: list, output_dir: str,
     """
     threading.Thread(
         target=write_wav_sync,
-        args=(list(buf_snapshot), output_dir, prefix, suffix, sample_rate, onset_time),
+        args=(list(buf_snapshot), output_dir, prefix, suffix, sample_rate,
+              onset_time, filename_stream),
         daemon=True,
     ).start()

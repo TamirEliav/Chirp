@@ -35,7 +35,7 @@ def captured_flushes(monkeypatch):
     flushes: list[dict] = []
 
     def _capture(buf_snapshot, output_dir, prefix='', suffix='',
-                 sample_rate=44100, onset_time=None):
+                 sample_rate=44100, onset_time=None, filename_stream=''):
         flushes.append({
             "audio": np.concatenate(list(buf_snapshot)),
             "n_chunks": len(buf_snapshot),
@@ -44,6 +44,7 @@ def captured_flushes(monkeypatch):
             "suffix": suffix,
             "sample_rate": sample_rate,
             "onset_time": onset_time,
+            "filename_stream": filename_stream,
         })
 
     monkeypatch.setattr(
@@ -299,9 +300,8 @@ def test_sub_threshold_never_triggers(captured_flushes):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_onset_time_is_populated(captured_flushes):
-    """Every flush carries a datetime onset_time. #23 will make it
-    monotonic-based; for now this pins that it is at least set.
-    """
+    """Every flush carries a datetime onset_time, derived from the
+    monotonic clock anchor (#23 / c13)."""
     import datetime
     rec = ThresholdRecorder()
     p = _params()
@@ -310,3 +310,26 @@ def test_onset_time_is_populated(captured_flushes):
     assert len(captured_flushes) == 1
     onset = captured_flushes[0]["onset_time"]
     assert isinstance(onset, datetime.datetime)
+
+
+def test_monotonic_anchor_resets_on_disable(captured_flushes):
+    """Disabling clears the anchor so the next enable re-anchors fresh."""
+    rec = ThresholdRecorder()
+    on = _params(enabled=True)
+    off = _params(enabled=False)
+    rec.process_chunk(_loud(0.5), trigger_peak=0.5, **on)
+    assert rec._mono_anchor is not None
+    rec.process_chunk(_silent(), trigger_peak=0.0, **off)
+    assert rec._mono_anchor is None
+
+
+def test_filename_stream_kwarg_forwarded(captured_flushes):
+    """The `filename_stream` kwarg flows through to the flush callback."""
+    rec = ThresholdRecorder()
+    p = _params()
+    rec.process_chunk(_loud(0.5), trigger_peak=0.5,
+                      filename_stream='Mic_A', **p)
+    rec.process_chunk(_silent(), trigger_peak=0.0,
+                      filename_stream='Mic_A', **p)
+    assert len(captured_flushes) == 1
+    assert captured_flushes[0]["filename_stream"] == 'Mic_A'
