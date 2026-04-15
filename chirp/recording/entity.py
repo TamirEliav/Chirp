@@ -188,6 +188,7 @@ class RecordingEntity:
     def change_fft_params(self, nperseg: int, window: str):
         self.spec_nperseg = nperseg
         self.spec_window  = window
+        # Fresh accumulators start un-primed — c10 / #14.
         self.spec_acc   = SpectrogramAccumulator(nperseg, window)
         self.spec_acc_r = SpectrogramAccumulator(nperseg, window)
         self.n_freq_bins  = nperseg // 2 + 1
@@ -293,6 +294,10 @@ class RecordingEntity:
 
     def start_acq(self):
         if not self.acq_running and self.capture.valid:
+            # Clear stale overlap so the first few FFT columns after a
+            # restart don't mix zero-padding into the spectrum (#14).
+            self.spec_acc.reset()
+            self.spec_acc_r.reset()
             self.capture.resume()
             self.acq_running = True
 
@@ -303,6 +308,8 @@ class RecordingEntity:
             self.rec_enabled = False
             self.bpf.reset()
             self.bpf_r.reset()
+            self.spec_acc.reset()
+            self.spec_acc_r.reset()
 
     def start_rec(self):
         if not self.acq_running:
@@ -399,8 +406,20 @@ class RecordingEntity:
         self.entropy_buffer[self.col_head] = entropy
 
         # ── Apply spectral trigger mode ───────────────────────────────
+        # #14: suppress spectral triggering while the FFT accumulator is
+        # still warming up — during the first `nperseg` samples after a
+        # reset the overlap buffer is zero-padded and the entropy value
+        # is meaningless.
         stm = self.spectral_trigger_mode
-        if stm != 'Amplitude Only':
+        spec_primed = self.spec_acc.primed and (
+            mode != 'Stereo' or self.spec_acc_r.primed)
+        if stm != 'Amplitude Only' and not spec_primed:
+            # Warm-up: spectral value is meaningless. Suppress spectral
+            # gating entirely. In Spectral-Only / AND modes this also
+            # forces trigger_peak below threshold so nothing fires.
+            if stm in ('Spectral Only', 'Amp AND Spectral'):
+                trigger_peak = 0.0
+        elif stm != 'Amplitude Only':
             spec_triggered = (entropy < self.spectral_threshold)
             if stm == 'Spectral Only':
                 trigger_peak = self.threshold if spec_triggered else 0.0

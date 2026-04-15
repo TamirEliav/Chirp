@@ -108,6 +108,54 @@ def test_spectrogram_detects_known_tone():
     assert abs(int(np.argmax(lin)) - expected_bin) <= 1
 
 
+# ── SpectrogramAccumulator warm-up / reset (#14, c10) ───────────────────────
+
+def test_spectrogram_starts_unprimed():
+    """A fresh accumulator is un-primed until `nperseg` samples flow in."""
+    acc = SpectrogramAccumulator(nperseg=1024)
+    assert acc.primed is False
+
+
+def test_spectrogram_primes_after_nperseg_samples():
+    """After feeding ≥ nperseg live samples the accumulator is primed."""
+    nperseg = 1024
+    acc = SpectrogramAccumulator(nperseg=nperseg)
+    # Two 512-sample chunks == 1024 live samples → primed.
+    chunk = np.zeros(512, dtype=np.float32)
+    acc.compute_column(chunk)
+    assert acc.primed is False
+    acc.compute_column(chunk)
+    assert acc.primed is True
+
+
+def test_spectrogram_reset_unprimes():
+    """`reset()` clears overlap and returns the accumulator to un-primed."""
+    nperseg = 256
+    acc = SpectrogramAccumulator(nperseg=nperseg)
+    acc.compute_column(np.ones(nperseg, dtype=np.float32))
+    assert acc.primed is True
+    acc.reset()
+    assert acc.primed is False
+    # Overlap was cleared: feeding zeros yields a near-silent column.
+    _, lin = acc.compute_column(np.zeros(64, dtype=np.float32))
+    assert float(np.max(lin)) < 1e-6
+
+
+def test_spectrogram_reset_clears_stale_overlap():
+    """After reset, a fresh tone should not be polluted by the previous run.
+
+    Regression for #14: feed a loud signal, reset, then feed silence —
+    the post-reset spectrum must not still echo the loud signal.
+    """
+    nperseg = 512
+    acc = SpectrogramAccumulator(nperseg=nperseg)
+    loud = np.ones(nperseg, dtype=np.float32) * 0.9
+    acc.compute_column(loud)
+    acc.reset()
+    _, lin = acc.compute_column(np.zeros(nperseg, dtype=np.float32))
+    assert float(np.max(lin)) < 1e-6
+
+
 # ── BandpassFilter ───────────────────────────────────────────────────────────
 
 def test_bandpass_invalid_band_passes_through():
