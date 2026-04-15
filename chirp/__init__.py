@@ -1976,14 +1976,14 @@ class ChirpWindow(QMainWindow):
     def _build_settings_data(self) -> dict:
         if self._selected_idx >= 0:
             self._flush_params_to_entity(self._selected_idx)
-        return {
-            'version': 1,
-            'view_mode': {
-                'columns': self._vm_n_cols,
+        from chirp.config import build_settings_dict
+        return build_settings_dict(
+            self._entities,
+            view_mode={
+                'columns':      self._vm_n_cols,
                 'panel_height': self._vm_panel_height,
             },
-            'recordings': [e.to_dict() for e in self._entities],
-        }
+        )
 
     def _write_settings_to_path(self, path: str, data: dict) -> bool:
         try:
