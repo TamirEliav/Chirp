@@ -120,6 +120,10 @@ class RecordingEntity:
         self.spec_buffer_r = np.full(
             (self.n_freq_bins, self._n_cols), SPEC_DB_MIN, dtype=np.float32)
         self.entropy_buffer = np.ones(self._n_cols, dtype=np.float32)
+        # Single cumulative sample counter — both ring-buffer cursors
+        # are derived from it so they cannot drift apart when chunk
+        # size differs from CHUNK_FRAMES (#20 / c14).
+        self._samples_total = 0
         self.write_head = 0
         self.col_head   = 0
 
@@ -147,6 +151,7 @@ class RecordingEntity:
         self.spec_buffer[:]   = SPEC_DB_MIN
         self.spec_buffer_r[:] = SPEC_DB_MIN
         self.entropy_buffer[:] = 1.0
+        self._samples_total = 0
         self.write_head = 0
         self.col_head   = 0
 
@@ -253,6 +258,7 @@ class RecordingEntity:
         self.spec_buffer_r = np.full(
             (self.n_freq_bins, self._n_cols), SPEC_DB_MIN, dtype=np.float32)
         self.entropy_buffer = np.ones(self._n_cols, dtype=np.float32)
+        self._samples_total = 0
         self.write_head = 0
         self.col_head   = 0
 
@@ -287,6 +293,7 @@ class RecordingEntity:
         self.spec_buffer_r = np.full(
             (self.n_freq_bins, self._n_cols), SPEC_DB_MIN, dtype=np.float32)
         self.entropy_buffer = np.ones(self._n_cols, dtype=np.float32)
+        self._samples_total = 0
         self.write_head = 0
         self.col_head   = 0
 
@@ -340,6 +347,16 @@ class RecordingEntity:
             record  = left
 
         n   = len(left)
+        # #20 / c14: derive both ring-buffer cursors from a single sample
+        # clock so they cannot drift apart when chunk size != CHUNK_FRAMES.
+        # Also assert the chunk fits — a single oversize chunk would
+        # otherwise smear across the buffer multiple times.
+        if n > self._total_samples:
+            raise ValueError(
+                f"chunk of {n} samples exceeds buffer capacity "
+                f"{self._total_samples}")
+        self.write_head = self._samples_total % self._total_samples
+        self.col_head   = (self._samples_total // CHUNK_FRAMES) % self._n_cols
         end = self.write_head + n
 
         # Spectrogram always uses unfiltered signal
@@ -474,8 +491,13 @@ class RecordingEntity:
                 self.abs_amp_buffer[self.write_head:] = abs_l[:split]
                 self.abs_amp_buffer[:wrap]            = abs_l[split:]
 
-        self.write_head = end % self._total_samples
-        self.col_head   = (self.col_head + 1) % self._n_cols
+        # Single source of truth: advance the cumulative sample clock,
+        # then re-derive both ring-buffer cursors. This guarantees they
+        # stay coherent regardless of `n` (#20 / c14) and gives readers
+        # the legacy "where the next sample lands" semantics.
+        self._samples_total += n
+        self.write_head = self._samples_total % self._total_samples
+        self.col_head   = (self._samples_total // CHUNK_FRAMES) % self._n_cols
 
         # Compute effective output dir (with day subfolder if ref_date set)
         out_dir = self.output_dir
