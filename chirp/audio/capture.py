@@ -20,6 +20,11 @@ class AudioCapture:
         self._queue    = audio_queue
         self._channels = channels
         self._stream   = None
+        # #13 / c15: count of audio chunks the PortAudio callback had
+        # to drop because the queue was full. The UI samples this on
+        # each plot tick to surface a drop-indicator badge in the
+        # sidebar so silent loss is no longer invisible.
+        self.drop_count = 0
         try:
             self._stream = sd.InputStream(
                 samplerate=samplerate, channels=channels,
@@ -41,7 +46,16 @@ class AudioCapture:
             else:
                 self._queue.put_nowait(indata[:, :2].copy())
         except queue.Full:
-            pass
+            self.drop_count += 1
+
+    def consume_drop_count(self) -> int:
+        """Return the drop count and reset it to zero. Intended to be
+        polled once per UI tick — the sidebar latches a transient
+        drop indicator whenever this returns > 0.
+        """
+        n = self.drop_count
+        self.drop_count = 0
+        return n
 
     def resume(self):
         if self._stream is not None:

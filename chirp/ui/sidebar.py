@@ -108,16 +108,29 @@ class RecordingSidebarItem(QWidget):
         self._lbl_acq  = QLabel('\u25cf')
         self._lbl_rec  = QLabel('\u25cf')
         self._lbl_trig = QLabel('\u25cf')
+        # #13 / c15: flashes orange when AudioCapture has dropped chunks
+        # since the last UI tick. The badge is latched for a few ticks
+        # after the last drop so brief stalls remain visible.
+        self._lbl_drop = QLabel('!')
+        self._drop_ttl = 0
         self._lbl_acq .setToolTip('Acquisition status (live monitoring)')
         self._lbl_rec .setToolTip('Recording status (threshold-triggered WAV saving enabled)')
         self._lbl_trig.setToolTip('Trigger status (currently writing to a WAV file)')
+        self._lbl_drop.setToolTip(
+            'Audio drops detected — the queue is overflowing because '
+            'the UI/processing loop cannot keep up with the capture '
+            'callback. Reduce the number of streams or lower the '
+            'sample rate.')
         for lbl in (self._lbl_acq, self._lbl_rec, self._lbl_trig):
             lbl.setFixedWidth(12)
             lbl.setStyleSheet(f'color: {C["surface2"]}; font-size: 8pt;')
+        self._lbl_drop.setFixedWidth(12)
+        self._lbl_drop.setStyleSheet(f'color: {C["surface2"]}; font-weight: bold; font-size: 9pt;')
 
         row1.addWidget(self._name_label)
         row1.addWidget(self._name_edit)
         row1.addStretch()
+        row1.addWidget(self._lbl_drop)
         row1.addWidget(self._lbl_acq)
         row1.addWidget(self._lbl_rec)
         row1.addWidget(self._lbl_trig)
@@ -186,6 +199,21 @@ class RecordingSidebarItem(QWidget):
 
     def update_mini_amp(self, data: np.ndarray):
         self._mini_amp.set_data(data)
+
+    def notify_drops(self, n_drops: int):
+        """Latch the drop indicator. Called once per UI tick with the
+        number of dropped chunks since the last tick. The badge stays
+        lit for `_DROP_LATCH_TICKS` ticks after the most recent drop
+        so brief stalls remain visible.
+        """
+        if n_drops > 0:
+            self._drop_ttl = 20  # ~1s at the default 50ms tick
+        elif self._drop_ttl > 0:
+            self._drop_ttl -= 1
+        active = self._drop_ttl > 0
+        color = C['peach'] if active else C['surface2']
+        self._lbl_drop.setStyleSheet(
+            f'color: {color}; font-weight: bold; font-size: 9pt;')
 
     def mouseDoubleClickEvent(self, event):
         self._start_edit()
@@ -335,6 +363,10 @@ class RecordingSidebar(QWidget):
     def update_item_amp(self, idx: int, data: np.ndarray):
         if 0 <= idx < len(self._items):
             self._items[idx].update_mini_amp(data)
+
+    def update_item_drops(self, idx: int, n_drops: int):
+        if 0 <= idx < len(self._items):
+            self._items[idx].notify_drops(n_drops)
 
     def update_item_name(self, idx: int, name: str):
         if 0 <= idx < len(self._items):

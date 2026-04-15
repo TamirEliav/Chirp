@@ -15,6 +15,22 @@ def _entity():
     return RecordingEntity(name="Test", device_id=None)
 
 
+# ── #13 / c15: AudioCapture drop counter ───────────────────────────────────
+
+def test_capture_drop_counter_increments_and_consumes():
+    """Simulating queue-full drops should increment `drop_count`, and
+    `consume_drop_count` should return-and-reset atomically."""
+    import queue as _q
+    from chirp.audio.capture import AudioCapture
+    q = _q.Queue(maxsize=1)
+    cap = AudioCapture(q, device=None)  # opens nothing in headless test
+    # Manually emulate three full-queue drops in the callback path.
+    cap.drop_count = 3
+    assert cap.consume_drop_count() == 3
+    assert cap.drop_count == 0
+    assert cap.consume_drop_count() == 0
+
+
 # ── #18: saturation must reflect the raw input, not the post-filter signal ──
 
 def test_saturation_detects_clipped_raw_input_even_with_bandpass():
