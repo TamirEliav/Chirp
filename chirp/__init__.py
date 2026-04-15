@@ -96,73 +96,16 @@ class AudioCapture:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SpectrogramAccumulator
+# DSP primitives (SpectrogramAccumulator, BandpassFilter, spectral entropy)
+# were hoisted into `chirp.dsp` in the Phase 1 refactor (plan: c03). They are
+# re-exported here so existing imports (`chirp.SpectrogramAccumulator`, etc.)
+# and the inline call sites in RecordingEntity keep working unchanged.
 # ──────────────────────────────────────────────────────────────────────────────
-class SpectrogramAccumulator:
-    WINDOW_TYPES = ('hann', 'hamming', 'blackman', 'bartlett', 'flattop')
-    FFT_SIZES    = (256, 512, 1024, 2048, 4096)
-
-    def __init__(self, nperseg=SPECTROGRAM_NPERSEG, window='hann'):
-        self._n       = nperseg
-        self._overlap = np.zeros(self._n, dtype=np.float32)
-        self._window  = scipy.signal.windows.get_window(window, self._n).astype(np.float32)
-
-    def compute_column(self, chunk: np.ndarray):
-        """Return (dB_column, linear_magnitude).
-
-        *dB_column* is the log-magnitude spectrogram column (float32).
-        *linear_magnitude* is the raw |FFT| before dB conversion (float32),
-        useful for computing spectral entropy.
-        """
-        combined    = np.concatenate([self._overlap, chunk])
-        window_data = combined[-self._n:]
-        self._overlap = window_data.copy()
-        fft_mag = np.abs(np.fft.rfft(window_data * self._window))
-        db_col  = (20.0 * np.log10(fft_mag + 1e-10)).astype(np.float32)
-        return db_col, fft_mag
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# BandpassFilter
-# ──────────────────────────────────────────────────────────────────────────────
-class BandpassFilter:
-    def __init__(self, sample_rate=SAMPLE_RATE):
-        self._sos    = None
-        self._zi     = None
-        self._params = (None, None)
-        self._sample_rate = sample_rate
-
-    def _redesign(self, low_hz: float, high_hz: float) -> bool:
-        nyq = self._sample_rate * 0.5
-        lo  = max(1.0, low_hz)
-        hi  = min(nyq - 1.0, high_hz)
-        if lo >= hi:
-            self._sos = self._zi = None
-            self._params = (low_hz, high_hz)
-            return False
-        self._sos    = scipy.signal.butter(4, [lo / nyq, hi / nyq],
-                                           btype='band', output='sos')
-        self._zi     = scipy.signal.sosfilt_zi(self._sos)
-        self._params = (low_hz, high_hz)
-        return True
-
-    def get_peak(self, chunk: np.ndarray, low_hz: float, high_hz: float) -> float:
-        _, peak = self.filter_chunk(chunk, low_hz, high_hz)
-        return peak
-
-    def filter_chunk(self, chunk: np.ndarray, low_hz: float, high_hz: float):
-        """Return (filtered_signal, peak). If filter invalid, returns (chunk, peak)."""
-        if (low_hz, high_hz) != self._params:
-            if not self._redesign(low_hz, high_hz):
-                return chunk, float(np.max(np.abs(chunk)))
-        if self._sos is None:
-            return chunk, float(np.max(np.abs(chunk)))
-        filtered, self._zi = scipy.signal.sosfilt(self._sos, chunk, zi=self._zi)
-        return filtered, float(np.max(np.abs(filtered)))
-
-    def reset(self):
-        if self._sos is not None:
-            self._zi = scipy.signal.sosfilt_zi(self._sos)
+from chirp.dsp import (  # noqa: E402
+    BandpassFilter,
+    SpectrogramAccumulator,
+    normalized_spectral_entropy as _spectral_entropy,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -670,19 +613,11 @@ class RecordingEntity:
         self.saturated = trigger_peak >= 0.99
 
         # ── Spectral entropy computation ──────────────────────────────
-        def _entropy(mag):
-            s = mag.sum()
-            if s < 1e-30:
-                return 1.0
-            p = mag / s
-            p = p[p > 0]
-            n = len(mag)
-            h = -float(np.sum(p * np.log2(p)))
-            return h / np.log2(n) if n > 1 else 0.0
-
-        entropy_l = _entropy(lin_mag)
+        # The normalized Shannon entropy helper lives in chirp.dsp.entropy
+        # and is re-exported at module level as `_spectral_entropy`.
+        entropy_l = _spectral_entropy(lin_mag)
         if mode == 'Stereo':
-            entropy_r = _entropy(lin_mag_r)
+            entropy_r = _spectral_entropy(lin_mag_r)
             self.spectral_entropy_r = entropy_r
             # Combine entropy per trigger_mode (same logic as amplitude)
             tm = self.trigger_mode
