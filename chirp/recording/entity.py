@@ -349,6 +349,16 @@ class RecordingEntity:
             db_col_r, lin_mag_r = self.spec_acc_r.compute_column(right)
             self.spec_buffer_r[:, self.col_head] = db_col_r
 
+        # Saturation must be measured on the *raw* (pre-filter) signal:
+        # the bandpass attenuates clipped peaks and would otherwise hide
+        # genuine input clipping (#18, c11).
+        if mode == 'Stereo':
+            raw_peak = max(float(np.max(np.abs(left))),
+                           float(np.max(np.abs(right))))
+        else:
+            raw_peak = float(np.max(np.abs(display)))
+        self.saturated = raw_peak >= 0.99
+
         # Trigger peak + filtered signal for amplitude display
         freq_on = self.freq_filter_enabled
         lo, hi = self.freq_lo, self.freq_hi
@@ -380,9 +390,6 @@ class RecordingEntity:
                 trigger_peak = float(np.max(np.abs(display)))
             amp_l = filt
             amp_r = None
-
-        # Saturation detection (hard clipping in normalized float32)
-        self.saturated = trigger_peak >= 0.99
 
         # ── Spectral entropy computation ──────────────────────────────
         entropy_l = _spectral_entropy(lin_mag)
