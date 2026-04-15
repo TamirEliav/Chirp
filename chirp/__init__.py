@@ -47,52 +47,10 @@ from chirp.constants import *  # noqa: F401,F403
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# AudioCapture
+# AudioCapture moved to chirp.audio.capture in the Phase 1 refactor (plan: c05).
+# Re-exported so `chirp.AudioCapture` keeps resolving for existing callers.
 # ──────────────────────────────────────────────────────────────────────────────
-class AudioCapture:
-    def __init__(self, audio_queue: queue.Queue, device=None, channels=1, samplerate=SAMPLE_RATE):
-        self._queue    = audio_queue
-        self._channels = channels
-        self._stream   = None
-        try:
-            self._stream = sd.InputStream(
-                samplerate=samplerate, channels=channels,
-                dtype=DTYPE, blocksize=CHUNK_FRAMES,
-                device=device,
-                callback=self._callback,
-            )
-        except Exception as exc:
-            print(f"[AudioCapture] Failed to open device {device}: {exc}")
-
-    @property
-    def valid(self):
-        return self._stream is not None
-
-    def _callback(self, indata, frames, time_info, status):
-        try:
-            if self._channels == 1:
-                self._queue.put_nowait(indata[:, 0].copy())
-            else:
-                self._queue.put_nowait(indata[:, :2].copy())
-        except queue.Full:
-            pass
-
-    def resume(self):
-        if self._stream is not None:
-            self._stream.start()
-
-    def pause(self):
-        if self._stream is not None:
-            self._stream.stop()
-
-    def close(self):
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-            except Exception:
-                pass
-            self._stream.close()
-            self._stream = None
+from chirp.audio import AudioCapture  # noqa: E402
 
 
 # ──────────────────────────────────────────────────────────────────────────────
