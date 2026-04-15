@@ -8,5 +8,6 @@ sounddevice.
 """
 
 from chirp.recording.trigger import ThresholdRecorder
+from chirp.recording.entity import RecordingEntity
 
-__all__ = ["ThresholdRecorder"]
+__all__ = ["ThresholdRecorder", "RecordingEntity"]

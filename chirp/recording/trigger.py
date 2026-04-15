@@ -21,13 +21,11 @@ c18 will rewrite this state machine to be sample-accurate.
 
 import collections
 import datetime
-import os
-import threading
 
 import numpy as np
-import scipy.io.wavfile
 
 from chirp.constants import CHUNK_FRAMES, SAMPLE_RATE
+from chirp.recording import writer as _writer
 
 
 class ThresholdRecorder:
@@ -163,32 +161,13 @@ class ThresholdRecorder:
     def _start_flush(buf_snapshot: list, output_dir: str,
                      prefix: str = '', suffix: str = '', sample_rate: int = SAMPLE_RATE,
                      onset_time=None):
-        threading.Thread(
-            target=ThresholdRecorder._write_wav,
-            args=(list(buf_snapshot), output_dir, prefix, suffix, sample_rate, onset_time),
-            daemon=True,
-        ).start()
-
-    @staticmethod
-    def _write_wav(buf_snapshot: list, output_dir: str,
-                   prefix: str = '', suffix: str = '', sample_rate: int = SAMPLE_RATE,
-                   onset_time=None):
-        audio = np.concatenate(buf_snapshot)
-        if audio.ndim == 1:
-            audio = audio.flatten()
-        pcm16 = (audio * 32767.0).clip(-32768, 32767).astype(np.int16)
-        os.makedirs(output_dir, exist_ok=True)
-        n_samples = audio.shape[0]
-        audio_dur = n_samples / sample_rate
-        if onset_time is not None:
-            onset = onset_time
-        else:
-            onset = datetime.datetime.now() - datetime.timedelta(seconds=audio_dur)
-        epoch_ms = int(onset.timestamp() * 1000)
-        local_ts = onset.strftime('%Y%m%d_%H%M%S_%f')[:-3]
-        parts = [p for p in [prefix.rstrip('_'), str(epoch_ms), local_ts, suffix.lstrip('_')] if p]
-        fname = '_'.join(parts) + '.wav'
-        path  = os.path.join(output_dir, fname)
-        scipy.io.wavfile.write(path, sample_rate, pcm16)
-        ch_str = 'stereo' if audio.ndim == 2 else 'mono'
-        print(f'[REC] saved {path}  ({n_samples/sample_rate:.2f} s, {ch_str})')
+        """Legacy daemon-thread launcher — delegates to
+        `chirp.recording.writer.start_flush_thread`. Kept as a
+        staticmethod on the class so the existing test monkeypatch
+        (`monkeypatch.setattr(ThresholdRecorder, "_start_flush", ...)`)
+        continues to take precedence.
+        """
+        _writer.start_flush_thread(
+            buf_snapshot, output_dir, prefix, suffix,
+            sample_rate=sample_rate, onset_time=onset_time,
+        )
