@@ -59,7 +59,18 @@ class ThresholdRecorder:
                       max_rec_sec: float, pre_trig_sec: float,
                       output_dir: str, enabled: bool,
                       filename_prefix: str = '', filename_suffix: str = '',
-                      sample_rate: int = SAMPLE_RATE):
+                      sample_rate: int = SAMPLE_RATE,
+                      should_trigger: bool | None = None):
+        """Drive the state machine with one audio chunk.
+
+        `should_trigger` (c12 / #16): if not None, the caller has already
+        decided whether this chunk is "above threshold" — typically by
+        AND/OR-ing the amplitude compare with a spectral-entropy gate
+        upstream. The state machine uses that boolean instead of the
+        legacy `trigger_peak >= threshold` compare. `trigger_peak` and
+        `threshold` are still consumed for backward compatibility (and
+        as the default when `should_trigger is None`).
+        """
 
         # ── Resize pre-trigger rolling buffer ─────────────────────────────
         needed = max(1, int((pre_trig_sec + min_cross_sec) * sample_rate / CHUNK_FRAMES) + 1)
@@ -90,7 +101,10 @@ class ThresholdRecorder:
         post_trig_chunks = max(0, int(post_trig_sec * sample_rate / CHUNK_FRAMES))
         max_chunks       = max(1, int(max_rec_sec * sample_rate / CHUNK_FRAMES))
 
-        above = trigger_peak >= threshold
+        if should_trigger is None:
+            above = trigger_peak >= threshold
+        else:
+            above = bool(should_trigger)
         if above:
             self._above_streak += len(chunk)
         else:

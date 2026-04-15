@@ -60,6 +60,46 @@ def _loud(level: float = 0.5):
     return np.full(CHUNK_FRAMES, level, dtype=np.float32)
 
 
+# ── #16 / c12: should_trigger override ──────────────────────────────────────
+
+def test_should_trigger_true_overrides_subthreshold_peak(captured_flushes):
+    """A quiet chunk with `should_trigger=True` should still fire."""
+    rec = ThresholdRecorder()
+    p = dict(
+        threshold=0.5, min_cross_sec=0.0, hold_sec=0.0,
+        post_trig_sec=0.0, max_rec_sec=10.0, pre_trig_sec=0.0,
+        output_dir="/tmp/x", enabled=True,
+        filename_prefix="", filename_suffix="", sample_rate=44100,
+    )
+    # Loud burst (above amplitude threshold) but caller forces False.
+    rec.process_chunk(np.full(1024, 0.9, dtype=np.float32),
+                      trigger_peak=0.9, should_trigger=False, **p)
+    assert captured_flushes == []
+    # Quiet burst with should_trigger=True → opens an event.
+    rec.process_chunk(np.zeros(1024, dtype=np.float32),
+                      trigger_peak=0.0, should_trigger=True, **p)
+    # Sub-threshold to end it
+    rec.process_chunk(np.zeros(1024, dtype=np.float32),
+                      trigger_peak=0.0, should_trigger=False, **p)
+    assert len(captured_flushes) == 1
+
+
+def test_should_trigger_none_falls_back_to_peak_compare(captured_flushes):
+    """When `should_trigger` is omitted the legacy compare path is used."""
+    rec = ThresholdRecorder()
+    p = dict(
+        threshold=0.5, min_cross_sec=0.0, hold_sec=0.0,
+        post_trig_sec=0.0, max_rec_sec=10.0, pre_trig_sec=0.0,
+        output_dir="/tmp/x", enabled=True,
+        filename_prefix="", filename_suffix="", sample_rate=44100,
+    )
+    rec.process_chunk(np.zeros(1024, dtype=np.float32),
+                      trigger_peak=0.9, **p)
+    rec.process_chunk(np.zeros(1024, dtype=np.float32),
+                      trigger_peak=0.0, **p)
+    assert len(captured_flushes) == 1
+
+
 def _params(**overrides):
     p = dict(
         threshold=0.1,

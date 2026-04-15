@@ -412,30 +412,34 @@ class RecordingEntity:
         self.spectral_entropy = entropy
         self.entropy_buffer[self.col_head] = entropy
 
-        # ── Apply spectral trigger mode ───────────────────────────────
-        # #14: suppress spectral triggering while the FFT accumulator is
-        # still warming up — during the first `nperseg` samples after a
-        # reset the overlap buffer is zero-padded and the entropy value
-        # is meaningless.
+        # ── Compute should_trigger (c12 / #16) ────────────────────────
+        # The state machine no longer infers triggering from
+        # `trigger_peak`. We compute the boolean here and pass it
+        # explicitly so the spectral path doesn't have to forge fake
+        # amplitude peaks. `trigger_peak` keeps its true post-filter
+        # value and remains useful for the saturation indicator + UI.
+        amp_above = (trigger_peak >= self.threshold)
         stm = self.spectral_trigger_mode
+        # #14: spectral entropy is meaningless during FFT warm-up.
         spec_primed = self.spec_acc.primed and (
             mode != 'Stereo' or self.spec_acc_r.primed)
-        if stm != 'Amplitude Only' and not spec_primed:
-            # Warm-up: spectral value is meaningless. Suppress spectral
-            # gating entirely. In Spectral-Only / AND modes this also
-            # forces trigger_peak below threshold so nothing fires.
+        if stm == 'Amplitude Only':
+            should_trigger = amp_above
+        elif not spec_primed:
+            # Warm-up: drop spectral contribution. AND/Only suppress;
+            # OR falls back to amplitude alone.
             if stm in ('Spectral Only', 'Amp AND Spectral'):
-                trigger_peak = 0.0
-        elif stm != 'Amplitude Only':
+                should_trigger = False
+            else:  # 'Amp OR Spectral'
+                should_trigger = amp_above
+        else:
             spec_triggered = (entropy < self.spectral_threshold)
             if stm == 'Spectral Only':
-                trigger_peak = self.threshold if spec_triggered else 0.0
+                should_trigger = spec_triggered
             elif stm == 'Amp AND Spectral':
-                if not spec_triggered:
-                    trigger_peak = 0.0
-            elif stm == 'Amp OR Spectral':
-                if spec_triggered and trigger_peak < self.threshold:
-                    trigger_peak = self.threshold
+                should_trigger = amp_above and spec_triggered
+            else:  # 'Amp OR Spectral'
+                should_trigger = amp_above or spec_triggered
 
         # Write amplitude buffers (filtered when band filter active)
         if mode == 'Stereo':
@@ -493,6 +497,7 @@ class RecordingEntity:
             filename_prefix = self.filename_prefix,
             filename_suffix = self.filename_suffix,
             sample_rate   = self.sample_rate,
+            should_trigger = should_trigger,
         )
 
     # ── Mini amplitude for sidebar ────────────────────────────────────────
