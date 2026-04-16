@@ -350,3 +350,86 @@ def test_filename_stream_kwarg_forwarded(captured_flushes):
                       filename_stream='Mic_A', **p)
     assert len(captured_flushes) == 1
     assert captured_flushes[0]["filename_stream"] == 'Mic_A'
+
+
+# ── #15 / c18: sample-accurate trigger evaluation ────────────────────────────
+
+def test_sample_accurate_min_cross_5ms_burst(captured_flushes):
+    """A 5 ms tone burst with min_cross_sec=0.003 should trigger.
+
+    Regression gate from the plan: feed a 5 ms tone burst, verify
+    `min_cross_sec=0.003` triggers correctly. Pre-c18 this would fail
+    because min_cross was chunk-quantized to ~23 ms at 44.1 kHz.
+    """
+    sr = 44100
+    rec = ThresholdRecorder()
+    p = dict(
+        threshold=0.1, min_cross_sec=0.003, hold_sec=0.0,
+        post_trig_sec=0.0, max_rec_sec=10.0, pre_trig_sec=0.0,
+        output_dir="/tmp/x", enabled=True,
+        filename_prefix="", filename_suffix="", sample_rate=sr,
+    )
+    burst_samps = int(0.005 * sr)  # ~221 samples
+    chunk = np.zeros(1024, dtype=np.float32)
+    chunk[100:100 + burst_samps] = 0.5  # 5 ms tone embedded in a 1024-frame chunk
+    mask = np.abs(chunk) >= 0.1
+    rec.process_chunk(chunk, trigger_peak=0.5, trigger_mask=mask, **p)
+    # The next chunk is silent → ends the event and flushes.
+    silent = np.zeros(1024, dtype=np.float32)
+    rec.process_chunk(silent, trigger_peak=0.0,
+                      trigger_mask=np.zeros(1024, dtype=bool), **p)
+    assert len(captured_flushes) == 1, (
+        "5 ms burst should trigger with min_cross_sec=0.003")
+    audio = captured_flushes[0]["audio"]
+    # Trim should land exactly on the last above-threshold sample
+    # (last_above_kept + 1 from event start). Since the burst is
+    # 221 samples starting at offset 100 with no pre-trig, the kept
+    # audio length is exactly burst_samps.
+    assert audio.shape[0] == burst_samps, (
+        f"Expected {burst_samps} samples sample-accurate, got {audio.shape[0]}")
+
+
+def test_sample_accurate_min_cross_too_short_does_not_trigger(captured_flushes):
+    """A 2 ms burst with min_cross_sec=0.003 must NOT trigger."""
+    sr = 44100
+    rec = ThresholdRecorder()
+    p = dict(
+        threshold=0.1, min_cross_sec=0.003, hold_sec=0.0,
+        post_trig_sec=0.0, max_rec_sec=10.0, pre_trig_sec=0.0,
+        output_dir="/tmp/x", enabled=True,
+        filename_prefix="", filename_suffix="", sample_rate=sr,
+    )
+    short = int(0.002 * sr)  # ~88 samples, below the 132-sample threshold
+    chunk = np.zeros(1024, dtype=np.float32)
+    chunk[100:100 + short] = 0.5
+    mask = np.abs(chunk) >= 0.1
+    rec.process_chunk(chunk, trigger_peak=0.5, trigger_mask=mask, **p)
+    rec.process_chunk(np.zeros(1024, dtype=np.float32),
+                      trigger_peak=0.0,
+                      trigger_mask=np.zeros(1024, dtype=bool), **p)
+    assert captured_flushes == []
+
+
+def test_sample_accurate_post_trig_tail_samples(captured_flushes):
+    """post_trig should be sample-accurate, not chunk-quantized."""
+    sr = 44100
+    rec = ThresholdRecorder()
+    post_samps = 500  # arbitrary non-chunk-aligned tail
+    p = dict(
+        threshold=0.1, min_cross_sec=0.0, hold_sec=0.0,
+        post_trig_sec=post_samps / sr, max_rec_sec=10.0, pre_trig_sec=0.0,
+        output_dir="/tmp/x", enabled=True,
+        filename_prefix="", filename_suffix="", sample_rate=sr,
+    )
+    burst = 200
+    chunk = np.zeros(1024, dtype=np.float32)
+    chunk[0:burst] = 0.5
+    mask = np.abs(chunk) >= 0.1
+    rec.process_chunk(chunk, trigger_peak=0.5, trigger_mask=mask, **p)
+    # Need another chunk to drain the post-trig tail.
+    rec.process_chunk(np.zeros(1024, dtype=np.float32),
+                      trigger_peak=0.0,
+                      trigger_mask=np.zeros(1024, dtype=bool), **p)
+    assert len(captured_flushes) == 1
+    # Kept = burst (last_above_kept=burst-1, +1) + post_samps
+    assert captured_flushes[0]["audio"].shape[0] == burst + post_samps
