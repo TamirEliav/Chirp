@@ -30,7 +30,7 @@ import sounddevice as sd
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QGridLayout, QGroupBox, QPushButton, QSlider, QLabel, QLineEdit,
+    QGridLayout, QGroupBox, QPushButton, QLabel, QLineEdit,
     QFileDialog, QFrame, QSizePolicy, QDoubleSpinBox, QComboBox, QCheckBox,
     QScrollArea, QStackedLayout, QDialog, QCalendarWidget, QMessageBox, QSpinBox,
 )
@@ -60,10 +60,6 @@ from chirp.ui.sidebar import (
 # ChirpWindow
 # ──────────────────────────────────────────────────────────────────────────────
 class ChirpWindow(QMainWindow):
-
-    _THR_SCALE  = 1000
-    _TIME_SCALE = 100
-    _DB_SCALE   = 10
 
     def __init__(self):
         super().__init__()
@@ -584,17 +580,14 @@ class ChirpWindow(QMainWindow):
         lbl_h = QLabel('Height:')
         lbl_h.setStyleSheet(f'color: {C["subtext"]}; font-size: 9pt;')
         h.addWidget(lbl_h)
-        self._vm_height_sl = QSlider(Qt.Horizontal)
-        self._vm_height_sl.setToolTip('Row height for each recording tile in View mode')
-        self._vm_height_sl.setRange(120, 700)
-        self._vm_height_sl.setValue(self._vm_panel_height)
-        self._vm_height_sl.setFixedWidth(180)
-        self._vm_height_sl.valueChanged.connect(self._on_vm_height_changed)
-        h.addWidget(self._vm_height_sl)
-        self._vm_height_lbl = QLabel(f'{self._vm_panel_height}px')
-        self._vm_height_lbl.setFixedWidth(45)
-        self._vm_height_lbl.setStyleSheet(f'color: {C["subtext"]}; font-size: 9pt;')
-        h.addWidget(self._vm_height_lbl)
+        self._vm_height_spin = QSpinBox()
+        self._vm_height_spin.setToolTip('Row height for each recording tile in View mode')
+        self._vm_height_spin.setRange(120, 700)
+        self._vm_height_spin.setValue(self._vm_panel_height)
+        self._vm_height_spin.setSuffix(' px')
+        self._vm_height_spin.setFixedWidth(90)
+        self._vm_height_spin.valueChanged.connect(self._on_vm_height_changed)
+        h.addWidget(self._vm_height_spin)
 
         return w
 
@@ -708,45 +701,33 @@ class ChirpWindow(QMainWindow):
         self._sb_thr.setValue(DEFAULT_THRESHOLD)
         self._sb_thr.hide()
 
-        _TRIG_SCALE = 10  # slider integer ticks per second
-
         trig_box = QGroupBox('TRIGGER')
         trig_g   = QGridLayout(trig_box)
         trig_g.setVerticalSpacing(8)
         trig_g.setHorizontalSpacing(10)
         trig_g.setColumnStretch(1, 3)
 
-        self._sl_mc, self._sb_mc = self._param_row(trig_g, 0, 0, 'Min Cross',
-            sl_min=0, sl_max=600, sl_init=int(DEFAULT_MIN_CROSS * _TRIG_SCALE),
+        self._sb_mc = self._param_row(trig_g, 0, 0, 'Min Cross',
+            sb_min=0.0, sb_max=60.0, sb_step=0.001, sb_dec=3, suffix=' s',
+            sb_init=DEFAULT_MIN_CROSS)
+        self._sb_hold = self._param_row(trig_g, 1, 0, 'Hold',
             sb_min=0.0, sb_max=60.0, sb_step=0.1, sb_dec=2, suffix=' s',
-            scale=_TRIG_SCALE)
-        self._sl_hold, self._sb_hold = self._param_row(trig_g, 1, 0, 'Hold',
-            sl_min=0, sl_max=600, sl_init=int(DEFAULT_HOLD * _TRIG_SCALE),
+            sb_init=DEFAULT_HOLD)
+        self._sb_pre = self._param_row(trig_g, 2, 0, 'Pre-Trigger',
             sb_min=0.0, sb_max=60.0, sb_step=0.1, sb_dec=2, suffix=' s',
-            scale=_TRIG_SCALE)
-        self._sl_post_trig, self._sb_post_trig = self._param_row(trig_g, 2, 0, 'Post-Trigger',
-            sl_min=0, sl_max=600, sl_init=int(DEFAULT_POST_TRIG * _TRIG_SCALE),
+            sb_init=DEFAULT_PRE_TRIG)
+        self._sb_post_trig = self._param_row(trig_g, 3, 0, 'Post-Trigger',
             sb_min=0.0, sb_max=60.0, sb_step=0.1, sb_dec=2, suffix=' s',
-            scale=_TRIG_SCALE)
-        self._sl_maxr, self._sb_maxr = self._param_row(trig_g, 3, 0, 'Max Rec',
-            sl_min=10, sl_max=36000, sl_init=int(DEFAULT_MAX_REC * _TRIG_SCALE),
+            sb_init=DEFAULT_POST_TRIG)
+        self._sb_maxr = self._param_row(trig_g, 4, 0, 'Max Rec',
             sb_min=1.0, sb_max=3600.0, sb_step=1.0, sb_dec=1, suffix=' s',
-            scale=_TRIG_SCALE)
-        self._sl_pre, self._sb_pre = self._param_row(trig_g, 4, 0, 'Pre-Trigger',
-            sl_min=0, sl_max=600, sl_init=int(DEFAULT_PRE_TRIG * _TRIG_SCALE),
-            sb_min=0.0, sb_max=60.0, sb_step=0.1, sb_dec=2, suffix=' s',
-            scale=_TRIG_SCALE)
+            sb_init=DEFAULT_MAX_REC)
 
-        for _tw in (self._sl_mc, self._sb_mc):
-            _tw.setToolTip('Min Cross: minimum time the signal must stay above the threshold to start a recording')
-        for _tw in (self._sl_hold, self._sb_hold):
-            _tw.setToolTip('Hold: duration of silence after the signal drops before a recording is considered finished')
-        for _tw in (self._sl_post_trig, self._sb_post_trig):
-            _tw.setToolTip('Post-Trigger: audio kept after the last above-threshold sample (tail of the saved WAV)')
-        for _tw in (self._sl_maxr, self._sb_maxr):
-            _tw.setToolTip('Max Rec: maximum length of a single WAV segment — longer events are split')
-        for _tw in (self._sl_pre, self._sb_pre):
-            _tw.setToolTip('Pre-Trigger: audio kept before the trigger point (lookback saved to the WAV)')
+        self._sb_mc.setToolTip('Min Cross: minimum time the signal must stay above the threshold to start a recording')
+        self._sb_hold.setToolTip('Hold: duration of silence after the signal drops before a recording is considered finished')
+        self._sb_pre.setToolTip('Pre-Trigger: audio kept before the trigger point (lookback saved to the WAV)')
+        self._sb_post_trig.setToolTip('Post-Trigger: audio kept after the last above-threshold sample (tail of the saved WAV)')
+        self._sb_maxr.setToolTip('Max Rec: maximum length of a single WAV segment — longer events are split')
 
         # Band filter row (row 5)
         self._chk_freq = QCheckBox('Band filter')
@@ -817,15 +798,11 @@ class ChirpWindow(QMainWindow):
         trig_g.addLayout(detect_row, 6, 0, 1, 3)
 
         # Entropy threshold row (row 7)
-        _ENTROPY_SCALE = 100  # slider integer ticks per unit
-        self._sl_entropy_thr, self._sb_entropy_thr = self._param_row(trig_g, 7, 0, 'Entropy Thr',
-            sl_min=0, sl_max=100, sl_init=50,
+        self._sb_entropy_thr = self._param_row(trig_g, 7, 0, 'Entropy Thr',
             sb_min=0.0, sb_max=1.0, sb_step=0.01, sb_dec=2, suffix='',
-            scale=_ENTROPY_SCALE)
-        self._sl_entropy_thr.setEnabled(False)
+            sb_init=0.50)
         self._sb_entropy_thr.setEnabled(False)
-        for _tw in (self._sl_entropy_thr, self._sb_entropy_thr):
-            _tw.setToolTip('Spectral entropy threshold — triggers when entropy falls below this value (0 = pure tone, 1 = white noise)')
+        self._sb_entropy_thr.setToolTip('Spectral entropy threshold — triggers when entropy falls below this value (0 = pure tone, 1 = white noise)')
 
         self._combo_detect_mode.currentTextChanged.connect(self._on_detect_mode_changed)
 
@@ -918,27 +895,21 @@ class ChirpWindow(QMainWindow):
         self._buf_combo.setFixedWidth(90)
         self._buf_combo.setToolTip('Length of visible history (seconds) in the live display')
 
-        self._sl_gain, self._sb_gain = self._param_row(grid, 0, 0, 'Gain',
-            sl_min=-200, sl_max=600, sl_init=0,
+        self._sb_gain = self._param_row(grid, 0, 0, 'Gain',
             sb_min=-20.0, sb_max=60.0, sb_step=1.0, sb_dec=1, suffix=' dB',
-            scale=self._DB_SCALE)
+            sb_init=0.0)
 
-        self._sl_floor, self._sb_floor = self._param_row(grid, 1, 0, 'dB Floor',
-            sl_min=-1200, sl_max=0, sl_init=int(SPEC_DB_MIN * self._DB_SCALE),
+        self._sb_floor = self._param_row(grid, 1, 0, 'dB Floor',
             sb_min=-120.0, sb_max=0.0, sb_step=1.0, sb_dec=1, suffix=' dB',
-            scale=self._DB_SCALE)
+            sb_init=SPEC_DB_MIN)
 
-        self._sl_ceil, self._sb_ceil = self._param_row(grid, 2, 0, 'dB Ceil',
-            sl_min=-1200, sl_max=0, sl_init=int(SPEC_DB_MAX * self._DB_SCALE),
+        self._sb_ceil = self._param_row(grid, 2, 0, 'dB Ceil',
             sb_min=-120.0, sb_max=0.0, sb_step=1.0, sb_dec=1, suffix=' dB',
-            scale=self._DB_SCALE)
+            sb_init=SPEC_DB_MAX)
 
-        for _tw in (self._sl_gain, self._sb_gain):
-            _tw.setToolTip('Gain applied to the spectrogram (dB) — brightens or darkens the image')
-        for _tw in (self._sl_floor, self._sb_floor):
-            _tw.setToolTip('Minimum dB value shown in the spectrogram colormap')
-        for _tw in (self._sl_ceil, self._sb_ceil):
-            _tw.setToolTip('Maximum dB value shown in the spectrogram colormap')
+        self._sb_gain.setToolTip('Gain applied to the spectrogram (dB) — brightens or darkens the image')
+        self._sb_floor.setToolTip('Minimum dB value shown in the spectrogram colormap')
+        self._sb_ceil.setToolTip('Maximum dB value shown in the spectrogram colormap')
 
         lbl_fft = QLabel('FFT')
         lbl_fft.setObjectName('param_label')
@@ -1025,44 +996,24 @@ class ChirpWindow(QMainWindow):
         return w
 
     def _param_row(self, grid, row, col, label,
-                   sl_min, sl_max, sl_init,
                    sb_min, sb_max, sb_step, sb_dec, suffix,
-                   scale) -> tuple:
+                   sb_init) -> QDoubleSpinBox:
         lbl = QLabel(label)
         lbl.setObjectName('param_label')
         lbl.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
-
-        sl = QSlider(Qt.Horizontal)
-        sl.setRange(sl_min, sl_max)
-        sl.setValue(sl_init)
 
         sb = QDoubleSpinBox()
         sb.setRange(sb_min, sb_max)
         sb.setSingleStep(sb_step)
         sb.setDecimals(sb_dec)
-        sb.setValue(sl_init / scale)
+        sb.setValue(sb_init)
         sb.setSuffix(suffix)
         sb.setFixedWidth(100)
         sb.setAlignment(Qt.AlignRight)
 
-        def _on_sl(v, _sb=sb, _sc=scale):
-            _sb.blockSignals(True)
-            _sb.setValue(v / _sc)
-            _sb.blockSignals(False)
-
-        def _on_sb(v, _sl=sl, _sc=scale):
-            iv = max(_sl.minimum(), min(_sl.maximum(), int(round(v * _sc))))
-            _sl.blockSignals(True)
-            _sl.setValue(iv)
-            _sl.blockSignals(False)
-
-        sl.valueChanged.connect(_on_sl)
-        sb.valueChanged.connect(_on_sb)
-
         grid.addWidget(lbl, row, col)
-        grid.addWidget(sl,  row, col + 1)
-        grid.addWidget(sb,  row, col + 2)
-        return sl, sb
+        grid.addWidget(sb,  row, col + 1)
+        return sb
 
     # ── Settings ──────────────────────────────────────────────────────────
 
@@ -1243,26 +1194,17 @@ class ChirpWindow(QMainWindow):
         self._sb_freq_hi.valueChanged  .connect(self._on_freq_filter_param)
 
         # Trigger params write-through
-        self._sl_mc  .valueChanged.connect(lambda _: self._write_trigger_params())
         self._sb_mc  .valueChanged.connect(lambda _: self._write_trigger_params())
-        self._sl_hold     .valueChanged.connect(lambda _: self._write_trigger_params())
         self._sb_hold     .valueChanged.connect(lambda _: self._write_trigger_params())
-        self._sl_post_trig.valueChanged.connect(lambda _: self._write_trigger_params())
-        self._sb_post_trig.valueChanged.connect(lambda _: self._write_trigger_params())
-        self._sl_maxr.valueChanged.connect(lambda _: self._write_trigger_params())
-        self._sb_maxr.valueChanged.connect(lambda _: self._write_trigger_params())
-        self._sl_pre .valueChanged.connect(lambda _: self._write_trigger_params())
         self._sb_pre .valueChanged.connect(lambda _: self._write_trigger_params())
+        self._sb_post_trig.valueChanged.connect(lambda _: self._write_trigger_params())
+        self._sb_maxr.valueChanged.connect(lambda _: self._write_trigger_params())
         self._combo_detect_mode.currentTextChanged.connect(lambda _: self._write_trigger_params())
-        self._sl_entropy_thr.valueChanged.connect(lambda _: self._write_trigger_params())
         self._sb_entropy_thr.valueChanged.connect(lambda _: self._write_trigger_params())
 
         # Spectrogram display write-through
-        self._sl_gain .valueChanged.connect(lambda _: self._write_spec_params())
         self._sb_gain .valueChanged.connect(lambda _: self._write_spec_params())
-        self._sl_floor.valueChanged.connect(lambda _: self._write_spec_params())
         self._sb_floor.valueChanged.connect(lambda _: self._write_spec_params())
-        self._sl_ceil .valueChanged.connect(lambda _: self._write_spec_params())
         self._sb_ceil .valueChanged.connect(lambda _: self._write_spec_params())
         self._combo_fft   .currentIndexChanged.connect(self._on_fft_params_changed)
         self._combo_win   .currentIndexChanged.connect(self._on_fft_params_changed)
@@ -1299,9 +1241,9 @@ class ChirpWindow(QMainWindow):
             return
         e.min_cross_sec = self._sb_mc.value()
         e.hold_sec      = self._sb_hold.value()
+        e.pre_trig_sec  = self._sb_pre.value()
         e.post_trig_sec = self._sb_post_trig.value()
         e.max_rec_sec   = self._sb_maxr.value()
-        e.pre_trig_sec  = self._sb_pre.value()
         e.spectral_trigger_mode = self._combo_detect_mode.currentText()
         e.spectral_threshold    = self._sb_entropy_thr.value()
         # #10 / c24: propagate to all when sync is on.
@@ -1371,9 +1313,9 @@ class ChirpWindow(QMainWindow):
         e.threshold     = self._sb_thr.value()
         e.min_cross_sec = self._sb_mc.value()
         e.hold_sec      = self._sb_hold.value()
+        e.pre_trig_sec  = self._sb_pre.value()
         e.post_trig_sec = self._sb_post_trig.value()
         e.max_rec_sec   = self._sb_maxr.value()
-        e.pre_trig_sec  = self._sb_pre.value()
         e.freq_filter_enabled = self._chk_freq.isChecked()
         e.freq_lo       = self._sb_freq_lo.value()
         e.freq_hi       = self._sb_freq_hi.value()
@@ -1410,18 +1352,12 @@ class ChirpWindow(QMainWindow):
             widget.setValue(val)
             widget.blockSignals(False)
 
-        _TRIG_SCALE = 10
         _set(self._sb_thr,  e.threshold)
         _set(self._sb_mc,   e.min_cross_sec)
-        _set(self._sl_mc,   int(round(e.min_cross_sec * _TRIG_SCALE)))
         _set(self._sb_hold,      e.hold_sec)
-        _set(self._sl_hold,      int(round(e.hold_sec * _TRIG_SCALE)))
-        _set(self._sb_post_trig, e.post_trig_sec)
-        _set(self._sl_post_trig, int(round(e.post_trig_sec * _TRIG_SCALE)))
-        _set(self._sb_maxr, e.max_rec_sec)
-        _set(self._sl_maxr, int(round(e.max_rec_sec * _TRIG_SCALE)))
         _set(self._sb_pre,  e.pre_trig_sec)
-        _set(self._sl_pre,  int(round(e.pre_trig_sec * _TRIG_SCALE)))
+        _set(self._sb_post_trig, e.post_trig_sec)
+        _set(self._sb_maxr, e.max_rec_sec)
 
         self._chk_freq.blockSignals(True)
         self._chk_freq.setChecked(e.freq_filter_enabled)
@@ -1432,11 +1368,8 @@ class ChirpWindow(QMainWindow):
         _set(self._sb_freq_hi, e.freq_hi)
 
         _set(self._sb_gain,  e.gain_db)
-        _set(self._sl_gain,  int(round(e.gain_db * self._DB_SCALE)))
         _set(self._sb_floor, e.db_floor)
-        _set(self._sl_floor, int(round(e.db_floor * self._DB_SCALE)))
         _set(self._sb_ceil,  e.db_ceil)
-        _set(self._sl_ceil,  int(round(e.db_ceil * self._DB_SCALE)))
 
         self._combo_fft.blockSignals(True)
         self._combo_fft.setCurrentText(str(e.spec_nperseg))
@@ -1500,11 +1433,8 @@ class ChirpWindow(QMainWindow):
         self._combo_detect_mode.blockSignals(True)
         self._combo_detect_mode.setCurrentText(e.spectral_trigger_mode)
         self._combo_detect_mode.blockSignals(False)
-        _ENTROPY_SCALE = 100
         _set(self._sb_entropy_thr, e.spectral_threshold)
-        _set(self._sl_entropy_thr, int(round(e.spectral_threshold * _ENTROPY_SCALE)))
         ent_on = (e.spectral_trigger_mode != 'Amplitude Only')
-        self._sl_entropy_thr.setEnabled(ent_on)
         self._sb_entropy_thr.setEnabled(ent_on)
 
         # Sample rate combo
@@ -1769,10 +1699,9 @@ class ChirpWindow(QMainWindow):
         self._vm_cols_spin.blockSignals(True)
         self._vm_cols_spin.setValue(self._vm_n_cols)
         self._vm_cols_spin.blockSignals(False)
-        self._vm_height_sl.blockSignals(True)
-        self._vm_height_sl.setValue(self._vm_panel_height)
-        self._vm_height_sl.blockSignals(False)
-        self._vm_height_lbl.setText(f'{self._vm_panel_height}px')
+        self._vm_height_spin.blockSignals(True)
+        self._vm_height_spin.setValue(self._vm_panel_height)
+        self._vm_height_spin.blockSignals(False)
 
         # Create entities from saved data
         warnings = []
@@ -2191,7 +2120,6 @@ class ChirpWindow(QMainWindow):
         self._mark_dirty()
 
     def _on_detect_mode_changed(self, mode: str):
-        self._sl_entropy_thr.setEnabled(mode != 'Amplitude Only')
         self._sb_entropy_thr.setEnabled(mode != 'Amplitude Only')
         self._write_trigger_params()
         e = self._sel
@@ -2709,7 +2637,6 @@ class ChirpWindow(QMainWindow):
 
     def _on_vm_height_changed(self, val):
         self._vm_panel_height = val
-        self._vm_height_lbl.setText(f'{val}px')
         if self._view_mode:
             self._setup_view_mode_axes()
 

@@ -88,9 +88,9 @@ class RecordingEntity:
         self.threshold     = DEFAULT_THRESHOLD
         self.min_cross_sec = DEFAULT_MIN_CROSS
         self.hold_sec      = DEFAULT_HOLD
+        self.pre_trig_sec  = DEFAULT_PRE_TRIG
         self.post_trig_sec = DEFAULT_POST_TRIG
         self.max_rec_sec   = DEFAULT_MAX_REC
-        self.pre_trig_sec  = DEFAULT_PRE_TRIG
         self.freq_filter_enabled = False
         self.freq_lo       = DEFAULT_FREQ_LO
         self.freq_hi       = DEFAULT_FREQ_HI

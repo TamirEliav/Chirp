@@ -68,8 +68,7 @@ def write_wav_sync(buf_snapshot: list, output_dir: str,
         onset = datetime.datetime.now() - datetime.timedelta(seconds=audio_dur)
     epoch_ms = int(onset.timestamp() * 1000)
     local_ts = onset.strftime('%Y%m%d_%H%M%S_%f')[:-3]
-    stream_tok = _sanitize_token(filename_stream) if filename_stream else ''
-    parts = [p for p in [prefix.rstrip('_'), stream_tok, str(epoch_ms), local_ts,
+    parts = [p for p in [prefix.rstrip('_'), str(epoch_ms), local_ts,
                          suffix.lstrip('_')] if p]
     fname = '_'.join(parts) + '.wav'
     path  = os.path.join(output_dir, fname)

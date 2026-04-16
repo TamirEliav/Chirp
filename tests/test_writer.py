@@ -19,16 +19,18 @@ def test_sanitize_token_strips_separators():
     assert _sanitize_token("///") == ""
 
 
-def test_filename_includes_stream_token(tmp_path):
+def test_filename_excludes_stream_name(tmp_path):
     onset = datetime.datetime(2024, 1, 2, 3, 4, 5, 678000)
     audio = np.zeros(1024, dtype=np.float32)
     path = write_wav_sync([audio], str(tmp_path),
-                          prefix='', suffix='',
+                          prefix='bird', suffix='',
                           sample_rate=44100,
                           onset_time=onset,
                           filename_stream='Channel 1')
     name = os.path.basename(path)
-    assert "Channel_1" in name
+    # Stream name should NOT appear in the filename
+    assert "Channel" not in name
+    assert name.startswith("bird_")
     assert name.endswith(".wav")
 
 
@@ -42,11 +44,10 @@ def test_writer_pool_drains_pending_writes(tmp_path):
     # Use a fresh pool to avoid interference with module-level state.
     writer.shutdown(timeout=1.0)
     n = 5
-    onset = datetime.datetime(2024, 1, 1, 0, 0, 0)
     for i in range(n):
+        onset = datetime.datetime(2024, 1, 1, 0, 0, i)
         writer.submit([np.zeros(512, dtype=np.float32)], str(tmp_path),
-                      sample_rate=44100, onset_time=onset,
-                      filename_stream=f'stream{i}')
+                      sample_rate=44100, onset_time=onset)
     assert writer.drain(timeout=10.0) is True
     assert writer.pending() == 0
     files = list(tmp_path.glob('*.wav'))

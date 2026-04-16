@@ -29,11 +29,11 @@ N_DISPLAY_ROWS      = 256
 
 # ── Recording defaults ─────────────────────────────────────────────────────────
 DEFAULT_THRESHOLD   = 0.05
-DEFAULT_MIN_CROSS   = 0.10
+DEFAULT_MIN_CROSS   = 0.020
 DEFAULT_HOLD        = 1.00
+DEFAULT_PRE_TRIG    = 0.50
 DEFAULT_POST_TRIG   = 0.50
 DEFAULT_MAX_REC     = 60.0
-DEFAULT_PRE_TRIG    = 1.00
 RECORDINGS_DIR      = './recordings'
 DEFAULT_FREQ_LO     = 1000.0
 DEFAULT_FREQ_HI     = 8000.0
