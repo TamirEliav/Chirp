@@ -40,6 +40,7 @@ from PyQt5.QtGui import QFont, QPainter, QColor, QPainterPath, QPen, QPolygonF
 # Re-exports used throughout the window code. The star-import brings in
 # all the module-level constants and the palette (C, QSS) so the class
 # body below keeps referring to them by bare name.
+from chirp import __version__
 from chirp.constants import *  # noqa: F401,F403
 from chirp.audio import AudioCapture  # noqa: F401
 from chirp.dsp import (  # noqa: F401
