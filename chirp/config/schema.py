@@ -40,7 +40,7 @@ _KNOWN_TOP_KEYS: frozenset[str] = frozenset({
 # Set of keys recognized inside each recording's dict. Mirrors
 # `RecordingEntity.to_dict` exactly.
 _KNOWN_RECORDING_KEYS: frozenset[str] = frozenset({
-    "name", "device_name", "sample_rate", "display_seconds",
+    "name", "device_name", "device_hostapi", "sample_rate", "display_seconds",
     "channel_mode", "trigger_mode",
     "threshold", "min_cross_sec", "hold_sec", "post_trig_sec",
     "max_rec_sec", "pre_trig_sec",

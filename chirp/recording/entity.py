@@ -23,6 +23,7 @@ import numpy as np
 import sounddevice as sd
 
 from chirp.audio import AudioCapture
+from chirp.audio.devices import find_device_by_name, host_api_name
 from chirp.constants import (
     CHUNK_FRAMES,
     DEFAULT_FREQ_HI,
@@ -605,12 +606,16 @@ class RecordingEntity:
     def to_dict(self) -> dict:
         """Serialise user-configurable settings to a plain dict."""
         try:
-            dev_name = sd.query_devices(self.device_id)['name'] if self.device_id is not None else ''
+            dev_info = sd.query_devices(self.device_id) if self.device_id is not None else None
+            dev_name = dev_info['name'] if dev_info else ''
+            dev_hostapi = host_api_name(dev_info) if dev_info else ''
         except Exception:
             dev_name = ''
+            dev_hostapi = ''
         return {
             'name':                self.name,
             'device_name':         dev_name,
+            'device_hostapi':      dev_hostapi,
             'sample_rate':         self.sample_rate,
             'display_seconds':     self.display_seconds,
             'channel_mode':        self.channel_mode,
@@ -650,23 +655,10 @@ class RecordingEntity:
         """Create a RecordingEntity from a settings dict.
         Returns (entity, warning_msg_or_None).
         """
-        # Resolve device by name
-        device_id = None
-        warning = None
+        # Resolve device by name (#21 / c20 — multi-strategy matcher).
         dev_name = d.get('device_name', '')
-        if dev_name:
-            for i, info in enumerate(sd.query_devices()):
-                if info['max_input_channels'] > 0 and info['name'] == dev_name:
-                    device_id = i
-                    break
-            if device_id is None:
-                # Try partial match
-                for i, info in enumerate(sd.query_devices()):
-                    if info['max_input_channels'] > 0 and dev_name.split('[')[0].strip() in info['name']:
-                        device_id = i
-                        break
-            if device_id is None:
-                warning = f"Device '{dev_name}' not found — using default"
+        hostapi_hint = d.get('device_hostapi', '')
+        device_id, warning = find_device_by_name(dev_name, hostapi_hint)
 
         sr = d.get('sample_rate', SAMPLE_RATE)
         ds = d.get('display_seconds', DISPLAY_SECONDS)
