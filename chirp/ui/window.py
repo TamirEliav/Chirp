@@ -871,6 +871,23 @@ class ChirpWindow(QMainWindow):
         calib_row.addStretch()
         trig_g.addLayout(calib_row, 8, 0, 1, 3)
 
+        # #10 / c24: sync + apply-all controls
+        sync_row = QHBoxLayout()
+        sync_row.setSpacing(10)
+        self._chk_shared_trigger = QCheckBox('Sync trigger across all recordings')
+        self._chk_shared_trigger.setToolTip(
+            'When enabled, trigger parameter changes propagate to all recordings')
+        self._btn_apply_all = QPushButton('Apply All Settings \u2192')
+        self._btn_apply_all.setObjectName('btn_small')
+        self._btn_apply_all.setFixedWidth(150)
+        self._btn_apply_all.setToolTip(
+            'Copy ALL settings (trigger + display + output) from the selected '
+            'recording to every other recording (one-shot)')
+        sync_row.addWidget(self._chk_shared_trigger)
+        sync_row.addWidget(self._btn_apply_all)
+        sync_row.addStretch()
+        trig_g.addLayout(sync_row, 9, 0, 1, 3)
+
         outer.addWidget(trig_box)
         return w
 
@@ -1254,6 +1271,10 @@ class ChirpWindow(QMainWindow):
         self._chk_shared_spec.toggled.connect(self._on_shared_spec_toggled)
         self._combo_display_mode.currentTextChanged.connect(self._on_display_mode_changed)
 
+        # #10 / c24: global settings scope
+        self._chk_shared_trigger.toggled.connect(self._on_shared_trigger_toggled)
+        self._btn_apply_all.clicked.connect(self._on_apply_all_settings)
+
         # Matplotlib events
         self._canvas.mpl_connect('button_press_event',   self._on_mpl_press)
         self._canvas.mpl_connect('motion_notify_event',  self._on_mpl_motion)
@@ -1282,6 +1303,17 @@ class ChirpWindow(QMainWindow):
         e.pre_trig_sec  = self._sb_pre.value()
         e.spectral_trigger_mode = self._combo_detect_mode.currentText()
         e.spectral_threshold    = self._sb_entropy_thr.value()
+        # #10 / c24: propagate to all when sync is on.
+        if self._chk_shared_trigger.isChecked():
+            for ent in self._entities:
+                if ent is not e:
+                    ent.min_cross_sec = e.min_cross_sec
+                    ent.hold_sec      = e.hold_sec
+                    ent.post_trig_sec = e.post_trig_sec
+                    ent.max_rec_sec   = e.max_rec_sec
+                    ent.pre_trig_sec  = e.pre_trig_sec
+                    ent.spectral_trigger_mode = e.spectral_trigger_mode
+                    ent.spectral_threshold    = e.spectral_threshold
         self._mark_dirty()
 
     def _write_spec_params(self):
@@ -1307,6 +1339,12 @@ class ChirpWindow(QMainWindow):
             e.freq_filter_enabled = on
             e.bpf.reset()
             e.bpf_r.reset()
+            if self._chk_shared_trigger.isChecked():
+                for ent in self._entities:
+                    if ent is not e:
+                        ent.freq_filter_enabled = on
+                        ent.bpf.reset()
+                        ent.bpf_r.reset()
             self._mark_dirty()
 
     def _on_freq_filter_param(self, _val):
@@ -1314,6 +1352,11 @@ class ChirpWindow(QMainWindow):
         if e:
             e.freq_lo = self._sb_freq_lo.value()
             e.freq_hi = self._sb_freq_hi.value()
+            if self._chk_shared_trigger.isChecked():
+                for ent in self._entities:
+                    if ent is not e:
+                        ent.freq_lo = e.freq_lo
+                        ent.freq_hi = e.freq_hi
             self._mark_dirty()
 
     # ──────────────────────────────────────────────────────────────────────
@@ -1802,6 +1845,10 @@ class ChirpWindow(QMainWindow):
         e = self._sel
         if e:
             e.threshold = val
+            if self._chk_shared_trigger.isChecked():
+                for ent in self._entities:
+                    if ent is not e:
+                        ent.threshold = val
             self._mark_dirty()
         self._sync_thr_line(val)
 
@@ -2065,6 +2112,72 @@ class ChirpWindow(QMainWindow):
                     ent.display_freq_hi = e.display_freq_hi
                     ent.rebuild_freq_mapping()
                     ent.change_fft_params(e.spec_nperseg, e.spec_window)
+
+    def _on_shared_trigger_toggled(self, on: bool):
+        """When shared-trigger is turned on, push current entity's trigger
+        params to all others immediately (#10 / c24)."""
+        if on:
+            e = self._sel
+            if not e:
+                return
+            for ent in self._entities:
+                if ent is not e:
+                    ent.threshold     = e.threshold
+                    ent.min_cross_sec = e.min_cross_sec
+                    ent.hold_sec      = e.hold_sec
+                    ent.post_trig_sec = e.post_trig_sec
+                    ent.max_rec_sec   = e.max_rec_sec
+                    ent.pre_trig_sec  = e.pre_trig_sec
+                    ent.freq_filter_enabled = e.freq_filter_enabled
+                    ent.freq_lo       = e.freq_lo
+                    ent.freq_hi       = e.freq_hi
+                    ent.spectral_trigger_mode = e.spectral_trigger_mode
+                    ent.spectral_threshold    = e.spectral_threshold
+            self._mark_dirty()
+
+    def _on_apply_all_settings(self):
+        """One-shot: copy ALL user-configurable settings from the selected
+        entity to every other entity (#10 / c24)."""
+        e = self._sel
+        if not e:
+            return
+        self._flush_params_to_entity(self._selected_idx)
+        for ent in self._entities:
+            if ent is not e:
+                # Trigger params
+                ent.threshold     = e.threshold
+                ent.min_cross_sec = e.min_cross_sec
+                ent.hold_sec      = e.hold_sec
+                ent.post_trig_sec = e.post_trig_sec
+                ent.max_rec_sec   = e.max_rec_sec
+                ent.pre_trig_sec  = e.pre_trig_sec
+                ent.freq_filter_enabled = e.freq_filter_enabled
+                ent.freq_lo       = e.freq_lo
+                ent.freq_hi       = e.freq_hi
+                ent.spectral_trigger_mode = e.spectral_trigger_mode
+                ent.spectral_threshold    = e.spectral_threshold
+                # Display params
+                ent.gain_db       = e.gain_db
+                ent.db_floor      = e.db_floor
+                ent.db_ceil       = e.db_ceil
+                ent.freq_scale    = e.freq_scale
+                ent.display_freq_lo = e.display_freq_lo
+                ent.display_freq_hi = e.display_freq_hi
+                ent.rebuild_freq_mapping()
+                ent.change_fft_params(e.spec_nperseg, e.spec_window)
+                ent.change_analysis_fft_params(e.analysis_nperseg, e.analysis_window)
+                ent.display_mode  = e.display_mode
+                # Output params
+                ent.output_dir       = e.output_dir
+                ent.filename_prefix  = e.filename_prefix
+                ent.filename_suffix  = e.filename_suffix
+                ent.dph_folder_prefix = e.dph_folder_prefix
+                ent.ref_date         = e.ref_date
+        self._mark_dirty()
+        # Brief flash to confirm
+        self._btn_apply_all.setText('\u2713 Applied!')
+        from PyQt5.QtCore import QTimer
+        QTimer.singleShot(1500, lambda: self._btn_apply_all.setText('Apply All Settings \u2192'))
 
     def _on_display_mode_changed(self, mode: str):
         e = self._sel
