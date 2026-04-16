@@ -5,19 +5,18 @@ the audio pipeline (capture → filter → FFT → entropy → trigger) and
 all the ring buffers that back the display. No Qt widgets live here —
 the UI layer pulls data out via attribute access.
 
-Behavior is unchanged from the monolith. Known issues pinned by the
-module docstrings in `chirp.dsp` and `chirp.recording.trigger`:
-
-  - #14: FFT accumulator overlap is not reset on start/stop → c10.
-  - #16: spectral trigger is forced through `trigger_peak` → c12.
-  - #18: saturation is measured post-filter → c11.
-  - #20: ring-buffer cursors desync when chunk size != CHUNK_FRAMES → c14.
-  - #19: `ingest_chunk` runs on the Qt main thread via `_update_plot` → c21.
+c21 (#19): `ingest_chunk` now runs on a dedicated ingestion thread
+instead of the Qt main thread. The thread is started/stopped with
+acquisition (start_acq / stop_acq). The display timer reads ring
+buffers directly — numpy slice reads under the GIL are safe for a
+real-time visualizer (at worst a single frame shows a partially
+updated column, which is visually harmless).
 """
 
 import datetime
 import os
 import queue
+import threading
 
 import numpy as np
 import sounddevice as sd
@@ -144,6 +143,8 @@ class RecordingEntity:
         # Runtime
         self.acq_running = False
         self.rec_enabled = False
+        self._ingest_stop = threading.Event()
+        self._ingest_thread: threading.Thread | None = None
 
         # Freq mapping
         self.freq_map_idx_floor = None
@@ -361,12 +362,24 @@ class RecordingEntity:
                 self._analysis_acc_r.reset()
             self.capture.resume()
             self.acq_running = True
+            # Start ingestion thread (#19 / c21).
+            self._ingest_stop.clear()
+            t = threading.Thread(target=self._ingest_loop,
+                                 name=f'chirp-ingest-{self.name}',
+                                 daemon=True)
+            self._ingest_thread = t
+            t.start()
 
     def stop_acq(self):
         if self.acq_running:
             self.capture.pause()
             self.acq_running = False
             self.rec_enabled = False
+            # Stop ingestion thread (#19 / c21).
+            self._ingest_stop.set()
+            if self._ingest_thread is not None:
+                self._ingest_thread.join(timeout=2.0)
+                self._ingest_thread = None
             self.bpf.reset()
             self.bpf_r.reset()
             self.spec_acc.reset()
@@ -375,6 +388,27 @@ class RecordingEntity:
                 self._analysis_acc.reset()
             if self._analysis_acc_r is not None:
                 self._analysis_acc_r.reset()
+
+    def _ingest_loop(self):
+        """Background ingestion thread — drains the audio queue and
+        calls `ingest_chunk` continuously until stop is signaled.
+
+        Moved off the Qt main thread in c21 (#19) so the GUI event
+        loop isn't blocked by DSP / FFT / trigger processing.
+        """
+        while not self._ingest_stop.is_set():
+            try:
+                chunk = self.queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            try:
+                self.ingest_chunk(chunk)
+            except Exception:
+                # Don't let a processing error crash the ingestion
+                # thread — log and continue. The display will stall
+                # briefly but recover on the next chunk.
+                import traceback
+                traceback.print_exc()
 
     def start_rec(self):
         if not self.acq_running:

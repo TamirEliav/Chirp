@@ -2636,36 +2636,10 @@ class ChirpWindow(QMainWindow):
     # ──────────────────────────────────────────────────────────────────────
 
     def _update_plot(self):
-        # 1. Ingest chunks for ALL entities. Cap the per-tick drain at
-        # MAX_DRAIN_PER_TICK so a stalled main thread cannot stretch a
-        # single tick into a multi-second processing block — that would
-        # starve the GUI loop and snowball drops on every other stream.
-        # Anything left in the queue past the cap is intentionally
-        # dropped on the floor and counted via `consume_drop_count`,
-        # which the sidebar surfaces as a drop-indicator badge (#13).
-        MAX_DRAIN_PER_TICK = 8
+        # 1. Ingestion now happens on per-entity background threads
+        # (#19 / c21). The main thread only reads the ring buffers and
+        # updates the display. Drop badges still need polling here.
         for idx, e in enumerate(self._entities):
-            drained = 0
-            while drained < MAX_DRAIN_PER_TICK:
-                try:
-                    e.ingest_chunk(e.queue.get_nowait())
-                except queue.Empty:
-                    break
-                drained += 1
-            else:
-                # Cap hit: anything still queued is over-budget. Account
-                # for it so the sidebar shows a drop badge, then drain
-                # the queue so we don't fall further behind.
-                overflow = 0
-                while True:
-                    try:
-                        e.queue.get_nowait()
-                        overflow += 1
-                    except queue.Empty:
-                        break
-                if overflow and hasattr(e.capture, 'drop_count'):
-                    e.capture.drop_count += overflow
-            # Surface the drop badge to the sidebar (#13 / c15).
             if hasattr(e.capture, 'consume_drop_count'):
                 n_drops = e.capture.consume_drop_count()
                 if hasattr(self, '_sidebar'):
@@ -2784,6 +2758,11 @@ class ChirpWindow(QMainWindow):
                 event.ignore()
                 return
         self._timer.stop()
+
+        # #19 / c21: stop all ingestion threads before flushing, so no
+        # new chunks are processed while we're draining pending events.
+        for e in self._entities:
+            e.stop_acq()
 
         # #17 / c16: flush any in-flight trigger events to the writer
         # pool, then drain the pool so non-daemon worker threads finish
