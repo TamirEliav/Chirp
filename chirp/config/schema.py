@@ -22,7 +22,9 @@ declared version up to the current version, so older files keep
 loading cleanly.
 """
 
-from typing import Iterable, Tuple, List
+from __future__ import annotations
+
+from typing import Iterable
 
 from chirp.recording.entity import RecordingEntity
 
@@ -111,7 +113,7 @@ def build_settings_dict(entities: Iterable[RecordingEntity],
     }
 
 
-def load_settings_dict(data: dict) -> Tuple[List[RecordingEntity], dict, List[str]]:
+def load_settings_dict(data: dict) -> tuple[list[RecordingEntity], dict, list[str]]:
     """Parse a settings dict into `(entities, view_mode, warnings)`.
 
     Raises ValueError if `data` is malformed. Unknown keys at any

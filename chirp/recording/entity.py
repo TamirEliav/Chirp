@@ -5,12 +5,13 @@ the audio pipeline (capture → filter → FFT → entropy → trigger) and
 all the ring buffers that back the display. No Qt widgets live here —
 the UI layer pulls data out via attribute access.
 
-c21 (#19): `ingest_chunk` now runs on a dedicated ingestion thread
-instead of the Qt main thread. The thread is started/stopped with
-acquisition (start_acq / stop_acq). The display timer reads ring
-buffers directly — numpy slice reads under the GIL are safe for a
-real-time visualizer (at worst a single frame shows a partially
-updated column, which is visually harmless).
+Post Phase 2/3 status:
+  - c10: FFT overlap reset on stream start/stop.
+  - c11: saturation measured from raw (pre-filter) signal.
+  - c12: should_trigger computed upstream, decoupled from trigger_peak.
+  - c14: ring-buffer cursors derived from a single sample counter.
+  - c19: display and analysis FFT accumulators decoupled.
+  - c21: ingest_chunk runs on a dedicated background thread.
 """
 
 import datetime

@@ -17,10 +17,8 @@ Warm-up / `primed` flag (c10, issue #14):
   Spectral-Only trigger can fire spuriously the instant acquisition
   restarts.
 
-Known quirks still pinned for later phases:
-  - Exactly one column is emitted per chunk regardless of chunk size,
-    so display temporal resolution is implicitly chunk-quantized
-    (issue #12 — hop-size control will be added in c19).
+c19 (#12) decoupled the display and analysis accumulators so they can
+use independent FFT sizes / windows.
 """
 
 import numpy as np

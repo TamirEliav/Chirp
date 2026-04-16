@@ -1,21 +1,21 @@
 """Sidebar widgets — per-stream list on the left-hand side.
 
 Extracted from the monolith in the Phase 1 refactor (plan: c08).
-Contains MiniAmplitudeWidget (QPainter mini waveform), 
+Contains MiniAmplitudeWidget (QPainter mini waveform),
 RecordingSidebarItem (single row), and RecordingSidebar (the list).
 
-#13 (c15) will add a drop-indicator badge here when the capture
-callback starts dropping chunks on queue.Full.
+c15 (#13) added a drop-indicator badge that flashes orange when the
+capture callback drops chunks on queue.Full.
 """
 
 import numpy as np
 
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea,
-    QFrame, QSizePolicy,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+    QScrollArea, QFrame, QSizePolicy,
 )
-from PyQt5.QtCore import Qt, QSize, pyqtSignal, QPointF
-from PyQt5.QtGui import QPainter, QColor, QPainterPath, QPen, QPolygonF, QFont
+from PyQt5.QtCore import Qt, pyqtSignal, QPointF
+from PyQt5.QtGui import QPainter, QColor, QPainterPath, QPen, QPolygonF
 
 from chirp.constants import C
 
