@@ -603,12 +603,13 @@ class ChirpWindow(QMainWindow):
         w = QWidget()
         w.setStyleSheet(f'background-color: {C["mantle"]};')
         h = QHBoxLayout(w)
-        h.setContentsMargins(14, 10, 14, 10)
+        h.setContentsMargins(14, 4, 14, 4)
         h.setSpacing(18)
 
         acq_box = QGroupBox('ACQUISITION')
         acq_h   = QHBoxLayout(acq_box)
         acq_h.setSpacing(10)
+        acq_h.setContentsMargins(8, 4, 8, 4)
         self._btn_start_acq = QPushButton('Start Acq')
         self._btn_stop_acq  = QPushButton('Stop Acq')
         self._btn_start_acq.setObjectName('btn_start_acq')
@@ -621,6 +622,7 @@ class ChirpWindow(QMainWindow):
         rec_box = QGroupBox('RECORDING')
         rec_h   = QHBoxLayout(rec_box)
         rec_h.setSpacing(10)
+        rec_h.setContentsMargins(8, 4, 8, 4)
         self._btn_start_rec = QPushButton('Start Rec')
         self._btn_stop_rec  = QPushButton('Stop Rec')
         self._btn_start_rec.setObjectName('btn_start_rec')
@@ -690,8 +692,9 @@ class ChirpWindow(QMainWindow):
     def _build_params(self) -> QWidget:
         w = QWidget()
         w.setStyleSheet(f'background-color: {C["mantle"]};')
+        w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         outer = QHBoxLayout(w)
-        outer.setContentsMargins(14, 6, 14, 6)
+        outer.setContentsMargins(14, 2, 14, 2)
 
         # Hidden threshold spinbox (synced from amplitude graph drag)
         self._sb_thr = QDoubleSpinBox()
@@ -703,9 +706,10 @@ class ChirpWindow(QMainWindow):
 
         trig_box = QGroupBox('TRIGGER')
         trig_g   = QGridLayout(trig_box)
-        trig_g.setVerticalSpacing(8)
-        trig_g.setHorizontalSpacing(10)
-        trig_g.setColumnStretch(1, 3)
+        trig_g.setVerticalSpacing(4)
+        trig_g.setHorizontalSpacing(8)
+        trig_g.setContentsMargins(8, 4, 8, 4)
+        trig_g.setColumnStretch(1, 1)
 
         self._sb_mc = self._param_row(trig_g, 0, 0, 'Min Cross',
             sb_min=0.0, sb_max=60.0, sb_step=0.001, sb_dec=3, suffix=' s',
@@ -874,14 +878,16 @@ class ChirpWindow(QMainWindow):
     def _build_spec_params(self) -> QWidget:
         w = QWidget()
         w.setStyleSheet(f'background-color: {C["mantle"]};')
+        w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         outer = QHBoxLayout(w)
-        outer.setContentsMargins(14, 6, 14, 6)
+        outer.setContentsMargins(14, 2, 14, 2)
 
         box  = QGroupBox('DISPLAY')
         grid = QGridLayout(box)
-        grid.setVerticalSpacing(8)
-        grid.setHorizontalSpacing(10)
-        grid.setColumnStretch(1, 3)
+        grid.setVerticalSpacing(4)
+        grid.setHorizontalSpacing(8)
+        grid.setContentsMargins(8, 4, 8, 4)
+        grid.setColumnStretch(1, 1)
         grid.setColumnStretch(4, 1)
 
         lbl_buf = QLabel('Buffer')
@@ -1020,14 +1026,16 @@ class ChirpWindow(QMainWindow):
     def _build_settings(self) -> QWidget:
         w = QWidget()
         w.setStyleSheet(f'background-color: {C["mantle"]};')
+        w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         outer = QHBoxLayout(w)
-        outer.setContentsMargins(14, 6, 14, 10)
+        outer.setContentsMargins(14, 2, 14, 4)
         outer.setSpacing(20)
 
         output_box = QGroupBox('OUTPUT')
         output_g   = QGridLayout(output_box)
         output_g.setVerticalSpacing(4)
         output_g.setHorizontalSpacing(6)
+        output_g.setContentsMargins(8, 4, 8, 4)
         lbl_folder = QLabel('Folder')
         lbl_folder.setObjectName('param_label')
         self._folder_edit = QLineEdit(RECORDINGS_DIR)
@@ -1061,6 +1069,7 @@ class ChirpWindow(QMainWindow):
         device_box = QGroupBox('INPUT DEVICE')
         device_v   = QVBoxLayout(device_box)
         device_v.setSpacing(4)
+        device_v.setContentsMargins(8, 4, 8, 4)
         dev_row1 = QHBoxLayout()
         dev_row1.setSpacing(4)
         self._device_combo = QComboBox()
