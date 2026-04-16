@@ -74,6 +74,7 @@ class ChirpWindow(QMainWindow):
         self._dragging = False
         self._dragging_entropy = False
         self._current_config_path: str | None = None
+        self._config_dirty = False  # #11 / c22: unsaved changes indicator
 
         # View mode
         self._view_mode = False
@@ -97,8 +98,42 @@ class ChirpWindow(QMainWindow):
         self._timer.timeout.connect(self._update_plot)
         self._timer.start()
 
-        self.setWindowTitle(f'Chirp v{__version__} — Triggered Sound Recording')
+        self._update_title()
         self.resize(1400, 850)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Dirty-state tracking (#11 / c22)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _mark_dirty(self):
+        """Flag that in-memory config has changed since last save/load."""
+        if not self._config_dirty:
+            self._config_dirty = True
+            self._update_title()
+            self._update_save_tooltip()
+
+    def _mark_clean(self):
+        """Reset dirty flag after a successful save or load."""
+        self._config_dirty = False
+        self._update_title()
+        self._update_save_tooltip()
+
+    def _update_title(self):
+        base = f'Chirp v{__version__} — Triggered Sound Recording'
+        path = self._current_config_path
+        if path:
+            import os
+            base += f'  [{os.path.basename(path)}]'
+        if self._config_dirty:
+            base += '  •'
+        self.setWindowTitle(base)
+
+    def _update_save_tooltip(self):
+        if not hasattr(self, '_btn_save'):
+            return
+        path = self._current_config_path or '(no file)'
+        dirty = ' (unsaved changes)' if self._config_dirty else ''
+        self._btn_save.setToolTip(f'Save configuration to {path}{dirty}')
 
     # ──────────────────────────────────────────────────────────────────────
     # matplotlib figure
@@ -1247,6 +1282,7 @@ class ChirpWindow(QMainWindow):
         e.pre_trig_sec  = self._sb_pre.value()
         e.spectral_trigger_mode = self._combo_detect_mode.currentText()
         e.spectral_threshold    = self._sb_entropy_thr.value()
+        self._mark_dirty()
 
     def _write_spec_params(self):
         e = self._sel
@@ -1261,6 +1297,7 @@ class ChirpWindow(QMainWindow):
                     ent.gain_db  = e.gain_db
                     ent.db_floor = e.db_floor
                     ent.db_ceil  = e.db_ceil
+        self._mark_dirty()
 
     def _on_freq_filter_toggled(self, on: bool):
         self._sb_freq_lo.setEnabled(on)
@@ -1270,12 +1307,14 @@ class ChirpWindow(QMainWindow):
             e.freq_filter_enabled = on
             e.bpf.reset()
             e.bpf_r.reset()
+            self._mark_dirty()
 
     def _on_freq_filter_param(self, _val):
         e = self._sel
         if e:
             e.freq_lo = self._sb_freq_lo.value()
             e.freq_hi = self._sb_freq_hi.value()
+            self._mark_dirty()
 
     # ──────────────────────────────────────────────────────────────────────
     # Flush / Load params for selection switching
@@ -1486,6 +1525,7 @@ class ChirpWindow(QMainWindow):
         self._entities.append(e)
         idx = self._sidebar.add_item(name)
         self._switch_selection(idx)
+        self._mark_dirty()
 
     def _remove_recording(self, idx: int):
         if len(self._entities) <= 1:
@@ -1500,6 +1540,7 @@ class ChirpWindow(QMainWindow):
             elif self._selected_idx >= idx:
                 self._selected_idx = max(0, self._selected_idx - 1)
             self._switch_selection(self._selected_idx)
+            self._mark_dirty()
 
     def _move_recording(self, idx: int, direction: int):
         new_idx = idx + direction
@@ -1520,6 +1561,7 @@ class ChirpWindow(QMainWindow):
     def _on_item_renamed(self, idx: int, name: str):
         if 0 <= idx < len(self._entities):
             self._entities[idx].name = name
+            self._mark_dirty()
 
     # ──────────────────────────────────────────────────────────────────────
     # Transport callbacks (operate on selected entity)
@@ -1625,6 +1667,7 @@ class ChirpWindow(QMainWindow):
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
             self._current_config_path = path
+            self._mark_clean()  # #11 / c22
             return True
         except Exception as exc:
             QMessageBox.warning(self, 'Save Error', f'Could not save settings:\n{exc}')
@@ -1724,6 +1767,7 @@ class ChirpWindow(QMainWindow):
             self._setup_view_mode_axes()
 
         self._current_config_path = path
+        self._mark_clean()  # #11 / c22
         self._timer.start()
 
         if warnings:
@@ -1758,6 +1802,7 @@ class ChirpWindow(QMainWindow):
         e = self._sel
         if e:
             e.threshold = val
+            self._mark_dirty()
         self._sync_thr_line(val)
 
     def _sync_thr_line(self, val: float):
@@ -2029,6 +2074,7 @@ class ChirpWindow(QMainWindow):
         stereo = e.channel_mode == 'Stereo'
         self._setup_axes(stereo=stereo)
         self._update_spec_yticks(e)
+        self._mark_dirty()
 
     def _on_detect_mode_changed(self, mode: str):
         self._sl_entropy_thr.setEnabled(mode != 'Amplitude Only')
@@ -2051,6 +2097,7 @@ class ChirpWindow(QMainWindow):
                     if ent is not e:
                         ent.freq_scale = scale
                         ent.rebuild_freq_mapping()
+            self._mark_dirty()
 
     def _on_fft_params_changed(self):
         e = self._sel
@@ -2065,6 +2112,7 @@ class ChirpWindow(QMainWindow):
                 for ent in self._entities:
                     if ent is not e:
                         ent.change_fft_params(nperseg, window)
+            self._mark_dirty()
 
     # ──────────────────────────────────────────────────────────────────────
     # Folder & device
@@ -2084,16 +2132,19 @@ class ChirpWindow(QMainWindow):
         e = self._sel
         if e:
             e.output_dir = text if text else RECORDINGS_DIR
+            self._mark_dirty()
 
     def _on_prefix_changed(self):
         e = self._sel
         if e:
             e.filename_prefix = self._prefix_edit.text()
+            self._mark_dirty()
 
     def _on_suffix_changed(self):
         e = self._sel
         if e:
             e.filename_suffix = self._suffix_edit.text()
+            self._mark_dirty()
 
     def _on_ref_date_toggled(self, on: bool):
         self._date_line.setEnabled(on)
