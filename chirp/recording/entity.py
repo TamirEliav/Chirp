@@ -75,6 +75,14 @@ class RecordingEntity:
         self.bpf        = BandpassFilter(sample_rate=self.sample_rate)
         self.bpf_r      = BandpassFilter(sample_rate=self.sample_rate)
 
+        # Analysis FFT params — default to display params. When they
+        # differ from the display FFT, a separate accumulator is used
+        # for spectral entropy / trigger (#12 / c19).
+        self.analysis_nperseg = SPECTROGRAM_NPERSEG
+        self.analysis_window  = 'hann'
+        self._analysis_acc: SpectrogramAccumulator | None = None
+        self._analysis_acc_r: SpectrogramAccumulator | None = None
+
         # Trigger params
         self.threshold     = DEFAULT_THRESHOLD
         self.min_cross_sec = DEFAULT_MIN_CROSS
@@ -202,6 +210,47 @@ class RecordingEntity:
         self.spec_buffer_r = np.full(
             (self.n_freq_bins, self._n_cols), SPEC_DB_MIN, dtype=np.float32)
         self.rebuild_freq_mapping()
+        # Rebuild analysis split when display params change (#12 / c19).
+        self._rebuild_analysis_split()
+
+    def change_analysis_fft_params(self, nperseg: int, window: str):
+        """Change the analysis FFT parameters independently of display (#12 / c19).
+
+        When (nperseg, window) matches the display FFT, the analysis
+        path reuses the display accumulator (zero overhead). Otherwise
+        a dedicated analysis accumulator is created.
+        """
+        self.analysis_nperseg = nperseg
+        self.analysis_window  = window
+        self._rebuild_analysis_split()
+
+    def _rebuild_analysis_split(self):
+        """Create or destroy the dedicated analysis accumulator.
+
+        Called whenever display or analysis FFT params change. When both
+        sets match, the analysis path reuses `spec_acc` / `spec_acc_r`
+        (shared mode). When they differ, private accumulators are created
+        so entropy computation runs at its own resolution.
+        """
+        if (self.analysis_nperseg == self.spec_nperseg
+                and self.analysis_window == self.spec_window):
+            self._analysis_acc   = None
+            self._analysis_acc_r = None
+        else:
+            self._analysis_acc   = SpectrogramAccumulator(
+                self.analysis_nperseg, self.analysis_window)
+            self._analysis_acc_r = SpectrogramAccumulator(
+                self.analysis_nperseg, self.analysis_window)
+
+    @property
+    def analysis_acc(self) -> SpectrogramAccumulator:
+        """Return the accumulator used for spectral entropy / trigger."""
+        return self._analysis_acc if self._analysis_acc is not None else self.spec_acc
+
+    @property
+    def analysis_acc_r(self) -> SpectrogramAccumulator:
+        """Return the right-channel analysis accumulator."""
+        return self._analysis_acc_r if self._analysis_acc_r is not None else self.spec_acc_r
 
     # ── Device change ─────────────────────────────────────────────────────
 
@@ -305,6 +354,10 @@ class RecordingEntity:
             # restart don't mix zero-padding into the spectrum (#14).
             self.spec_acc.reset()
             self.spec_acc_r.reset()
+            if self._analysis_acc is not None:
+                self._analysis_acc.reset()
+            if self._analysis_acc_r is not None:
+                self._analysis_acc_r.reset()
             self.capture.resume()
             self.acq_running = True
 
@@ -317,6 +370,10 @@ class RecordingEntity:
             self.bpf_r.reset()
             self.spec_acc.reset()
             self.spec_acc_r.reset()
+            if self._analysis_acc is not None:
+                self._analysis_acc.reset()
+            if self._analysis_acc_r is not None:
+                self._analysis_acc_r.reset()
 
     def start_rec(self):
         if not self.acq_running:
@@ -359,12 +416,20 @@ class RecordingEntity:
         self.col_head   = (self._samples_total // CHUNK_FRAMES) % self._n_cols
         end = self.write_head + n
 
-        # Spectrogram always uses unfiltered signal
+        # Display spectrogram — always uses unfiltered signal.
         db_col, lin_mag = self.spec_acc.compute_column(display)
         self.spec_buffer[:, self.col_head] = db_col
         if mode == 'Stereo':
             db_col_r, lin_mag_r = self.spec_acc_r.compute_column(right)
             self.spec_buffer_r[:, self.col_head] = db_col_r
+
+        # Analysis FFT — when analysis params differ from display, a
+        # separate accumulator produces its own magnitude spectrum for
+        # spectral entropy computation (#12 / c19).
+        if self._analysis_acc is not None:
+            _, lin_mag = self._analysis_acc.compute_column(display)
+            if mode == 'Stereo':
+                _, lin_mag_r = self._analysis_acc_r.compute_column(right)
 
         # Saturation must be measured on the *raw* (pre-filter) signal:
         # the bandpass attenuates clipped peaks and would otherwise hide
@@ -438,8 +503,10 @@ class RecordingEntity:
         amp_above = (trigger_peak >= self.threshold)
         stm = self.spectral_trigger_mode
         # #14: spectral entropy is meaningless during FFT warm-up.
-        spec_primed = self.spec_acc.primed and (
-            mode != 'Stereo' or self.spec_acc_r.primed)
+        # Use the analysis accumulator — it may have different params
+        # from the display accumulator (#12 / c19).
+        spec_primed = self.analysis_acc.primed and (
+            mode != 'Stereo' or self.analysis_acc_r.primed)
         if stm == 'Amplitude Only':
             should_trigger = amp_above
         elif not spec_primed:
@@ -574,6 +641,8 @@ class RecordingEntity:
             'spectral_trigger_mode': self.spectral_trigger_mode,
             'spectral_threshold':    self.spectral_threshold,
             'display_mode':        self.display_mode,
+            'analysis_nperseg':    self.analysis_nperseg,
+            'analysis_window':     self.analysis_window,
         }
 
     @classmethod
@@ -625,6 +694,12 @@ class RecordingEntity:
         nperseg = d.get('spec_nperseg', SPECTROGRAM_NPERSEG)
         window  = d.get('spec_window', 'hann')
         e.change_fft_params(nperseg, window)
+
+        # Analysis FFT params (#12 / c19). Legacy files won't have these
+        # keys, so fall back to display params for backward compat.
+        a_nperseg = d.get('analysis_nperseg', nperseg)
+        a_window  = d.get('analysis_window', window)
+        e.change_analysis_fft_params(a_nperseg, a_window)
 
         # Ref date
         ref = d.get('ref_date')

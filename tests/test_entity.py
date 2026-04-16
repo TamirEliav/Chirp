@@ -124,3 +124,69 @@ def test_saturation_true_on_unfiltered_clip():
     chunk = np.full(1024, 0.999, dtype=np.float32)
     e.ingest_chunk(chunk)
     assert e.saturated is True
+
+
+# ── #12 / c19: decoupled display vs analysis FFT ────────────────────────────
+
+def test_analysis_accumulator_shared_when_params_match():
+    """When analysis and display FFT params are the same, no separate
+    accumulator is created (zero overhead)."""
+    e = _entity()
+    assert e._analysis_acc is None
+    assert e.analysis_acc is e.spec_acc
+    assert e.analysis_acc_r is e.spec_acc_r
+
+
+def test_analysis_accumulator_separate_when_params_differ():
+    """Changing analysis params creates a dedicated accumulator."""
+    e = _entity()
+    e.change_analysis_fft_params(512, 'hamming')
+    assert e._analysis_acc is not None
+    assert e.analysis_acc is not e.spec_acc
+    assert e.analysis_acc._n == 512
+
+
+def test_analysis_accumulator_collapses_back_to_shared():
+    """Setting analysis params back to display params drops the split."""
+    e = _entity()
+    e.change_analysis_fft_params(512, 'hamming')
+    assert e._analysis_acc is not None
+    # Set back to defaults (same as display)
+    e.change_analysis_fft_params(e.spec_nperseg, e.spec_window)
+    assert e._analysis_acc is None
+    assert e.analysis_acc is e.spec_acc
+
+
+def test_decoupled_analysis_does_not_affect_display_buffer():
+    """With a separate analysis accumulator, the display spectrogram
+    buffer should still use the display FFT params."""
+    e = _entity()
+    original_freq_bins = e.n_freq_bins
+    e.change_analysis_fft_params(256, 'hamming')
+    # Display buffer dimensions unchanged
+    assert e.n_freq_bins == original_freq_bins
+    assert e.spec_buffer.shape[0] == original_freq_bins
+    # Ingest a chunk — should work without error
+    chunk = np.random.randn(1024).astype(np.float32) * 0.1
+    e.ingest_chunk(chunk)
+
+
+def test_analysis_params_survive_config_roundtrip():
+    """analysis_nperseg and analysis_window should round-trip through
+    to_dict/from_dict (#12 / c19)."""
+    e = _entity()
+    e.change_analysis_fft_params(512, 'hamming')
+    d = e.to_dict()
+    assert d['analysis_nperseg'] == 512
+    assert d['analysis_window'] == 'hamming'
+
+
+def test_legacy_config_without_analysis_keys_defaults_to_display():
+    """A config dict missing analysis keys should fall back to the
+    display FFT params for backward compat."""
+    from chirp.recording.entity import RecordingEntity
+    d = {'name': 'Legacy', 'spec_nperseg': 2048, 'spec_window': 'blackman'}
+    ent, _ = RecordingEntity.from_dict(d)
+    assert ent.analysis_nperseg == 2048
+    assert ent.analysis_window == 'blackman'
+    assert ent._analysis_acc is None  # same as display → shared

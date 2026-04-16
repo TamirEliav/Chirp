@@ -53,6 +53,7 @@ _KNOWN_RECORDING_KEYS: frozenset[str] = frozenset({
     "amp_ylim",
     "spectral_trigger_mode", "spectral_threshold",
     "display_mode",
+    "analysis_nperseg", "analysis_window",
 })
 
 _KNOWN_VIEW_MODE_KEYS: frozenset[str] = frozenset({
