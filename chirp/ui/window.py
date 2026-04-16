@@ -504,39 +504,29 @@ class ChirpWindow(QMainWindow):
         vbox.addWidget(self._view_toolbar)
         self._view_toolbar.hide()
 
-        # Config panels — store refs for hide/show in view mode
+        # Config panel — single compact row: Trigger | Display | Transport | Settings
         self._config_widgets: list[QWidget] = []
 
-        # Row 1: transport
         hl = self._hline()
-        transport = self._build_transport()
-        vbox.addWidget(hl)
-        vbox.addWidget(transport)
-        self._config_widgets.extend([hl, transport])
-
-        # Row 2: trigger params + display side by side (compact, left-aligned)
-        hl2 = self._hline()
         params_panel = self._build_params()
         spec_panel = self._build_spec_params()
-        combined = QWidget()
-        combined.setStyleSheet(f'background-color: {C["mantle"]};')
-        combined.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-        combined_h = QHBoxLayout(combined)
-        combined_h.setContentsMargins(0, 0, 0, 0)
-        combined_h.setSpacing(0)
-        combined_h.addWidget(params_panel)
-        combined_h.addWidget(spec_panel)
-        combined_h.addStretch(1)
-        vbox.addWidget(hl2)
-        vbox.addWidget(combined)
-        self._config_widgets.extend([hl2, combined])
+        transport_panel = self._build_transport()
+        settings_panel = self._build_settings()
 
-        # Row 3: settings (output folder, filename, device)
-        hl3 = self._hline()
-        settings = self._build_settings()
-        vbox.addWidget(hl3)
-        vbox.addWidget(settings)
-        self._config_widgets.extend([hl3, settings])
+        config_row = QWidget()
+        config_row.setStyleSheet(f'background-color: {C["mantle"]};')
+        config_row.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        config_h = QHBoxLayout(config_row)
+        config_h.setContentsMargins(0, 0, 0, 0)
+        config_h.setSpacing(0)
+        config_h.addWidget(params_panel)
+        config_h.addWidget(spec_panel)
+        config_h.addWidget(transport_panel)
+        config_h.addWidget(settings_panel, stretch=1)
+
+        vbox.addWidget(hl)
+        vbox.addWidget(config_row)
+        self._config_widgets.extend([hl, config_row])
 
         hbox.addWidget(right, stretch=1)
 
@@ -604,68 +594,42 @@ class ChirpWindow(QMainWindow):
     def _build_transport(self) -> QWidget:
         w = QWidget()
         w.setStyleSheet(f'background-color: {C["mantle"]};')
-        h = QHBoxLayout(w)
-        h.setContentsMargins(14, 4, 14, 4)
-        h.setSpacing(18)
+        w.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Maximum)
+        outer = QHBoxLayout(w)
+        outer.setContentsMargins(6, 2, 6, 2)
+        outer.setSpacing(6)
 
-        acq_box = QGroupBox('ACQUISITION')
-        acq_h   = QHBoxLayout(acq_box)
-        acq_h.setSpacing(10)
-        acq_h.setContentsMargins(8, 4, 8, 4)
+        # Left column: buttons grid
+        btn_box = QGroupBox('CONTROLS')
+        btn_g = QGridLayout(btn_box)
+        btn_g.setSpacing(4)
+        btn_g.setContentsMargins(8, 4, 8, 4)
+
         self._btn_start_acq = QPushButton('Start Acq')
         self._btn_stop_acq  = QPushButton('Stop Acq')
         self._btn_start_acq.setObjectName('btn_start_acq')
         self._btn_stop_acq .setObjectName('btn_stop_acq')
         self._btn_start_acq.setToolTip('Start audio acquisition (live monitoring) for the selected recording')
         self._btn_stop_acq .setToolTip('Stop audio acquisition for the selected recording')
-        acq_h.addWidget(self._btn_start_acq)
-        acq_h.addWidget(self._btn_stop_acq)
 
-        rec_box = QGroupBox('RECORDING')
-        rec_h   = QHBoxLayout(rec_box)
-        rec_h.setSpacing(10)
-        rec_h.setContentsMargins(8, 4, 8, 4)
         self._btn_start_rec = QPushButton('Start Rec')
         self._btn_stop_rec  = QPushButton('Stop Rec')
         self._btn_start_rec.setObjectName('btn_start_rec')
         self._btn_stop_rec .setObjectName('btn_stop_rec')
         self._btn_start_rec.setToolTip('Enable threshold-triggered WAV recording for the selected recording')
         self._btn_stop_rec .setToolTip('Disable threshold-triggered WAV recording for the selected recording')
-        rec_h.addWidget(self._btn_start_rec)
-        rec_h.addWidget(self._btn_stop_rec)
 
-        status_box = QGroupBox('STATUS')
-        status_v   = QVBoxLayout(status_box)
-        status_v.setSpacing(4)
-        self._lbl_acq_status  = QLabel('ACQ  \u25cf  STOPPED')
-        self._lbl_rec_status  = QLabel('REC  \u25cf  STOPPED')
-        self._lbl_trig_status = QLabel('TRIG \u25cf  IDLE')
-        self._lbl_entropy     = QLabel('ENT  —')
-        self._lbl_acq_status .setObjectName('status_off')
-        self._lbl_rec_status .setObjectName('status_off')
-        self._lbl_trig_status.setObjectName('trig_idle')
-        self._lbl_entropy    .setObjectName('trig_idle')
-        mono = QFont('Consolas', 10)
-        for lbl in (self._lbl_acq_status, self._lbl_rec_status, self._lbl_trig_status,
-                     self._lbl_entropy):
-            lbl.setFont(mono)
-        status_v.addWidget(self._lbl_acq_status)
-        status_v.addWidget(self._lbl_rec_status)
-        status_v.addWidget(self._lbl_trig_status)
-        status_v.addWidget(self._lbl_entropy)
-        self._blink_counter = 0
-
-        self._btn_reset = QPushButton('Reset Params')
+        self._btn_reset = QPushButton('Reset')
         self._btn_reset.setObjectName('btn_browse')
         self._btn_reset.setToolTip('Reset all trigger and display parameters to their defaults')
 
-        self._btn_view_mode = QPushButton('\u25a3  View Mode')
+        self._btn_view_mode = QPushButton('\u25a3 View')
         self._btn_view_mode.setObjectName('btn_view_mode')
         self._btn_view_mode.setToolTip('Switch to View mode — a read-only monitoring grid of all recordings')
         self._btn_view_mode.setStyleSheet(
             f'QPushButton {{ background-color: {C["surface0"]}; color: {C["mauve"]}; '
             f'border: 1px solid {C["mauve"]}; border-radius: 5px; '
-            f'padding: 6px 16px; font-weight: bold; min-width: 0px; }}'
+            f'padding: 4px 8px; font-weight: bold; min-width: 0px; }}'
             f'QPushButton:hover {{ background-color: {C["surface1"]}; }}'
         )
 
@@ -678,15 +642,41 @@ class ChirpWindow(QMainWindow):
         for btn in (self._btn_save, self._btn_save_as, self._btn_load):
             btn.setObjectName('btn_browse')
 
-        h.addWidget(acq_box)
-        h.addWidget(rec_box)
-        h.addWidget(self._btn_reset)
-        h.addWidget(self._btn_save)
-        h.addWidget(self._btn_save_as)
-        h.addWidget(self._btn_load)
-        h.addWidget(self._btn_view_mode)
-        h.addStretch()
-        h.addWidget(status_box)
+        btn_g.addWidget(self._btn_start_acq, 0, 0)
+        btn_g.addWidget(self._btn_stop_acq,  0, 1)
+        btn_g.addWidget(self._btn_start_rec, 1, 0)
+        btn_g.addWidget(self._btn_stop_rec,  1, 1)
+        btn_g.addWidget(self._btn_save,      2, 0)
+        btn_g.addWidget(self._btn_save_as,   2, 1)
+        btn_g.addWidget(self._btn_load,      3, 0)
+        btn_g.addWidget(self._btn_reset,     3, 1)
+        btn_g.addWidget(self._btn_view_mode, 4, 0, 1, 2)
+
+        # Right column: status labels
+        status_box = QGroupBox('STATUS')
+        status_v   = QVBoxLayout(status_box)
+        status_v.setSpacing(2)
+        status_v.setContentsMargins(8, 4, 8, 4)
+        self._lbl_acq_status  = QLabel('ACQ  \u25cf  STOPPED')
+        self._lbl_rec_status  = QLabel('REC  \u25cf  STOPPED')
+        self._lbl_trig_status = QLabel('TRIG \u25cf  IDLE')
+        self._lbl_entropy     = QLabel('ENT  \u2014')
+        self._lbl_acq_status .setObjectName('status_off')
+        self._lbl_rec_status .setObjectName('status_off')
+        self._lbl_trig_status.setObjectName('trig_idle')
+        self._lbl_entropy    .setObjectName('trig_idle')
+        mono = QFont('Consolas', 9)
+        for lbl in (self._lbl_acq_status, self._lbl_rec_status, self._lbl_trig_status,
+                     self._lbl_entropy):
+            lbl.setFont(mono)
+        status_v.addWidget(self._lbl_acq_status)
+        status_v.addWidget(self._lbl_rec_status)
+        status_v.addWidget(self._lbl_trig_status)
+        status_v.addWidget(self._lbl_entropy)
+        self._blink_counter = 0
+
+        outer.addWidget(btn_box)
+        outer.addWidget(status_box)
         return w
 
     # ── Trigger Parameters ────────────────────────────────────────────────
@@ -1026,9 +1016,9 @@ class ChirpWindow(QMainWindow):
         w = QWidget()
         w.setStyleSheet(f'background-color: {C["mantle"]};')
         w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-        outer = QHBoxLayout(w)
+        outer = QVBoxLayout(w)
         outer.setContentsMargins(6, 2, 6, 2)
-        outer.setSpacing(10)
+        outer.setSpacing(2)
 
         output_box = QGroupBox('OUTPUT')
         output_g   = QGridLayout(output_box)
@@ -1151,9 +1141,13 @@ class ChirpWindow(QMainWindow):
         ref_g.addLayout(date_row,            1, 0)
         ref_g.addLayout(pfx_row,             2, 0)
 
-        outer.addWidget(output_box, stretch=10)
-        outer.addWidget(ref_box, stretch=3)
-        outer.addWidget(device_box, stretch=5)
+        # Top row: Output + Ref Date side by side
+        top_row = QHBoxLayout()
+        top_row.setSpacing(6)
+        top_row.addWidget(output_box, stretch=3)
+        top_row.addWidget(ref_box, stretch=1)
+        outer.addLayout(top_row)
+        outer.addWidget(device_box)
         return w
 
     # ──────────────────────────────────────────────────────────────────────
