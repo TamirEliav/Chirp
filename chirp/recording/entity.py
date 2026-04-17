@@ -22,7 +22,7 @@ import threading
 import numpy as np
 import sounddevice as sd
 
-from chirp.audio import AudioCapture
+from chirp.audio import AudioCapture, WavFileCapture
 from chirp.audio.devices import find_device_by_name, host_api_name
 from chirp.constants import (
     CHUNK_FRAMES,
@@ -67,9 +67,15 @@ class RecordingEntity:
         self.channel_mode = 'Mono'
         self.trigger_mode = 'Average'
 
+        # Input source: 'device' (live sounddevice input) or 'wav_file'
+        # (feed a WAV through the pipeline for reproducible testing).
+        self.input_source  = 'device'
+        self.wav_file_path: str | None = None
+        self.wav_loop      = True
+
         # Audio pipeline
         self.queue      = queue.Queue(maxsize=200)
-        self.capture    = AudioCapture(self.queue, device=device_id, samplerate=self.sample_rate)
+        self.capture    = self._make_capture(channels=1)
         self.spec_acc   = SpectrogramAccumulator()
         self.spec_acc_r = SpectrogramAccumulator()
         self.recorder   = ThresholdRecorder()
@@ -255,6 +261,21 @@ class RecordingEntity:
         """Return the right-channel analysis accumulator."""
         return self._analysis_acc_r if self._analysis_acc_r is not None else self.spec_acc_r
 
+    # ── Capture factory ───────────────────────────────────────────────────
+
+    def _make_capture(self, channels: int):
+        """Return a capture object matching the current ``input_source``.
+
+        Mirrors the ``AudioCapture`` contract so the rest of the
+        pipeline doesn't care whether samples come from a live device
+        or a WAV file.
+        """
+        if self.input_source == 'wav_file' and self.wav_file_path:
+            return WavFileCapture(self.queue, self.wav_file_path,
+                                  channels=channels, loop=self.wav_loop)
+        return AudioCapture(self.queue, device=self.device_id,
+                            channels=channels, samplerate=self.sample_rate)
+
     # ── Device change ─────────────────────────────────────────────────────
 
     def change_device(self, device_id, channels):
@@ -269,8 +290,8 @@ class RecordingEntity:
             except queue.Empty:
                 break
         self.device_id = device_id
-        self.capture = AudioCapture(self.queue, device=device_id, channels=channels,
-                                    samplerate=self.sample_rate)
+        self.input_source = 'device'
+        self.capture = self._make_capture(channels=channels)
         if not self.capture.valid:
             self.acq_running = False
             return False
@@ -278,6 +299,64 @@ class RecordingEntity:
             self.capture.resume()
             self.acq_running = True
         return True
+
+    def use_wav_file(self, path: str, loop: bool = True) -> tuple[bool, str | None]:
+        """Switch the input source to a WAV file.
+
+        Reads the file's sample rate and channel count; if the rate
+        differs from the current session rate, the whole pipeline is
+        rebuilt at the file's rate (same path as a live SR change).
+
+        Returns ``(ok, warning)``. ``ok`` is False when the file could
+        not be opened; a warning string is returned when the session
+        sample rate had to change to match the file.
+        """
+        was_running = self.acq_running
+        if was_running:
+            self.capture.pause()
+            self.acq_running = False
+        self.capture.close()
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
+
+        self.input_source  = 'wav_file'
+        self.wav_file_path = path
+        self.wav_loop      = loop
+
+        need_ch = 2 if self.channel_mode != 'Mono' else 1
+        probe = self._make_capture(channels=need_ch)
+        if not probe.valid:
+            # Fall back to live device on failure.
+            probe.close()
+            self.input_source = 'device'
+            self.wav_file_path = None
+            self.capture = self._make_capture(channels=need_ch)
+            return False, f"Could not open WAV file: {path}"
+
+        warning = None
+        file_sr = probe.file_sample_rate
+        if file_sr and file_sr != self.sample_rate and file_sr in self.SUPPORTED_RATES:
+            probe.close()
+            # change_sample_rate will call _make_capture again with the
+            # new rate, reusing the WAV source we just configured.
+            self.change_sample_rate(file_sr)
+            warning = (f"Session sample rate changed to {file_sr} Hz to "
+                       f"match WAV file")
+        elif file_sr and file_sr != self.sample_rate:
+            warning = (f"WAV file sample rate ({file_sr} Hz) is not a "
+                       f"supported session rate — resampling is not "
+                       f"performed; timing will be off")
+            self.capture = probe
+        else:
+            self.capture = probe
+
+        if was_running and self.capture.valid:
+            self.capture.resume()
+            self.acq_running = True
+        return True, warning
 
     # ── Sample rate change ──────────────────────────────────────────────
 
@@ -318,8 +397,7 @@ class RecordingEntity:
         self.bpf   = BandpassFilter(sample_rate=new_rate)
         self.bpf_r = BandpassFilter(sample_rate=new_rate)
         need_ch = 2 if self.channel_mode != 'Mono' else 1
-        self.capture = AudioCapture(self.queue, device=self.device_id,
-                                    channels=need_ch, samplerate=new_rate)
+        self.capture = self._make_capture(channels=need_ch)
         self.rebuild_freq_mapping()
 
         if was_running and self.capture.valid:
@@ -683,6 +761,9 @@ class RecordingEntity:
             'display_mode':        self.display_mode,
             'analysis_nperseg':    self.analysis_nperseg,
             'analysis_window':     self.analysis_window,
+            'input_source':        self.input_source,
+            'wav_file_path':       self.wav_file_path,
+            'wav_loop':            self.wav_loop,
         }
 
     @classmethod
@@ -709,7 +790,8 @@ class RecordingEntity:
                      'output_dir', 'filename_prefix', 'filename_suffix',
                      'dph_folder_prefix', 'amp_ylim',
                      'spectral_trigger_mode', 'spectral_threshold',
-                     'display_mode'):
+                     'display_mode',
+                     'input_source', 'wav_file_path', 'wav_loop'):
             if attr in d:
                 setattr(e, attr, d[attr])
 
@@ -747,6 +829,14 @@ class RecordingEntity:
                 e.channel_mode = 'Mono'
         if need_ch == 2:
             e.change_device(device_id, 2)
+
+        # If the saved config used a WAV file, re-open it so the capture
+        # actually points at the file (the setattr loop only set the
+        # attributes; __init__ already created a live-device capture).
+        if e.input_source == 'wav_file' and e.wav_file_path:
+            ok, wav_warning = e.use_wav_file(e.wav_file_path, loop=e.wav_loop)
+            if not ok and wav_warning:
+                warning = f"{warning}; {wav_warning}" if warning else wav_warning
 
         e.rebuild_freq_mapping()
         return e, warning

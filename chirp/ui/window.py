@@ -1103,8 +1103,46 @@ class ChirpWindow(QMainWindow):
         dev_row2.addWidget(lbl_sr)
         dev_row2.addWidget(self._sr_combo)
         dev_row2.addStretch()
+
+        # Row 3 — WAV simulation controls. Visible only when this
+        # entity's input source is 'wav_file'.
+        self._wav_ctrl_row = QHBoxLayout()
+        self._wav_ctrl_row.setSpacing(6)
+        self._btn_wav_reset = QPushButton('\u23EE Reset')
+        self._btn_wav_reset.setObjectName('btn_small')
+        self._btn_wav_reset.setFixedHeight(22)
+        self._btn_wav_reset.setToolTip('Rewind the WAV playback to the start of the file')
+        self._btn_wav_reset.clicked.connect(self._on_wav_reset_clicked)
+        self._chk_wav_loop = QCheckBox('Loop')
+        self._chk_wav_loop.setToolTip('When on, the WAV file restarts from the beginning after it ends')
+        self._chk_wav_loop.setChecked(True)
+        self._chk_wav_loop.toggled.connect(self._on_wav_loop_toggled)
+        self._lbl_wav_time = QLabel('0:00 / 0:00')
+        self._lbl_wav_time.setStyleSheet(
+            f'color: {C["teal"]}; font-family: Consolas; font-size: 9pt;')
+        self._lbl_wav_time.setToolTip('Elapsed / total duration of the WAV file')
+        self._wav_ctrl_row.addWidget(self._btn_wav_reset)
+        self._wav_ctrl_row.addWidget(self._chk_wav_loop)
+        self._wav_ctrl_row.addSpacing(8)
+        self._wav_ctrl_row.addWidget(self._lbl_wav_time)
+        self._wav_ctrl_row.addStretch()
+
+        # Hold the row's widgets in a list so we can toggle visibility
+        # when the input source switches.
+        self._wav_ctrl_widgets = [
+            self._btn_wav_reset, self._chk_wav_loop, self._lbl_wav_time,
+        ]
+        # NB: don't reuse the name `w` here — it's the panel widget
+        # bound at the top of this method and the parent of `outer`.
+        # Shadowing it drops the only Python reference, Python GCs the
+        # QWidget, and Qt cascades the delete to `outer` → crash on
+        # the next `outer.addLayout` call.
+        for _w in self._wav_ctrl_widgets:
+            _w.setVisible(False)
+
         device_v.addLayout(dev_row1)
         device_v.addLayout(dev_row2)
+        device_v.addLayout(self._wav_ctrl_row)
 
         ref_box = QGroupBox('REFERENCE DATE')
         ref_g   = QGridLayout(ref_box)
@@ -1181,7 +1219,13 @@ class ChirpWindow(QMainWindow):
         self._date_line.editingFinished.connect(self._on_ref_date_text_changed)
         self._btn_pick_date.clicked.connect(self._on_pick_date)
         self._dph_prefix_edit.editingFinished.connect(self._on_dph_prefix_changed)
-        self._device_combo.currentIndexChanged.connect(self._on_device_changed)
+        # `activated` fires once per user selection (including re-click
+        # of the current item, unlike `currentIndexChanged`). Using only
+        # `activated` keeps the WAV-sim picker fireable on re-select and
+        # avoids the double-prompt that both signals firing caused.
+        # Programmatic combo updates are wrapped in `blockSignals`, so
+        # we don't need `currentIndexChanged` for those.
+        self._device_combo.activated.connect(self._on_device_changed)
         self._chan_combo.currentTextChanged.connect(self._on_channel_mode_changed)
         self._trig_combo.currentTextChanged.connect(self._on_trigger_mode_changed)
         self._sr_combo.currentIndexChanged.connect(self._on_sample_rate_changed)
@@ -1339,7 +1383,12 @@ class ChirpWindow(QMainWindow):
         e.dph_folder_prefix = self._dph_prefix_edit.text()
         e.channel_mode  = self._chan_combo.currentText()
         e.trigger_mode  = self._trig_combo.currentText()
-        e.device_id     = self._device_combo.currentData()
+        # Device_id should only track live-device selections. The
+        # WAV-sim sentinel leaves device_id alone (input_source /
+        # wav_file_path are managed by _handle_wav_sim_selection).
+        sel = self._device_combo.currentData()
+        if sel != self.WAV_SIM_SENTINEL:
+            e.device_id = sel
         e.spectral_trigger_mode = self._combo_detect_mode.currentText()
         e.spectral_threshold    = self._sb_entropy_thr.value()
         e.display_mode  = self._combo_display_mode.currentText()
@@ -1415,12 +1464,18 @@ class ChirpWindow(QMainWindow):
         self._chk_ref_date.blockSignals(False)
         self._dph_prefix_edit.setText(e.dph_folder_prefix)
 
-        # Device combo — find by device_id
+        # Device combo — WAV-sim sentinel when e uses a file, else
+        # match by live device_id.
         self._device_combo.blockSignals(True)
-        for i in range(self._device_combo.count()):
-            if self._device_combo.itemData(i) == e.device_id:
-                self._device_combo.setCurrentIndex(i)
-                break
+        # Always refresh the sentinel's label with the entity's WAV path.
+        self._device_combo.setItemText(0, self._wav_sim_label(e.wav_file_path))
+        if e.input_source == 'wav_file':
+            self._device_combo.setCurrentIndex(0)
+        else:
+            for i in range(self._device_combo.count()):
+                if self._device_combo.itemData(i) == e.device_id:
+                    self._device_combo.setCurrentIndex(i)
+                    break
         self._device_combo.blockSignals(False)
 
         self._chan_combo.blockSignals(True)
@@ -1460,6 +1515,9 @@ class ChirpWindow(QMainWindow):
 
         # Update threshold line
         self._sync_thr_line(e.threshold)
+
+        # Show/hide WAV transport row based on this entity's source.
+        self._refresh_wav_controls()
 
         # Display mode combo
         self._combo_display_mode.blockSignals(True)
@@ -2249,10 +2307,28 @@ class ChirpWindow(QMainWindow):
         except ValueError:
             return None
 
+    # Sentinel userData for the WAV-file-simulation virtual device entry.
+    WAV_SIM_SENTINEL = '__wav_sim__'
+
+    def _wav_sim_label(self, path: str | None) -> str:
+        if path:
+            return f'\u25B6 WAV sim: {os.path.basename(path)}'
+        return '\u25B6 <WAV file simulation...>'
+
     def _populate_device_combo(self, keep_current: bool = False):
         prev_name = self._device_combo.currentText() if keep_current else None
+        prev_data = self._device_combo.currentData() if keep_current else None
         self._device_combo.blockSignals(True)
         self._device_combo.clear()
+
+        # Virtual entry at the top for WAV-file simulation. Its label
+        # reflects the currently selected entity's WAV path (if any) so
+        # the user can see what file will play.
+        e = self._sel if hasattr(self, '_sel') else None
+        wav_path = e.wav_file_path if (e is not None) else None
+        self._device_combo.addItem(self._wav_sim_label(wav_path),
+                                   userData=self.WAV_SIM_SENTINEL)
+
         try:
             default_in = sd.default.device[0]
         except Exception:
@@ -2277,6 +2353,8 @@ class ChirpWindow(QMainWindow):
                 restore_idx = idx
             if i == default_in:
                 default_idx = idx
+        if keep_current and prev_data == self.WAV_SIM_SENTINEL:
+            restore_idx = 0
         self._device_combo.setCurrentIndex(restore_idx if keep_current else default_idx)
         self._device_combo.blockSignals(False)
 
@@ -2290,6 +2368,14 @@ class ChirpWindow(QMainWindow):
         device_id = self._device_combo.currentData()
         if device_id is None:
             return
+
+        # WAV-file simulation sentinel — prompt for a file and route
+        # input through WavFileCapture instead of a live device.
+        if device_id == self.WAV_SIM_SENTINEL:
+            self._handle_wav_sim_selection(e)
+            self._refresh_transport_ui()
+            return
+
         try:
             info = sd.query_devices(device_id)
             max_ch = info['max_input_channels']
@@ -2310,6 +2396,108 @@ class ChirpWindow(QMainWindow):
             QMessageBox.warning(self, 'Device Error',
                                 f'Could not open device:\n{self._device_combo.currentText()}')
         self._refresh_transport_ui()
+        self._refresh_wav_controls()
+
+    # ── WAV simulation transport ─────────────────────────────────────
+
+    @staticmethod
+    def _format_mmss(seconds: float) -> str:
+        if seconds < 0 or seconds != seconds:  # NaN guard
+            seconds = 0.0
+        total = int(seconds)
+        return f'{total // 60}:{total % 60:02d}'
+
+    def _refresh_wav_controls(self):
+        """Show/hide the WAV transport row based on the selected
+        entity's input source, and sync the loop checkbox.
+        """
+        from chirp.audio import WavFileCapture
+        e = self._sel
+        show = bool(e) and e.input_source == 'wav_file' \
+               and isinstance(e.capture, WavFileCapture)
+        for w in self._wav_ctrl_widgets:
+            w.setVisible(show)
+        if show:
+            self._chk_wav_loop.blockSignals(True)
+            self._chk_wav_loop.setChecked(bool(e.wav_loop))
+            self._chk_wav_loop.blockSignals(False)
+            self._update_wav_time_label()
+        else:
+            self._lbl_wav_time.setText('0:00 / 0:00')
+
+    def _update_wav_time_label(self):
+        """Refresh the ``passed / total`` label from the live capture."""
+        from chirp.audio import WavFileCapture
+        e = self._sel
+        if not e or not isinstance(e.capture, WavFileCapture):
+            return
+        cap = e.capture
+        passed = self._format_mmss(cap.position_sec)
+        total  = self._format_mmss(cap.duration_sec)
+        self._lbl_wav_time.setText(f'{passed} / {total}')
+
+    def _on_wav_reset_clicked(self):
+        from chirp.audio import WavFileCapture
+        e = self._sel
+        if not e or not isinstance(e.capture, WavFileCapture):
+            return
+        e.capture.reset_position()
+        # Clear the display ring so the rewind isn't visually confusing.
+        e.reset_display()
+        self._update_wav_time_label()
+
+    def _on_wav_loop_toggled(self, checked: bool):
+        from chirp.audio import WavFileCapture
+        e = self._sel
+        if not e:
+            return
+        e.wav_loop = bool(checked)
+        if isinstance(e.capture, WavFileCapture):
+            e.capture.set_loop(checked)
+
+    def _handle_wav_sim_selection(self, e: RecordingEntity):
+        """Prompt for a WAV file and switch ``e`` to WAV-simulation mode.
+
+        If the user cancels the dialog, revert the combo to whatever
+        live device was previously active. On success, display the
+        chosen filename on the combo entry.
+        """
+        start_dir = os.path.dirname(e.wav_file_path) if e.wav_file_path else ''
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Pick a WAV file to simulate input',
+            start_dir, 'WAV files (*.wav)')
+        if not path:
+            # User cancelled — revert selection to current device/source.
+            self._device_combo.blockSignals(True)
+            target = e.device_id if e.input_source == 'device' else None
+            for i in range(self._device_combo.count()):
+                if self._device_combo.itemData(i) == target:
+                    self._device_combo.setCurrentIndex(i)
+                    break
+            self._device_combo.blockSignals(False)
+            return
+
+        ok, warning = e.use_wav_file(path, loop=e.wav_loop)
+        if not ok:
+            QMessageBox.warning(self, 'WAV File Error',
+                                f'Could not open WAV file:\n{path}')
+            return
+
+        # Update the sentinel label to show the chosen filename.
+        self._device_combo.blockSignals(True)
+        self._device_combo.setItemText(0, self._wav_sim_label(path))
+        self._device_combo.setCurrentIndex(0)
+        self._device_combo.blockSignals(False)
+
+        # If the session SR changed to match the file, sync the combo.
+        self._sr_combo.blockSignals(True)
+        self._sr_combo.setCurrentText(f'{e.sample_rate} Hz')
+        self._sr_combo.blockSignals(False)
+
+        self._refresh_wav_controls()
+
+        if warning:
+            QMessageBox.information(self, 'WAV File Simulation', warning)
 
     # ──────────────────────────────────────────────────────────────────────
     # Channel mode
@@ -2326,7 +2514,8 @@ class ChirpWindow(QMainWindow):
 
         need_ch = 2 if is_stereo_input else 1
         device_id = self._device_combo.currentData()
-        if device_id is not None:
+        is_wav_sim = (device_id == self.WAV_SIM_SENTINEL)
+        if device_id is not None and not is_wav_sim:
             try:
                 info = sd.query_devices(device_id)
                 if info['max_input_channels'] < 2 and need_ch == 2:
@@ -2344,7 +2533,12 @@ class ChirpWindow(QMainWindow):
         if want_stereo != self._is_stereo_layout:
             self._setup_axes(stereo=want_stereo)
 
-        e.change_device(device_id, need_ch)
+        if is_wav_sim:
+            # Re-open the WAV with the new channel count.
+            if e.wav_file_path:
+                e.use_wav_file(e.wav_file_path, loop=e.wav_loop)
+        else:
+            e.change_device(device_id, need_ch)
         if not want_stereo:
             e.amp_buffer_r[:] = 0.0
             e.spec_buffer_r[:] = SPEC_DB_MIN
@@ -2746,6 +2940,10 @@ class ChirpWindow(QMainWindow):
         if self._view_mode:
             self._update_plot_view_mode()
             return
+
+        # Refresh the WAV transport time label for the selected entity
+        # on every plot tick (50 ms) so "passed / total" stays live.
+        self._update_wav_time_label()
 
         # 3. Update main display for selected entity (blitting)
         e = self._sel

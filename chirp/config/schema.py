@@ -56,6 +56,7 @@ _KNOWN_RECORDING_KEYS: frozenset[str] = frozenset({
     "spectral_trigger_mode", "spectral_threshold",
     "display_mode",
     "analysis_nperseg", "analysis_window",
+    "input_source", "wav_file_path", "wav_loop",
 })
 
 _KNOWN_VIEW_MODE_KEYS: frozenset[str] = frozenset({
