@@ -343,3 +343,45 @@ def test_entity_detect_buffer_clears_after_full_cycle(captured_flushes):
         assert not e.detect_mask_buffer.any()
     finally:
         e.close()
+
+
+def test_entity_detect_buffer_respects_bandpass_filter(captured_flushes):
+    """When the bandpass filter is enabled, the detect-strip mask must
+    be computed from the *filtered* signal, not the raw input. A loud
+    out-of-band tone should NOT light up the detect strip.
+
+    Pins the regression where the strip used `record` (raw) and lit
+    up on tones the filter was supposed to suppress, making it look
+    like the trigger was ignoring the bandpass.
+    """
+    e = _make_entity()
+    e.freq_filter_enabled = True
+    # Pass-band well away from the out-of-band tone we'll feed in.
+    e.freq_lo = 5000.0
+    e.freq_hi = 10000.0
+    try:
+        sr = e.sample_rate
+        # 500 Hz tone, 0.9 amplitude — well below the 5 kHz high-pass.
+        # Raw peak is 0.9 (> threshold 0.5). Filtered peak → ~0.
+        t = np.arange(CHUNK_FRAMES, dtype=np.float32) / sr
+        out_of_band = (0.9 * np.sin(2 * np.pi * 500.0 * t)).astype(np.float32)
+        # Warm up the IIR state a little so the first chunk's transient
+        # isn't what we measure — feed one chunk of the same signal
+        # first, then assert on a fresh chunk.
+        e.ingest_chunk(out_of_band)
+        e.ingest_chunk(out_of_band)
+        # After warm-up the filter output is ≪ 0.5 — no crossings.
+        # Check the second chunk's ring region specifically.
+        region = e.detect_mask_buffer[CHUNK_FRAMES:2 * CHUNK_FRAMES]
+        assert not region.any(), (
+            f'out-of-band tone lit up detect strip '
+            f'({int(region.sum())} samples) — filter not honored')
+
+        # Sanity: an IN-band tone of the same amplitude DOES light up.
+        in_band = (0.9 * np.sin(2 * np.pi * 7000.0 * t)).astype(np.float32)
+        e.ingest_chunk(in_band)
+        e.ingest_chunk(in_band)
+        region = e.detect_mask_buffer[3 * CHUNK_FRAMES:4 * CHUNK_FRAMES]
+        assert region.any(), 'in-band tone failed to light up detect strip'
+    finally:
+        e.close()

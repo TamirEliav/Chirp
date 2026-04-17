@@ -716,16 +716,33 @@ class RecordingEntity:
                 self.abs_amp_buffer[self.write_head:] = abs_l[:split]
                 self.abs_amp_buffer[:wrap]            = abs_l[split:]
 
-        # #32: per-sample threshold-crossing mask for the detect strip.
-        # Computed on the (possibly filtered) record signal the trigger
-        # sees. For stereo, take the max across channels so either
-        # channel's crossing lights up the indicator. This is
-        # pre-gating: the spectral / min_cross rules don't factor in,
-        # so the user can see raw crossings while tuning the threshold.
-        if record.ndim == 2:
-            sample_detect = np.max(np.abs(record), axis=1) >= self.threshold
+        # #32: per-sample amplitude-threshold crossing mask for the
+        # detect strip. Must use the *filtered* signal (when the
+        # bandpass is enabled) combined per-sample under the active
+        # `trigger_mode` rule, so the strip exactly mirrors the
+        # chunk-level trigger decision (`amp_above`). Previously used
+        # the raw `record` signal — the strip would light up on
+        # out-of-band energy the filter was suppressing, making it
+        # look like the trigger ignored the bandpass. Spectral /
+        # min_cross gating is still pre-stripped (pre-gating) so the
+        # user can see raw amplitude crossings while tuning.
+        if mode == 'Stereo':
+            abs_fl = np.abs(filt_l)
+            abs_fr = np.abs(filt_r)
+            tm = self.trigger_mode
+            if tm == 'Left Channel':
+                filt_combined_abs = abs_fl
+            elif tm == 'Right Channel':
+                filt_combined_abs = abs_fr
+            elif tm == 'Any Channel':
+                filt_combined_abs = np.maximum(abs_fl, abs_fr)
+            elif tm == 'Both Channels':
+                filt_combined_abs = np.minimum(abs_fl, abs_fr)
+            else:  # Average
+                filt_combined_abs = (abs_fl + abs_fr) * 0.5
         else:
-            sample_detect = np.abs(record) >= self.threshold
+            filt_combined_abs = np.abs(filt)
+        sample_detect = filt_combined_abs >= self.threshold
 
         # Write detect-mask ring buffer for the chunk just arrived
         # (wrap-aware, mirroring the amp-buffer path above).
