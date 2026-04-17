@@ -126,6 +126,39 @@ def test_saturation_true_on_unfiltered_clip():
     assert e.saturated is True
 
 
+# ── #28: sticky saturation flag ──────────────────────────────────────────
+
+def test_saturation_ever_latches_and_survives_clean_chunk():
+    """``saturated_ever`` latches on the first clipped chunk and stays
+    True even after subsequent clean chunks — unlike the transient
+    ``saturated`` flag which clears as soon as fresh audio arrives."""
+    e = _entity()
+    # Initially clean.
+    assert e.saturated is False
+    assert e.saturated_ever is False
+    # Clip once.
+    e.ingest_chunk(np.full(1024, 0.999, dtype=np.float32))
+    assert e.saturated is True
+    assert e.saturated_ever is True
+    # Clean chunk: transient clears, sticky survives.
+    e.ingest_chunk(np.zeros(1024, dtype=np.float32))
+    assert e.saturated is False
+    assert e.saturated_ever is True
+
+
+def test_clear_saturation_flag_resets_sticky_only():
+    """``clear_saturation_flag()`` resets ``saturated_ever`` but the
+    transient ``saturated`` flag re-lights on the next clipped chunk."""
+    e = _entity()
+    e.ingest_chunk(np.full(1024, 0.999, dtype=np.float32))
+    assert e.saturated_ever is True
+    e.clear_saturation_flag()
+    assert e.saturated_ever is False
+    # Another clip → sticky comes right back.
+    e.ingest_chunk(np.full(1024, 0.999, dtype=np.float32))
+    assert e.saturated_ever is True
+
+
 # ── #12 / c19: decoupled display vs analysis FFT ────────────────────────────
 
 def test_analysis_accumulator_shared_when_params_match():

@@ -62,6 +62,10 @@ class WavFileCapture:
         self._pause_evt.set()  # start paused; resume() starts playback
         self._thread: threading.Thread | None = None
         self.drop_count = 0
+        # #29: persistent session-wide drop stats — see AudioCapture
+        # for the rationale. Sidebar uses these for the sticky badge.
+        self.drop_count_total = 0
+        self.has_ever_dropped = False
         # #7: optional monitor loopback — see AudioCapture.set_monitor.
         self._monitor = None
         self._monitor_source_id = None
@@ -127,6 +131,12 @@ class WavFileCapture:
         n = self.drop_count
         self.drop_count = 0
         return n
+
+    def reset_drop_stats(self) -> None:
+        """Mirror of AudioCapture.reset_drop_stats (#29)."""
+        self.drop_count = 0
+        self.drop_count_total = 0
+        self.has_ever_dropped = False
 
     def resume(self) -> None:
         if self._samples is None:
@@ -232,6 +242,8 @@ class WavFileCapture:
                     self._queue.put_nowait(emit.copy())
                 except queue.Full:
                     self.drop_count += 1
+                    self.drop_count_total += 1
+                    self.has_ever_dropped = True
 
                 if not self._loop and next_pos >= total:
                     self._pos = total

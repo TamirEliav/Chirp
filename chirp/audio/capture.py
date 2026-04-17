@@ -25,6 +25,13 @@ class AudioCapture:
         # each plot tick to surface a drop-indicator badge in the
         # sidebar so silent loss is no longer invisible.
         self.drop_count = 0
+        # #29: session-wide persistent stats. `drop_count_total` only
+        # increases; `has_ever_dropped` latches True on the first drop
+        # and can only be cleared by `reset_drop_stats()`. The sidebar
+        # uses these to keep a sticky "drops happened at some point"
+        # badge visible until the user explicitly clears it.
+        self.drop_count_total = 0
+        self.has_ever_dropped = False
         # #7: optional monitor loopback. When wired by the owning
         # RecordingEntity, the callback also forwards raw samples to
         # the shared AudioMonitor — the monitor itself gates on
@@ -70,15 +77,29 @@ class AudioCapture:
                 self._queue.put_nowait(indata[:, :2].copy())
         except queue.Full:
             self.drop_count += 1
+            self.drop_count_total += 1
+            self.has_ever_dropped = True
 
     def consume_drop_count(self) -> int:
         """Return the drop count and reset it to zero. Intended to be
         polled once per UI tick — the sidebar latches a transient
         drop indicator whenever this returns > 0.
+
+        Does NOT touch ``drop_count_total`` / ``has_ever_dropped`` —
+        those are the sticky session stats, cleared only by
+        ``reset_drop_stats()``.
         """
         n = self.drop_count
         self.drop_count = 0
         return n
+
+    def reset_drop_stats(self) -> None:
+        """Clear both the transient and persistent drop stats (#29).
+        Triggered by the user clicking the sticky drop badge.
+        """
+        self.drop_count = 0
+        self.drop_count_total = 0
+        self.has_ever_dropped = False
 
     def resume(self):
         if self._stream is not None:

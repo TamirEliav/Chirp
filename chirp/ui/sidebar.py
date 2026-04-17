@@ -6,6 +6,12 @@ RecordingSidebarItem (single row), and RecordingSidebar (the list).
 
 c15 (#13) added a drop-indicator badge that flashes orange when the
 capture callback drops chunks on queue.Full.
+
+#28 / #29 add two *sticky* badges next to the transient one:
+  * "S" — sticky saturation flag (red once the stream ever clipped).
+  * "D" — sticky persistent drops flag (red once any chunks were ever
+    dropped, tooltip shows cumulative count).
+Both clear on click.
 """
 
 import numpy as np
@@ -78,6 +84,9 @@ class RecordingSidebarItem(QWidget):
     move_down = pyqtSignal(int)
     delete   = pyqtSignal(int)
     renamed  = pyqtSignal(int, str)
+    # #28 / #29: click-to-clear sticky session flags.
+    clear_sat_requested   = pyqtSignal(int)
+    clear_drops_requested = pyqtSignal(int)
 
     def __init__(self, index: int, name: str, parent=None):
         super().__init__(parent)
@@ -113,6 +122,14 @@ class RecordingSidebarItem(QWidget):
         # after the last drop so brief stalls remain visible.
         self._lbl_drop = QLabel('!')
         self._drop_ttl = 0
+        # #28 / #29: sticky "happened at least once since last reset"
+        # session flags. Click either to clear. Cached state so we
+        # only touch the stylesheet when something actually changes.
+        self._lbl_sat = QLabel('S')
+        self._lbl_drop_sticky = QLabel('D')
+        self._sat_lit    = False
+        self._drop_sticky_lit = False
+        self._drop_sticky_total = 0
         self._lbl_acq .setToolTip('Acquisition status (live monitoring)')
         self._lbl_rec .setToolTip('Recording status (threshold-triggered WAV saving enabled)')
         self._lbl_trig.setToolTip('Trigger status (currently writing to a WAV file)')
@@ -121,15 +138,28 @@ class RecordingSidebarItem(QWidget):
             'the UI/processing loop cannot keep up with the capture '
             'callback. Reduce the number of streams or lower the '
             'sample rate.')
+        self._lbl_sat.setToolTip(
+            'Saturation has not been detected on this stream.')
+        self._lbl_drop_sticky.setToolTip(
+            'No dropped chunks recorded for this stream.')
         for lbl in (self._lbl_acq, self._lbl_rec, self._lbl_trig):
             lbl.setFixedWidth(12)
             lbl.setStyleSheet(f'color: {C["surface2"]}; font-size: 8pt;')
         self._lbl_drop.setFixedWidth(12)
         self._lbl_drop.setStyleSheet(f'color: {C["surface2"]}; font-weight: bold; font-size: 9pt;')
+        for lbl in (self._lbl_sat, self._lbl_drop_sticky):
+            lbl.setFixedWidth(14)
+            lbl.setStyleSheet(
+                f'color: {C["surface2"]}; font-weight: bold; font-size: 9pt;')
+            lbl.setCursor(Qt.PointingHandCursor)
 
         row1.addWidget(self._name_label)
         row1.addWidget(self._name_edit)
         row1.addStretch()
+        # Order: sticky flags (session-wide) first, then transient
+        # drop flash, then live status dots.
+        row1.addWidget(self._lbl_sat)
+        row1.addWidget(self._lbl_drop_sticky)
         row1.addWidget(self._lbl_drop)
         row1.addWidget(self._lbl_acq)
         row1.addWidget(self._lbl_rec)
@@ -215,12 +245,60 @@ class RecordingSidebarItem(QWidget):
         self._lbl_drop.setStyleSheet(
             f'color: {color}; font-weight: bold; font-size: 9pt;')
 
+    def update_saturation_sticky(self, ever: bool):
+        """#28: update the sticky saturation badge. Called each UI tick."""
+        ever = bool(ever)
+        if ever == self._sat_lit:
+            return
+        self._sat_lit = ever
+        color = C['red'] if ever else C['surface2']
+        self._lbl_sat.setStyleSheet(
+            f'color: {color}; font-weight: bold; font-size: 9pt;')
+        self._lbl_sat.setToolTip(
+            'Saturation detected at some point during this session — '
+            'click to clear.'
+            if ever else
+            'Saturation has not been detected on this stream.')
+
+    def update_drop_sticky(self, has_ever: bool, total: int):
+        """#29: update the sticky persistent-drops badge. Called each
+        UI tick with the capture's ``has_ever_dropped`` flag and the
+        cumulative count (tooltip).
+        """
+        has_ever = bool(has_ever)
+        total = int(total)
+        # Always refresh the tooltip if the count moved while lit —
+        # but skip the stylesheet write if nothing visual changed.
+        if has_ever == self._drop_sticky_lit and total == self._drop_sticky_total:
+            return
+        self._drop_sticky_lit = has_ever
+        self._drop_sticky_total = total
+        color = C['red'] if has_ever else C['surface2']
+        self._lbl_drop_sticky.setStyleSheet(
+            f'color: {color}; font-weight: bold; font-size: 9pt;')
+        self._lbl_drop_sticky.setToolTip(
+            f'Dropped {total} chunk{"s" if total != 1 else ""} total '
+            f'since last reset — click to clear.'
+            if has_ever else
+            'No dropped chunks recorded for this stream.')
+
     def mouseDoubleClickEvent(self, event):
         self._start_edit()
 
     def mousePressEvent(self, event):
-        if not self._editing:
-            self.clicked.emit(self._index)
+        if self._editing:
+            return
+        # Click-to-clear on the sticky badges — must come before the
+        # usual clicked.emit(index) so a badge click doesn't also
+        # change selection.
+        child = self.childAt(event.pos())
+        if child is self._lbl_sat and self._sat_lit:
+            self.clear_sat_requested.emit(self._index)
+            return
+        if child is self._lbl_drop_sticky and self._drop_sticky_lit:
+            self.clear_drops_requested.emit(self._index)
+            return
+        self.clicked.emit(self._index)
 
     def _start_edit(self):
         self._editing = True
@@ -256,6 +334,9 @@ class RecordingSidebar(QWidget):
     stop_all_acq      = pyqtSignal()
     start_all_rec     = pyqtSignal()
     stop_all_rec      = pyqtSignal()
+    # #28 / #29: click-to-clear sticky session flags.
+    clear_sat_requested   = pyqtSignal(int)
+    clear_drops_requested = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -327,6 +408,8 @@ class RecordingSidebar(QWidget):
         item.move_down.connect(lambda i: self.move_requested.emit(i, 1))
         item.delete.connect(self.delete_requested.emit)
         item.renamed.connect(self.item_renamed.emit)
+        item.clear_sat_requested.connect(self.clear_sat_requested.emit)
+        item.clear_drops_requested.connect(self.clear_drops_requested.emit)
         self._scroll_layout.insertWidget(idx, item)
         self._items.append(item)
         return idx
@@ -367,6 +450,16 @@ class RecordingSidebar(QWidget):
     def update_item_drops(self, idx: int, n_drops: int):
         if 0 <= idx < len(self._items):
             self._items[idx].notify_drops(n_drops)
+
+    def update_item_saturation_sticky(self, idx: int, ever: bool):
+        """#28: update the sticky saturation badge for one item."""
+        if 0 <= idx < len(self._items):
+            self._items[idx].update_saturation_sticky(ever)
+
+    def update_item_drop_sticky(self, idx: int, has_ever: bool, total: int):
+        """#29: update the sticky persistent-drops badge for one item."""
+        if 0 <= idx < len(self._items):
+            self._items[idx].update_drop_sticky(has_ever, total)
 
     def update_item_name(self, idx: int, name: str):
         if 0 <= idx < len(self._items):
