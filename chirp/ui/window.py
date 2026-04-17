@@ -200,6 +200,9 @@ class ChirpWindow(QMainWindow):
                 ratios.append(1)
         rows_list.append('amp')
         ratios.append(1)
+        # #32: thin detect/record indicator strip under the amp axis.
+        rows_list.append('events')
+        ratios.append(0.25)
         if show_entropy:
             rows_list.append('entropy')
             ratios.append(1)
@@ -220,6 +223,7 @@ class ChirpWindow(QMainWindow):
         self._ax_wave    = axes_map.get('wave', None)
         self._ax_wave_r  = axes_map.get('wave_r', None)
         self._ax_amp     = axes_map['amp']
+        self._ax_events  = axes_map.get('events', None)
         self._ax_entropy = axes_map.get('entropy', None)
 
         self._fig.subplots_adjust(top=0.97, bottom=0.06, left=0.07, right=0.99)
@@ -341,6 +345,42 @@ class ChirpWindow(QMainWindow):
         )
         self._cursor_amp = self._ax_amp.axvline(x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
 
+        # -- #32: detect / record indicator strip --
+        if self._ax_events is not None:
+            # Amp no longer the bottom of its group — hide its x labels.
+            self._ax_amp.tick_params(axis='x', labelbottom=False)
+            # 2-row RGBA image: row 0 = detect (yellow), row 1 = record (green).
+            # Initial image is fully opaque at axis facecolor — see
+            # _build_events_rgba for rationale (opaque avoids blit ghosting).
+            rgba0 = np.empty((2, max(1, n_cols), 4), dtype=np.float32)
+            rgba0[..., 0] = 0x18 / 255.0
+            rgba0[..., 1] = 0x18 / 255.0
+            rgba0[..., 2] = 0x25 / 255.0
+            rgba0[..., 3] = 1.0
+            self._events_im = self._ax_events.imshow(
+                rgba0, aspect='auto', origin='upper',
+                extent=[0.0, disp_secs, 0, 2],
+                interpolation='nearest',
+            )
+            self._ax_events.set_xlim(0.0, disp_secs)
+            self._ax_events.set_ylim(0, 2)
+            self._ax_events.set_yticks([0.5, 1.5])
+            self._ax_events.set_yticklabels(['rec', 'det'], fontsize=7)
+            self._ax_events.tick_params(axis='y', length=0, pad=2)
+            self._cursor_events = self._ax_events.axvline(
+                x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
+            # The events strip takes the x-label when it's the last row
+            # (no entropy axis below it). Otherwise entropy gets it.
+            self._ax_amp.set_xlabel('')
+            if self._ax_entropy is None:
+                self._ax_events.set_xlabel('Time (s)')
+            else:
+                self._ax_events.set_xlabel('')
+                self._ax_events.tick_params(axis='x', labelbottom=False)
+        else:
+            self._events_im = None
+            self._cursor_events = None
+
         # -- Entropy axes --
         if self._ax_entropy is not None:
             ent_n_cols = e._n_cols if e else n_cols
@@ -400,6 +440,8 @@ class ChirpWindow(QMainWindow):
         if self._entropy_line is not None:
             arts.extend([self._entropy_line, self._cursor_entropy,
                          self._entropy_thr_line, self._entropy_thr_label])
+        if getattr(self, '_events_im', None) is not None:
+            arts.extend([self._events_im, self._cursor_events])
         return arts
 
     @staticmethod
@@ -477,6 +519,52 @@ class ChirpWindow(QMainWindow):
         if 0 <= self._selected_idx < len(self._entities):
             return self._entities[self._selected_idx]
         return None
+
+    # ──────────────────────────────────────────────────────────────────────
+    # #32: events strip helpers
+    # ──────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _build_events_rgba(e: 'RecordingEntity') -> np.ndarray | None:
+        """Build a 2-row RGBA array (det, rec) for the events imshow.
+
+        Downsamples the per-sample mask buffers to one column per
+        CHUNK_FRAMES block so the image width matches ``e._n_cols``
+        (and therefore aligns with the spectrogram/entropy grid).
+
+        "Off" cells are painted with the axis face colour (Catppuccin
+        mantle) at full opacity — NOT transparent — so that matplotlib
+        blitting always fully overwrites previous frame content. A
+        previous implementation used alpha=0 for "off" cells, which
+        left ghost bars on screen after the ring buffer cycled because
+        transparent pixels don't erase what the renderer painted on
+        earlier frames.
+        """
+        n_cols = e._n_cols
+        total = e._total_samples
+        if total <= 0 or n_cols <= 0:
+            return None
+        det = e.detect_mask_buffer[:n_cols * CHUNK_FRAMES].reshape(
+            n_cols, CHUNK_FRAMES).any(axis=1)
+        rec = e.record_mask_buffer[:n_cols * CHUNK_FRAMES].reshape(
+            n_cols, CHUNK_FRAMES).any(axis=1)
+        # Axis face colour = Catppuccin mantle (#181825) — keep in sync
+        # with the rcParam set in __init__.
+        bg_r, bg_g, bg_b = 0x18 / 255.0, 0x18 / 255.0, 0x25 / 255.0
+        rgba = np.empty((2, n_cols, 4), dtype=np.float32)
+        rgba[..., 0] = bg_r
+        rgba[..., 1] = bg_g
+        rgba[..., 2] = bg_b
+        rgba[..., 3] = 1.0  # fully opaque everywhere
+        # Row 0 = detect (top): Catppuccin yellow where True.
+        rgba[0, det, 0] = 0.976  # 0xF9
+        rgba[0, det, 1] = 0.886  # 0xE2
+        rgba[0, det, 2] = 0.686  # 0xAF
+        # Row 1 = record (bottom): Catppuccin green where True.
+        rgba[1, rec, 0] = 0.651  # 0xA6
+        rgba[1, rec, 1] = 0.890  # 0xE3
+        rgba[1, rec, 2] = 0.631  # 0xA1
+        return rgba
 
     # ──────────────────────────────────────────────────────────────────────
     # Qt layout
@@ -3231,6 +3319,13 @@ class ChirpWindow(QMainWindow):
                 self._entropy_thr_line.set_ydata([e.spectral_threshold, e.spectral_threshold])
                 self._entropy_thr_label.set_y(e.spectral_threshold + 0.03)
                 self._entropy_thr_label.set_text(f'ent = {e.spectral_threshold:.3f}')
+
+            # #32: detect / record events strip
+            if self._events_im is not None:
+                rgba = self._build_events_rgba(e)
+                if rgba is not None:
+                    self._events_im.set_data(rgba)
+                self._cursor_events.set_xdata([cursor_x, cursor_x])
 
             self._canvas.restore_region(self._bg)
             for a in self._get_config_artists():

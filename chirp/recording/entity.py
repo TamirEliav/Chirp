@@ -140,6 +140,15 @@ class RecordingEntity:
         self.spec_buffer_r = np.full(
             (self.n_freq_bins, self._n_cols), SPEC_DB_MIN, dtype=np.float32)
         self.entropy_buffer = np.ones(self._n_cols, dtype=np.float32)
+        # #32: per-sample indicator buffers. ``detect_mask_buffer`` is the
+        # raw threshold mask (regardless of min_cross / hold gating) so
+        # the display can show where the signal crossed the threshold at
+        # all; ``record_mask_buffer`` is True wherever a sample was (or
+        # will be) written to a saved WAV — including pre-trigger history
+        # retroactively marked when an event opens, and the post-trigger
+        # tail as it fills.
+        self.detect_mask_buffer = np.zeros(self._total_samples, dtype=bool)
+        self.record_mask_buffer = np.zeros(self._total_samples, dtype=bool)
         # Single cumulative sample counter — both ring-buffer cursors
         # are derived from it so they cannot drift apart when chunk
         # size differs from CHUNK_FRAMES (#20 / c14).
@@ -173,6 +182,8 @@ class RecordingEntity:
         self.spec_buffer[:]   = SPEC_DB_MIN
         self.spec_buffer_r[:] = SPEC_DB_MIN
         self.entropy_buffer[:] = 1.0
+        self.detect_mask_buffer[:] = False
+        self.record_mask_buffer[:] = False
         self._samples_total = 0
         self.write_head = 0
         self.col_head   = 0
@@ -418,6 +429,8 @@ class RecordingEntity:
         self.spec_buffer_r = np.full(
             (self.n_freq_bins, self._n_cols), SPEC_DB_MIN, dtype=np.float32)
         self.entropy_buffer = np.ones(self._n_cols, dtype=np.float32)
+        self.detect_mask_buffer = np.zeros(self._total_samples, dtype=bool)
+        self.record_mask_buffer = np.zeros(self._total_samples, dtype=bool)
         self._samples_total = 0
         self.write_head = 0
         self.col_head   = 0
@@ -452,6 +465,8 @@ class RecordingEntity:
         self.spec_buffer_r = np.full(
             (self.n_freq_bins, self._n_cols), SPEC_DB_MIN, dtype=np.float32)
         self.entropy_buffer = np.ones(self._n_cols, dtype=np.float32)
+        self.detect_mask_buffer = np.zeros(self._total_samples, dtype=bool)
+        self.record_mask_buffer = np.zeros(self._total_samples, dtype=bool)
         self._samples_total = 0
         self.write_head = 0
         self.col_head   = 0
@@ -701,6 +716,27 @@ class RecordingEntity:
                 self.abs_amp_buffer[self.write_head:] = abs_l[:split]
                 self.abs_amp_buffer[:wrap]            = abs_l[split:]
 
+        # #32: per-sample threshold-crossing mask for the detect strip.
+        # Computed on the (possibly filtered) record signal the trigger
+        # sees. For stereo, take the max across channels so either
+        # channel's crossing lights up the indicator. This is
+        # pre-gating: the spectral / min_cross rules don't factor in,
+        # so the user can see raw crossings while tuning the threshold.
+        if record.ndim == 2:
+            sample_detect = np.max(np.abs(record), axis=1) >= self.threshold
+        else:
+            sample_detect = np.abs(record) >= self.threshold
+
+        # Write detect-mask ring buffer for the chunk just arrived
+        # (wrap-aware, mirroring the amp-buffer path above).
+        if end <= self._total_samples:
+            self.detect_mask_buffer[self.write_head:end] = sample_detect
+        else:
+            split = self._total_samples - self.write_head
+            wrap  = end % self._total_samples
+            self.detect_mask_buffer[self.write_head:]   = sample_detect[:split]
+            self.detect_mask_buffer[:wrap]              = sample_detect[split:]
+
         # Single source of truth: advance the cumulative sample clock,
         # then re-derive both ring-buffer cursors. This guarantees they
         # stay coherent regardless of `n` (#20 / c14) and gives readers
@@ -715,7 +751,7 @@ class RecordingEntity:
             days = (datetime.date.today() - self.ref_date).days
             out_dir = os.path.join(out_dir, f'{self.dph_folder_prefix}{days}')
 
-        self.recorder.process_chunk(
+        report = self.recorder.process_chunk(
             record,
             trigger_peak  = trigger_peak,
             threshold     = self.threshold,
@@ -731,7 +767,75 @@ class RecordingEntity:
             sample_rate   = self.sample_rate,
             should_trigger = should_trigger,
             filename_stream = self.name,
+            global_chunk_end = self._samples_total,
         )
+
+        # #32: paint the record_mask indicator buffer from the recorder's
+        # span report. detect_mask_buffer was already painted above from
+        # the raw per-sample threshold crossings.
+        self._paint_record_buffer(report, n)
+
+    # ── #32: indicator buffer painting ───────────────────────────────────
+
+    def _paint_record_buffer(self, report: dict, n: int) -> None:
+        """Paint ``record_mask_buffer`` from the recorder's span report.
+
+        The chunk just ingested covers global samples
+        ``[global_end - n, global_end)`` — which maps to ring positions
+        ``[prev_write_head, prev_write_head + n)`` (wrapping).
+
+        ``record_mask_buffer`` is *cleared* for the chunk's range first
+        (so stale True values from a previous pass over this ring
+        region don't persist), then ORed with True for every span in
+        ``active_spans`` + ``flushed_spans`` that overlaps the
+        currently-visible ring window. This is what retroactively
+        lights up the pre-trigger samples at the moment an event opens:
+        their global range falls inside the ring window and the OR-in
+        hits past ring positions.
+        """
+        if report is None:
+            return
+
+        total = self._total_samples
+        g_end = self._samples_total
+        g_begin_chunk = g_end - n
+        ring_start = g_begin_chunk % total
+
+        # Clear the just-written chunk's range first.
+        end = ring_start + n
+        if end <= total:
+            self.record_mask_buffer[ring_start:end] = False
+        else:
+            self.record_mask_buffer[ring_start:] = False
+            self.record_mask_buffer[:end - total] = False
+
+        spans = list(report.get('active_spans') or [])
+        spans.extend(report.get('flushed_spans') or [])
+        if not spans:
+            return
+
+        # Visible ring window in global-sample coords.
+        ring_window_start = g_end - total
+        for g_lo, g_hi in spans:
+            lo = max(int(g_lo), ring_window_start)
+            hi = min(int(g_hi), g_end)
+            if hi <= lo:
+                continue
+            self._or_range(self.record_mask_buffer, lo, hi, total)
+
+    @staticmethod
+    def _or_range(buf: np.ndarray, g_lo: int, g_hi: int, total: int) -> None:
+        """OR True into a circular buffer over global sample range
+        ``[g_lo, g_hi)``. Caller guarantees the range fits in the ring.
+        """
+        b0 = g_lo % total
+        length = g_hi - g_lo
+        end = b0 + length
+        if end <= total:
+            buf[b0:end] = True
+        else:
+            buf[b0:] = True
+            buf[:end - total] = True
 
     # ── Mini amplitude for sidebar ────────────────────────────────────────
 

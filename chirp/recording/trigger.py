@@ -88,12 +88,29 @@ class ThresholdRecorder:
                       sample_rate: int = SAMPLE_RATE,
                       should_trigger: bool | None = None,
                       trigger_mask: np.ndarray | None = None,
-                      filename_stream: str = ''):
+                      filename_stream: str = '',
+                      global_chunk_end: int | None = None) -> dict:
         """Drive the state machine with one audio chunk.
 
         See module docstring for the mask-input model.
+
+        Returns a report dict used by the entity to paint detect/record
+        indicator strips (#32):
+          * ``detect_mask`` — per-sample bool array (raw threshold mask
+            after masking rules, length = ``len(chunk)``).
+          * ``active_spans`` — list of ``(g_start, g_end)`` in absolute
+            global-sample coordinates for every event still open after
+            this chunk. ``g_end`` is clipped to ``global_chunk_end``.
+          * ``flushed_spans`` — list of ``(g_start, g_end)`` for events
+            finalised during this chunk (disable-flush, post-trigger
+            tail complete, or force-split on ``max_rec``).
+
+        When ``global_chunk_end`` is None (legacy callers), the spans
+        lists are always empty but ``detect_mask`` is still populated.
         """
         n = len(chunk)
+        flushed_spans: list[tuple[int, int]] = []
+        active_spans: list[tuple[int, int]]  = []
 
         # ── Resize pre-trigger rolling buffer (in chunks) ─────────────────
         # Holds enough history to cover (pre_trig + min_cross) of lookback.
@@ -109,6 +126,7 @@ class ThresholdRecorder:
         # ── Enable/disable transitions ────────────────────────────────────
         if self._was_enabled and not enabled:
             for ev in self._active_events:
+                flushed_spans.append(self._span_for_flush(ev))
                 self._flush_event(ev, output_dir, filename_prefix,
                                   filename_suffix, sample_rate, filename_stream)
             self._active_events = []
@@ -118,7 +136,18 @@ class ThresholdRecorder:
         self._was_enabled = enabled
 
         if not enabled:
-            return
+            # Still return the raw mask so the detect strip keeps
+            # rendering even while recording is disabled. No new events
+            # can open, so active_spans is empty.
+            mask = self._build_mask(chunk, threshold=threshold,
+                                    trigger_peak=trigger_peak,
+                                    should_trigger=should_trigger,
+                                    trigger_mask=trigger_mask)
+            return {
+                'detect_mask':   mask.copy(),
+                'active_spans':  [],
+                'flushed_spans': [s for s in flushed_spans if s[0] >= 0],
+            }
 
         # Lazily anchor the monotonic + wall clocks (#23 / c13).
         if self._mono_anchor is None:
@@ -155,7 +184,8 @@ class ThresholdRecorder:
         just_created = None
         if trigger_pos is not None:
             just_created = self._open_event(
-                trigger_pos, n, need, pre_trig_samps, sample_rate)
+                trigger_pos, n, need, pre_trig_samps, sample_rate,
+                global_chunk_end=global_chunk_end)
             self._active_events.append(just_created)
 
         # ── Walk every active event through this chunk ───────────────────
@@ -196,6 +226,7 @@ class ThresholdRecorder:
 
             # Flush when the post-trigger tail is fully captured.
             if ev['ended'] and ev['samples_kept'] >= ev['target_kept']:
+                flushed_spans.append(self._span_for_flush(ev))
                 self._flush_event(ev, output_dir, filename_prefix,
                                   filename_suffix, sample_rate, filename_stream)
                 to_remove.append(ev)
@@ -204,6 +235,7 @@ class ThresholdRecorder:
             # Force-split events longer than max_rec.
             if ev['samples_kept'] >= max_samps:
                 ev['target_kept'] = ev['samples_kept']
+                flushed_spans.append(self._span_for_flush(ev))
                 self._flush_event(ev, output_dir, filename_prefix,
                                   filename_suffix, sample_rate, filename_stream)
                 to_remove.append(ev)
@@ -212,10 +244,31 @@ class ThresholdRecorder:
             if ev in self._active_events:
                 self._active_events.remove(ev)
 
+        # ── Build span report for still-open events ──────────────────────
+        if global_chunk_end is not None:
+            for ev in self._active_events:
+                gs = ev.get('global_start')
+                if gs is None:
+                    continue
+                # The event currently spans [global_start, global_start +
+                # samples_kept). Clip to global_chunk_end defensively —
+                # should be equal after chunk append, but keep the
+                # invariant explicit.
+                ge = min(gs + ev['samples_kept'], global_chunk_end)
+                if ge > gs:
+                    active_spans.append((gs, ge))
+
+        return {
+            'detect_mask':   mask.copy(),
+            'active_spans':  active_spans,
+            'flushed_spans': [s for s in flushed_spans if s[0] >= 0],
+        }
+
     # ── Helpers ──────────────────────────────────────────────────────────
 
     def _open_event(self, trigger_pos: int, n: int, need: int,
-                    pre_trig_samps: int, sample_rate: int) -> dict:
+                    pre_trig_samps: int, sample_rate: int,
+                    *, global_chunk_end: int | None = None) -> dict:
         """Build a new event dict at the given trigger sample.
 
         `trigger_pos` is the sample index in the current chunk where the
@@ -255,6 +308,15 @@ class ThresholdRecorder:
                  + datetime.timedelta(seconds=mono_delta)
                  - datetime.timedelta(seconds=samples_kept / sample_rate))
 
+        # #32: absolute start of the event in global-sample coordinates.
+        # Kept alongside `samples_kept` so span reporting stays correct
+        # even across flush-on-disable (no chunk appended) and force-split
+        # (target_kept replaced) paths. When the caller doesn't supply
+        # global_chunk_end (legacy tests), global_start is None and the
+        # event simply isn't reported in the span lists.
+        global_start = (None if global_chunk_end is None
+                        else global_chunk_end - samples_kept)
+
         return {
             'buf':             buf_init,
             'start_offset':    start_offset,
@@ -264,7 +326,23 @@ class ThresholdRecorder:
             'ended':           False,
             'target_kept':     None,
             'onset_time':      onset,
+            'global_start':    global_start,
         }
+
+    @staticmethod
+    def _span_for_flush(ev: dict) -> tuple[int, int]:
+        """Return ``(g_start, g_end)`` for an event about to be flushed.
+
+        Mirrors the trimming logic in ``_trim_event`` — uses
+        ``target_kept`` when set, falls back to ``samples_kept`` for the
+        disable-path flush. Returns ``(-1, -1)`` when the event has no
+        global_start (legacy tests that don't pass ``global_chunk_end``).
+        """
+        gs = ev.get('global_start')
+        if gs is None:
+            return (-1, -1)
+        target = ev['target_kept'] if ev['target_kept'] is not None else ev['samples_kept']
+        return (gs, gs + target)
 
     @staticmethod
     def _trim_event(ev: dict) -> list:
