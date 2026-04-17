@@ -345,6 +345,75 @@ def test_entity_detect_buffer_clears_after_full_cycle(captured_flushes):
         e.close()
 
 
+def test_entity_detect_mask_is_same_array_state_machine_sees(
+        captured_flushes, monkeypatch):
+    """Pins the 1:1 invariant: the bool array written into
+    ``detect_mask_buffer`` for a chunk is literally the same
+    ``trigger_mask`` that ``ThresholdRecorder.process_chunk`` walks
+    sample-by-sample. Not two parallel computations.
+    """
+    e = _make_entity()
+    seen: dict = {}
+
+    real_process = e.recorder.process_chunk
+
+    def _spy(chunk, *args, **kwargs):
+        seen['trigger_mask'] = kwargs.get('trigger_mask')
+        return real_process(chunk, *args, **kwargs)
+
+    monkeypatch.setattr(e.recorder, 'process_chunk', _spy)
+    try:
+        chunk = np.zeros(CHUNK_FRAMES, dtype=np.float32)
+        # Mixed above/below threshold inside one chunk — the
+        # distinction between chunk-uniform broadcast and per-sample
+        # walking only matters for signals like this.
+        chunk[100:200] = 0.9
+        chunk[400:450] = 0.9
+        e.ingest_chunk(chunk)
+        tm = seen['trigger_mask']
+        assert tm is not None, 'entity must pass trigger_mask to recorder'
+        assert tm.dtype == bool
+        assert tm.shape == (CHUNK_FRAMES,)
+        # detect_mask_buffer for this chunk's ring region must equal
+        # the recorder's trigger_mask, element for element.
+        np.testing.assert_array_equal(
+            e.detect_mask_buffer[:CHUNK_FRAMES], tm)
+        # And it must NOT be a chunk-uniform broadcast — it must have
+        # per-sample granularity matching the above/below pattern.
+        assert tm[100:200].all()
+        assert tm[400:450].all()
+        assert not tm[:100].any()
+        assert not tm[200:400].any()
+        assert not tm[450:].any()
+    finally:
+        e.close()
+
+
+def test_entity_detect_mask_includes_spectral_gate(captured_flushes):
+    """In 'Amp AND Spectral' mode, the detect strip must reflect the
+    spectral gate too — not just amplitude crossings. This is part
+    of the 1:1 contract (strip == state-machine input)."""
+    e = _make_entity()
+    e.spectral_trigger_mode = 'Amp AND Spectral'
+    # Force spec_primed = True by priming the analysis FFT, and force
+    # the gate CLOSED by setting spectral_threshold = 0 (entropy can
+    # never go below zero → spec_triggered is always False).
+    e.spectral_threshold = 0.0
+    try:
+        loud = np.full(CHUNK_FRAMES, 0.9, dtype=np.float32)
+        # Ingest enough chunks to prime the analysis accumulator.
+        for _ in range(8):
+            e.ingest_chunk(loud)
+        # Amplitude trigger would fire every sample (0.9 > 0.5), but
+        # the closed spectral gate AND's everything to False — no
+        # samples in the detect strip.
+        assert not e.detect_mask_buffer.any(), (
+            f'{int(e.detect_mask_buffer.sum())} samples still lit '
+            f'despite closed spectral gate')
+    finally:
+        e.close()
+
+
 def test_entity_detect_buffer_respects_bandpass_filter(captured_flushes):
     """When the bandpass filter is enabled, the detect-strip mask must
     be computed from the *filtered* signal, not the raw input. A loud
