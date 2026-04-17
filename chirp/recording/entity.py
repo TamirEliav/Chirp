@@ -652,36 +652,65 @@ class RecordingEntity:
         self.spectral_entropy = entropy
         self.entropy_buffer[self.col_head] = entropy
 
-        # ── Compute should_trigger (c12 / #16) ────────────────────────
-        # The state machine no longer infers triggering from
-        # `trigger_peak`. We compute the boolean here and pass it
-        # explicitly so the spectral path doesn't have to forge fake
-        # amplitude peaks. `trigger_peak` keeps its true post-filter
-        # value and remains useful for the saturation indicator + UI.
-        amp_above = (trigger_peak >= self.threshold)
+        # ── Build per-sample trigger mask (single source of truth) ─────
+        # This array is THE detection signal. It is:
+        #   (1) passed to the state machine verbatim as ``trigger_mask=``
+        #       so min_cross / hold / pre+post trigger are walked
+        #       sample-by-sample on the same bools the UI shows.
+        #   (2) written verbatim to ``detect_mask_buffer`` so the yellow
+        #       "det" indicator strip is literally the detection input,
+        #       not a parallel per-sample computation that can drift
+        #       from what the recorder sees.
+        #
+        # Amplitude component: per-sample |filtered signal| ≥ threshold
+        # under the active `trigger_mode` rule. Spectral component: the
+        # entropy trigger is chunk-level (one entropy value per FFT
+        # column), so it contributes a scalar AND/OR gate.
+        if mode == 'Stereo':
+            abs_fl = np.abs(filt_l)
+            abs_fr = np.abs(filt_r)
+            tm = self.trigger_mode
+            if tm == 'Left Channel':
+                filt_combined_abs = abs_fl
+            elif tm == 'Right Channel':
+                filt_combined_abs = abs_fr
+            elif tm == 'Any Channel':
+                filt_combined_abs = np.maximum(abs_fl, abs_fr)
+            elif tm == 'Both Channels':
+                filt_combined_abs = np.minimum(abs_fl, abs_fr)
+            else:  # Average
+                filt_combined_abs = (abs_fl + abs_fr) * 0.5
+        else:
+            filt_combined_abs = np.abs(filt)
+        amp_mask = filt_combined_abs >= self.threshold
+
         stm = self.spectral_trigger_mode
-        # #14: spectral entropy is meaningless during FFT warm-up.
-        # Use the analysis accumulator — it may have different params
-        # from the display accumulator (#12 / c19).
+        # #14: spectral entropy is meaningless during FFT warm-up. Use
+        # the analysis accumulator — it may have different params from
+        # the display accumulator (#12 / c19).
         spec_primed = self.analysis_acc.primed and (
             mode != 'Stereo' or self.analysis_acc_r.primed)
         if stm == 'Amplitude Only':
-            should_trigger = amp_above
+            trigger_mask = amp_mask
         elif not spec_primed:
             # Warm-up: drop spectral contribution. AND/Only suppress;
             # OR falls back to amplitude alone.
             if stm in ('Spectral Only', 'Amp AND Spectral'):
-                should_trigger = False
+                trigger_mask = np.zeros(n, dtype=bool)
             else:  # 'Amp OR Spectral'
-                should_trigger = amp_above
+                trigger_mask = amp_mask
         else:
-            spec_triggered = (entropy < self.spectral_threshold)
+            spec_triggered = bool(entropy < self.spectral_threshold)
             if stm == 'Spectral Only':
-                should_trigger = spec_triggered
+                trigger_mask = np.full(n, spec_triggered, dtype=bool)
             elif stm == 'Amp AND Spectral':
-                should_trigger = amp_above and spec_triggered
+                trigger_mask = (amp_mask
+                                if spec_triggered
+                                else np.zeros(n, dtype=bool))
             else:  # 'Amp OR Spectral'
-                should_trigger = amp_above or spec_triggered
+                trigger_mask = (np.ones(n, dtype=bool)
+                                if spec_triggered
+                                else amp_mask)
 
         # Write amplitude buffers (filtered when band filter active)
         if mode == 'Stereo':
@@ -716,43 +745,17 @@ class RecordingEntity:
                 self.abs_amp_buffer[self.write_head:] = abs_l[:split]
                 self.abs_amp_buffer[:wrap]            = abs_l[split:]
 
-        # #32: per-sample amplitude-threshold crossing mask for the
-        # detect strip. Must use the *filtered* signal (when the
-        # bandpass is enabled) combined per-sample under the active
-        # `trigger_mode` rule, so the strip exactly mirrors the
-        # chunk-level trigger decision (`amp_above`). Previously used
-        # the raw `record` signal — the strip would light up on
-        # out-of-band energy the filter was suppressing, making it
-        # look like the trigger ignored the bandpass. Spectral /
-        # min_cross gating is still pre-stripped (pre-gating) so the
-        # user can see raw amplitude crossings while tuning.
-        if mode == 'Stereo':
-            abs_fl = np.abs(filt_l)
-            abs_fr = np.abs(filt_r)
-            tm = self.trigger_mode
-            if tm == 'Left Channel':
-                filt_combined_abs = abs_fl
-            elif tm == 'Right Channel':
-                filt_combined_abs = abs_fr
-            elif tm == 'Any Channel':
-                filt_combined_abs = np.maximum(abs_fl, abs_fr)
-            elif tm == 'Both Channels':
-                filt_combined_abs = np.minimum(abs_fl, abs_fr)
-            else:  # Average
-                filt_combined_abs = (abs_fl + abs_fr) * 0.5
-        else:
-            filt_combined_abs = np.abs(filt)
-        sample_detect = filt_combined_abs >= self.threshold
-
-        # Write detect-mask ring buffer for the chunk just arrived
-        # (wrap-aware, mirroring the amp-buffer path above).
+        # #32: write the detect-strip ring buffer from the SAME array
+        # the state machine will walk. One source of truth — no
+        # parallel per-sample computation. Wrap-aware, mirroring the
+        # amp-buffer path above.
         if end <= self._total_samples:
-            self.detect_mask_buffer[self.write_head:end] = sample_detect
+            self.detect_mask_buffer[self.write_head:end] = trigger_mask
         else:
             split = self._total_samples - self.write_head
             wrap  = end % self._total_samples
-            self.detect_mask_buffer[self.write_head:]   = sample_detect[:split]
-            self.detect_mask_buffer[:wrap]              = sample_detect[split:]
+            self.detect_mask_buffer[self.write_head:]   = trigger_mask[:split]
+            self.detect_mask_buffer[:wrap]              = trigger_mask[split:]
 
         # Single source of truth: advance the cumulative sample clock,
         # then re-derive both ring-buffer cursors. This guarantees they
@@ -782,14 +785,15 @@ class RecordingEntity:
             filename_prefix = self.filename_prefix,
             filename_suffix = self.filename_suffix,
             sample_rate   = self.sample_rate,
-            should_trigger = should_trigger,
+            trigger_mask  = trigger_mask,
             filename_stream = self.name,
             global_chunk_end = self._samples_total,
         )
 
-        # #32: paint the record_mask indicator buffer from the recorder's
-        # span report. detect_mask_buffer was already painted above from
-        # the raw per-sample threshold crossings.
+        # #32: paint the record_mask indicator buffer from the
+        # recorder's span report. detect_mask_buffer was already
+        # painted above from the SAME trigger_mask array the state
+        # machine walked — 1:1 with detection, by construction.
         self._paint_record_buffer(report, n)
 
     # ── #32: indicator buffer painting ───────────────────────────────────
