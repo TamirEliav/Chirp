@@ -461,6 +461,8 @@ class ChirpWindow(QMainWindow):
         if vm.get('entropy_line') is not None:
             arts.extend([vm['entropy_line'], vm['cursor_entropy'],
                          vm['entropy_thr_line']])
+        if vm.get('events_im') is not None:
+            arts.extend([vm['events_im'], vm['cursor_events']])
         return arts
 
     def _recapture_bg(self, event=None):
@@ -2999,6 +3001,10 @@ class ChirpWindow(QMainWindow):
                 inner_ratios.append(1 if show_spec else 3)
             inner_rows.append('amp')
             inner_ratios.append(1)
+            # #32: thin detect/record events strip under the amp axis,
+            # mirrors the config-mode layout.
+            inner_rows.append('events')
+            inner_ratios.append(0.3)
             if show_entropy:
                 inner_rows.append('entropy')
                 inner_ratios.append(1)
@@ -3019,6 +3025,9 @@ class ChirpWindow(QMainWindow):
             entropy_line = None
             entropy_thr_line = None
             cursor_entropy = None
+            ax_events = None
+            events_im = None
+            cursor_events = None
 
             e_disp = e.display_seconds
             e_ts = e._total_samples
@@ -3091,13 +3100,37 @@ class ChirpWindow(QMainWindow):
                 linestyle=(0, (6, 3)),
             )
 
-            # Only show x-labels on bottom row
-            if r < rows - 1:
-                ax_amp.tick_params(labelbottom=False)
-            else:
-                ax_amp.set_xlabel('Time (s)', fontsize=7)
-
+            # The amp axis is no longer the bottom of this cell (events
+            # strip and/or entropy axis come below). Hide its x tick
+            # labels; whichever axis ends up last will carry the label.
+            ax_amp.tick_params(labelbottom=False)
             ax_amp.set_ylabel('Amp', fontsize=7)
+
+            # #32: detect/record events strip (row 0 = det / yellow,
+            # row 1 = rec / green). Same construction as config mode.
+            ax_events = self._fig.add_subplot(
+                inner[inner_idx['events']], sharex=first_ax)
+            rgba0 = np.empty((2, max(1, e._n_cols), 4), dtype=np.float32)
+            rgba0[..., 0] = 0x18 / 255.0
+            rgba0[..., 1] = 0x18 / 255.0
+            rgba0[..., 2] = 0x25 / 255.0
+            rgba0[..., 3] = 1.0
+            events_im = ax_events.imshow(
+                rgba0, aspect='auto', origin='upper',
+                extent=[0.0, e_disp, 0, 2],
+                interpolation='nearest',
+            )
+            ax_events.set_xlim(0.0, e_disp)
+            ax_events.set_ylim(0, 2)
+            ax_events.set_yticks([0.5, 1.5])
+            ax_events.set_yticklabels(['rec', 'det'], fontsize=6)
+            ax_events.tick_params(axis='y', length=0, pad=2)
+            cursor_events = ax_events.axvline(
+                x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
+            # Events is either the bottom axis in this cell, or entropy
+            # is below it. Default: hide its x ticks — entropy (if
+            # present) or the fallback below handles the label.
+            ax_events.tick_params(labelbottom=False)
 
             # Entropy subplot
             if show_entropy:
@@ -3117,12 +3150,16 @@ class ChirpWindow(QMainWindow):
                     x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
                 ax_entropy.set_ylabel('Ent', fontsize=7)
                 ax_entropy.tick_params(labelbottom=False)
-                # Move x-label from amp to entropy
-                ax_amp.tick_params(labelbottom=False)
+                # Entropy is the bottom axis when present — it carries
+                # the x-label on the bottom row of cells.
                 if r >= rows - 1:
                     ax_entropy.tick_params(labelbottom=True)
                     ax_entropy.set_xlabel('Time (s)', fontsize=7)
-                    ax_amp.set_xlabel('')
+            elif r >= rows - 1:
+                # No entropy: events strip is the bottom axis. Give it
+                # the x-label on the bottom row of cells.
+                ax_events.tick_params(labelbottom=True)
+                ax_events.set_xlabel('Time (s)', fontsize=7)
 
             # Title and status on the topmost axis
             top_ax = ax_spec if ax_spec is not None else ax_wave
@@ -3134,13 +3171,15 @@ class ChirpWindow(QMainWindow):
 
             self._vm_axes.append({
                 'ax_spec': ax_spec, 'ax_amp': ax_amp, 'ax_wave': ax_wave,
-                'ax_entropy': ax_entropy,
+                'ax_entropy': ax_entropy, 'ax_events': ax_events,
                 'spec_im': spec_im,
                 'amp_line': amp_line, 'amp_line_r': amp_line_r,
                 'wave_line': wave_line, 'wave_line_r': wave_line_r,
                 'entropy_line': entropy_line,
+                'events_im': events_im,
                 'cursor_spec': cursor_spec, 'cursor_amp': cursor_amp,
                 'cursor_wave': cursor_wave, 'cursor_entropy': cursor_entropy,
+                'cursor_events': cursor_events,
                 'thr_line': thr_line, 'entropy_thr_line': entropy_thr_line,
                 'title': title_obj, 'status_text': status_text,
             })
@@ -3212,6 +3251,13 @@ class ChirpWindow(QMainWindow):
                 vm['entropy_line'].set_ydata(e.entropy_buffer)
                 vm['cursor_entropy'].set_xdata([col_cursor_x, col_cursor_x])
                 vm['entropy_thr_line'].set_ydata([e.spectral_threshold, e.spectral_threshold])
+
+            # #32: detect / record events strip
+            if vm.get('events_im') is not None:
+                rgba = self._build_events_rgba(e)
+                if rgba is not None:
+                    vm['events_im'].set_data(rgba)
+                vm['cursor_events'].set_xdata([cursor_x, cursor_x])
 
             # Status text
             parts = []
