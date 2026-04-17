@@ -25,6 +25,12 @@ class AudioCapture:
         # each plot tick to surface a drop-indicator badge in the
         # sidebar so silent loss is no longer invisible.
         self.drop_count = 0
+        # #7: optional monitor loopback. When wired by the owning
+        # RecordingEntity, the callback also forwards raw samples to
+        # the shared AudioMonitor — the monitor itself gates on
+        # source_id so only the selected stream is actually played.
+        self._monitor = None
+        self._monitor_source_id = None
         try:
             self._stream = sd.InputStream(
                 samplerate=samplerate, channels=channels,
@@ -35,11 +41,28 @@ class AudioCapture:
         except Exception as exc:
             print(f"[AudioCapture] Failed to open device {device}: {exc}")
 
+    def set_monitor(self, monitor, source_id) -> None:
+        """Wire the shared audio monitor. Safe to call at any time."""
+        self._monitor = monitor
+        self._monitor_source_id = source_id
+
     @property
     def valid(self):
         return self._stream is not None
 
     def _callback(self, indata, frames, time_info, status):
+        # Feed the monitor first — it's the lowest-latency path and
+        # doesn't care whether the DSP queue is full.
+        mon = self._monitor
+        if mon is not None:
+            try:
+                if self._channels == 1:
+                    mon.feed(self._monitor_source_id, indata[:, 0])
+                else:
+                    mon.feed(self._monitor_source_id, indata[:, :2])
+            except Exception:
+                # Monitor must never break acquisition.
+                pass
         try:
             if self._channels == 1:
                 self._queue.put_nowait(indata[:, 0].copy())

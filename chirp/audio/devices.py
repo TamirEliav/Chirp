@@ -36,6 +36,19 @@ def list_input_devices() -> List[Tuple[int, dict]]:
     ]
 
 
+def list_output_devices() -> List[Tuple[int, dict]]:
+    """Return `[(device_id, info_dict), ...]` for every output-capable device.
+
+    Used by the audio-monitor loopback (#7) to populate its output
+    device dropdown — the complement of ``list_input_devices()``.
+    """
+    return [
+        (i, info)
+        for i, info in enumerate(sd.query_devices())
+        if info.get('max_output_channels', 0) > 0
+    ]
+
+
 def host_api_name(device_info: dict) -> str:
     """Return the human-readable host API name for a device info dict."""
     try:

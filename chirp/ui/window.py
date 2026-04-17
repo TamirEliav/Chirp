@@ -42,7 +42,8 @@ from PyQt5.QtGui import QFont, QPainter, QColor, QPainterPath, QPen, QPolygonF
 # body below keeps referring to them by bare name.
 from chirp import __version__
 from chirp.constants import *  # noqa: F401,F403
-from chirp.audio import AudioCapture  # noqa: F401
+from chirp.audio import AudioCapture, AudioMonitor  # noqa: F401
+from chirp.audio.devices import list_output_devices, host_api_name
 from chirp.dsp import (  # noqa: F401
     BandpassFilter,
     SpectrogramAccumulator,
@@ -78,6 +79,12 @@ class ChirpWindow(QMainWindow):
         self._vm_axes: list[dict] = []
         self._vm_n_cols = 1
         self._vm_panel_height = 300
+
+        # #7: shared audio-monitor loopback. One output stream; each
+        # RecordingEntity is wired into it in `_add_recording` and the
+        # monitor itself gates on `source_id` so only the chosen stream
+        # plays. Created before `_build_ui` so the UI can reference it.
+        self._monitor = AudioMonitor()
 
         # Time axis (regenerated per entity's sample_rate)
         self._t_axis_key = (0, 0)  # track (sample_rate, display_seconds) for cached t_axis
@@ -492,6 +499,12 @@ class ChirpWindow(QMainWindow):
         vbox.setContentsMargins(0, 0, 0, 0)
         vbox.setSpacing(0)
 
+        # #7: persistent monitor bar at the very top — visible in both
+        # Config and View mode so the user can always toggle which
+        # stream is routed to the output speakers.
+        self._monitor_bar = self._build_monitor_bar()
+        vbox.addWidget(self._monitor_bar)
+
         # Canvas inside a scroll area (scrollable in view mode)
         self._canvas_scroll = QScrollArea()
         self._canvas_scroll.setWidgetResizable(True)
@@ -588,6 +601,204 @@ class ChirpWindow(QMainWindow):
         f.setFrameShape(QFrame.HLine)
         f.setFrameShadow(QFrame.Plain)
         return f
+
+    # ── Audio monitor bar (#7) ───────────────────────────────────────
+
+    # Sentinel userData for "no monitor source" in the source combo.
+    _MON_OFF = '__off__'
+
+    def _build_monitor_bar(self) -> QWidget:
+        """Thin persistent bar exposing the audio-monitor controls.
+
+        Kept deliberately compact — one row, always visible in both
+        Config and View modes. Contains the global output device
+        dropdown and a single "Monitor" combo that picks which
+        RecordingEntity (if any) is currently routed to the output.
+        """
+        w = QWidget()
+        w.setStyleSheet(
+            f'QWidget#monitor_bar {{ background-color: {C["mantle"]}; '
+            f'border-bottom: 1px solid {C["surface0"]}; }}')
+        w.setObjectName('monitor_bar')
+        w.setFixedHeight(34)
+        h = QHBoxLayout(w)
+        h.setContentsMargins(10, 3, 10, 3)
+        h.setSpacing(8)
+
+        icon = QLabel('\U0001F3A7')  # headphones
+        icon.setStyleSheet(f'color: {C["mauve"]}; font-size: 12pt;')
+        icon.setToolTip('Audio monitor loopback — routes one input stream to an output device')
+        h.addWidget(icon)
+
+        lbl_src = QLabel('Monitor:')
+        lbl_src.setStyleSheet(f'color: {C["subtext"]}; font-size: 9pt;')
+        h.addWidget(lbl_src)
+
+        self._monitor_src_combo = QComboBox()
+        self._monitor_src_combo.setToolTip(
+            'Which recording stream to route to the output — only one '
+            'at a time (switching stops the previous). Independent of '
+            'acquisition / recording state.')
+        self._monitor_src_combo.setFixedWidth(180)
+        self._monitor_src_combo.addItem('Off', userData=self._MON_OFF)
+        self._monitor_src_combo.currentIndexChanged.connect(self._on_monitor_source_changed)
+        h.addWidget(self._monitor_src_combo)
+
+        h.addSpacing(8)
+
+        lbl_out = QLabel('Output:')
+        lbl_out.setStyleSheet(f'color: {C["subtext"]}; font-size: 9pt;')
+        h.addWidget(lbl_out)
+
+        self._monitor_out_combo = QComboBox()
+        self._monitor_out_combo.setToolTip(
+            'Output audio device (speakers/headphones) used for monitor loopback')
+        self._monitor_out_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._monitor_out_combo.setMinimumWidth(200)
+        self._populate_monitor_output_combo()
+        self._monitor_out_combo.currentIndexChanged.connect(self._on_monitor_output_changed)
+        h.addWidget(self._monitor_out_combo, stretch=1)
+
+        btn_refresh = QPushButton('\u21BB')
+        btn_refresh.setObjectName('btn_small')
+        btn_refresh.setFixedSize(26, 22)
+        btn_refresh.setToolTip('Rescan available output devices')
+        btn_refresh.clicked.connect(self._on_refresh_monitor_outputs)
+        h.addWidget(btn_refresh)
+
+        self._monitor_status = QLabel('')
+        self._monitor_status.setStyleSheet(
+            f'color: {C["subtext"]}; font-size: 9pt; min-width: 40px;')
+        h.addWidget(self._monitor_status)
+
+        return w
+
+    def _populate_monitor_output_combo(self):
+        """Fill the output-device combo; ``None`` entry = disabled."""
+        combo = self._monitor_out_combo
+        prev = combo.currentData() if combo.count() > 0 else None
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem('\u2014 None (disabled)', userData=None)
+        restore_idx = 0
+        try:
+            default_out = sd.default.device[1]
+        except Exception:
+            default_out = -1
+        default_idx = 0
+        for dev_id, info in list_output_devices():
+            api = host_api_name(info)
+            label = f"{info['name']}  [{api}]" if api else info['name']
+            combo.addItem(label, userData=dev_id)
+            idx = combo.count() - 1
+            if prev is not None and prev == dev_id:
+                restore_idx = idx
+            if dev_id == default_out and default_idx == 0:
+                default_idx = idx
+        combo.setCurrentIndex(restore_idx if prev is not None else default_idx)
+        combo.blockSignals(False)
+
+    def _refresh_monitor_source_combo(self):
+        """Rebuild the monitor-source dropdown from the entity list."""
+        combo = self._monitor_src_combo
+        prev = combo.currentData() if combo.count() > 0 else self._MON_OFF
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem('Off', userData=self._MON_OFF)
+        restore_idx = 0
+        for i, e in enumerate(self._entities):
+            token = id(e)
+            combo.addItem(e.name, userData=token)
+            if prev == token:
+                restore_idx = combo.count() - 1
+        combo.setCurrentIndex(restore_idx)
+        combo.blockSignals(False)
+        # Sync the monitor backend with whatever ended up selected.
+        data = combo.currentData()
+        self._apply_monitor_source(data)
+
+    def _apply_monitor_source(self, source_token):
+        """Switch the monitor to a source token from the combo.
+
+        ``source_token`` is either :attr:`_MON_OFF` or ``id(entity)``.
+        When switching to a live entity, the output stream is re-opened
+        at that entity's sample rate / channel count so the playback
+        isn't speed-shifted.
+        """
+        if source_token == self._MON_OFF or source_token is None:
+            self._monitor.set_source(None)
+            self._update_monitor_status()
+            return
+        ent = next((e for e in self._entities if id(e) == source_token), None)
+        if ent is None:
+            self._monitor.set_source(None)
+            self._update_monitor_status()
+            return
+        # Re-open the output stream at the source's SR if needed so the
+        # loopback doesn't play back at the wrong pitch.
+        out_dev = self._monitor_out_combo.currentData()
+        want_ch = 2 if ent.channel_mode == 'Stereo' else 1
+        if (out_dev is not None
+                and (self._monitor.samplerate != ent.sample_rate
+                     or self._monitor.channels != want_ch
+                     or not self._monitor.running)):
+            self._monitor.set_output_device(out_dev,
+                                            samplerate=ent.sample_rate,
+                                            channels=want_ch)
+        self._monitor.set_source(source_token)
+        self._update_monitor_status()
+
+    def _on_monitor_source_changed(self, _idx: int):
+        self._apply_monitor_source(self._monitor_src_combo.currentData())
+
+    def _on_monitor_output_changed(self, _idx: int):
+        dev = self._monitor_out_combo.currentData()
+        # Pick the SR/channels of the currently-selected source so the
+        # first playback doesn't have to reopen the stream.
+        src = self._monitor_src_combo.currentData()
+        sr = SAMPLE_RATE
+        ch = 1
+        if src != self._MON_OFF and src is not None:
+            ent = next((e for e in self._entities if id(e) == src), None)
+            if ent is not None:
+                sr = ent.sample_rate
+                ch = 2 if ent.channel_mode == 'Stereo' else 1
+        if dev is None:
+            self._monitor.set_output_device(None)
+        else:
+            ok = self._monitor.set_output_device(dev, samplerate=sr, channels=ch)
+            if not ok:
+                QMessageBox.warning(
+                    self, 'Monitor Output',
+                    f'Could not open output device:\n'
+                    f'{self._monitor_out_combo.currentText()}\n\n'
+                    f'{self._monitor.last_error or ""}')
+                # Revert to "None".
+                self._monitor_out_combo.blockSignals(True)
+                self._monitor_out_combo.setCurrentIndex(0)
+                self._monitor_out_combo.blockSignals(False)
+        self._update_monitor_status()
+
+    def _on_refresh_monitor_outputs(self):
+        self._populate_monitor_output_combo()
+
+    def _update_monitor_status(self):
+        """Reflect backend state on the little status label."""
+        if not hasattr(self, '_monitor_status'):
+            return
+        if self._monitor.source_id is None:
+            self._monitor_status.setText('off')
+            self._monitor_status.setStyleSheet(
+                f'color: {C["surface2"]}; font-size: 9pt; min-width: 40px;')
+            return
+        if not self._monitor.running:
+            self._monitor_status.setText('no output')
+            self._monitor_status.setStyleSheet(
+                f'color: {C["peach"]}; font-size: 9pt; min-width: 40px;')
+            return
+        self._monitor_status.setText('\u25B6 live')
+        self._monitor_status.setStyleSheet(
+            f'color: {C["green"]}; font-size: 9pt; min-width: 40px; font-weight: bold;')
 
     # ── Transport ─────────────────────────────────────────────────────────
 
@@ -1556,9 +1767,14 @@ class ChirpWindow(QMainWindow):
         name = f'Recording {self._next_num}'
         self._next_num += 1
         e = RecordingEntity(name=name)
+        # #7: wire this entity into the shared audio monitor so its
+        # capture forwards samples whenever it becomes the selected
+        # source (the monitor itself gates on source_id).
+        e.set_monitor(self._monitor)
         self._entities.append(e)
         idx = self._sidebar.add_item(name)
         self._switch_selection(idx)
+        self._refresh_monitor_source_combo()
         self._mark_dirty()
 
     def _remove_recording(self, idx: int):
@@ -1566,6 +1782,10 @@ class ChirpWindow(QMainWindow):
             return  # don't delete last
         if 0 <= idx < len(self._entities):
             e = self._entities.pop(idx)
+            # #7: if this entity was the monitor source, disable first
+            # so the monitor doesn't hold a stale token.
+            if self._monitor.source_id == id(e):
+                self._monitor.set_source(None)
             e.close()
             self._sidebar.remove_item(idx)
             # Re-select
@@ -1574,6 +1794,7 @@ class ChirpWindow(QMainWindow):
             elif self._selected_idx >= idx:
                 self._selected_idx = max(0, self._selected_idx - 1)
             self._switch_selection(self._selected_idx)
+            self._refresh_monitor_source_combo()
             self._mark_dirty()
 
     def _move_recording(self, idx: int, direction: int):
@@ -1595,6 +1816,8 @@ class ChirpWindow(QMainWindow):
     def _on_item_renamed(self, idx: int, name: str):
         if 0 <= idx < len(self._entities):
             self._entities[idx].name = name
+            # Keep the monitor-source combo labels in sync with renames.
+            self._refresh_monitor_source_combo()
             self._mark_dirty()
 
     # ──────────────────────────────────────────────────────────────────────
@@ -1745,6 +1968,9 @@ class ChirpWindow(QMainWindow):
         self._timer.stop()
 
         # Close and remove all existing entities
+        # #7: drop any monitor source before closing the entities it
+        # might be pointing at.
+        self._monitor.set_source(None)
         for e in self._entities:
             e.stop_acq()
             e.close()
@@ -1767,10 +1993,14 @@ class ChirpWindow(QMainWindow):
         warnings = []
         for rec_d in data['recordings']:
             ent, warn = RecordingEntity.from_dict(rec_d)
+            # #7: re-wire the monitor on every freshly-loaded entity.
+            ent.set_monitor(self._monitor)
             self._entities.append(ent)
             self._sidebar.add_item(ent.name)
             if warn:
                 warnings.append(warn)
+        # Rebuild monitor-source combo from the loaded entities.
+        self._refresh_monitor_source_combo()
 
         # Update next recording number
         max_num = 0
@@ -2544,6 +2774,10 @@ class ChirpWindow(QMainWindow):
             e.spec_buffer_r[:] = SPEC_DB_MIN
         e.bpf.reset()
         e.bpf_r.reset()
+        # #7: if this entity is the monitor source, resync so the output
+        # stream has the right channel count.
+        if self._monitor.source_id == id(e):
+            self._apply_monitor_source(id(e))
 
     def _on_trigger_mode_changed(self, mode: str):
         e = self._sel
@@ -2558,6 +2792,10 @@ class ChirpWindow(QMainWindow):
         if new_sr is None or new_sr == e.sample_rate:
             return
         e.change_sample_rate(new_sr)
+        # #7: if this entity is the monitor source, the output stream
+        # needs to be reopened at the new SR so playback isn't pitched.
+        if self._monitor.source_id == id(e):
+            self._apply_monitor_source(id(e))
         # Update freq range limits
         nyq = new_sr / 2
         self._sb_freq_lo.setRange(1.0, nyq - 1)
@@ -3092,6 +3330,14 @@ class ChirpWindow(QMainWindow):
             except Exception:
                 _writer.drain(timeout=30.0)
         _writer.shutdown(timeout=5.0)
+
+        # #7: close the monitor loopback before closing entities — the
+        # output stream's callback could otherwise read a buffer that
+        # feeders are tearing down.
+        try:
+            self._monitor.close()
+        except Exception:
+            pass
 
         for e in self._entities:
             e.close()

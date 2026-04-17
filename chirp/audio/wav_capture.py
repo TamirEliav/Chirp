@@ -62,6 +62,9 @@ class WavFileCapture:
         self._pause_evt.set()  # start paused; resume() starts playback
         self._thread: threading.Thread | None = None
         self.drop_count = 0
+        # #7: optional monitor loopback — see AudioCapture.set_monitor.
+        self._monitor = None
+        self._monitor_source_id = None
         # Playback cursor (frame index). Written by the producer thread,
         # read from the UI thread — a plain int assignment is atomic in
         # CPython so no lock is needed.
@@ -106,6 +109,11 @@ class WavFileCapture:
 
     def set_loop(self, loop: bool) -> None:
         self._loop = bool(loop)
+
+    def set_monitor(self, monitor, source_id) -> None:
+        """Wire the shared audio monitor (mirror of AudioCapture)."""
+        self._monitor = monitor
+        self._monitor_source_id = source_id
 
     def reset_position(self) -> None:
         """Rewind playback to the start of the file.
@@ -214,6 +222,12 @@ class WavFileCapture:
             while now >= next_t and not self._stop_evt.is_set():
                 chunk, next_pos = self._build_chunk(self._pos)
                 emit = self._format_for_queue(chunk)
+                mon = self._monitor
+                if mon is not None:
+                    try:
+                        mon.feed(self._monitor_source_id, emit)
+                    except Exception:
+                        pass
                 try:
                     self._queue.put_nowait(emit.copy())
                 except queue.Full:

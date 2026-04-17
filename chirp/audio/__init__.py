@@ -7,6 +7,7 @@ in tests and keeps PortAudio out of pure-numpy code paths.
 """
 
 from chirp.audio.capture import AudioCapture
+from chirp.audio.monitor import AudioMonitor
 from chirp.audio.wav_capture import WavFileCapture
 
-__all__ = ["AudioCapture", "WavFileCapture"]
+__all__ = ["AudioCapture", "AudioMonitor", "WavFileCapture"]

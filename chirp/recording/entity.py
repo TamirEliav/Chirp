@@ -73,6 +73,11 @@ class RecordingEntity:
         self.wav_file_path: str | None = None
         self.wav_loop      = True
 
+        # #7: shared audio monitor (set by ChirpWindow via set_monitor).
+        # Kept on the entity so every rebuilt capture (device change,
+        # sample-rate change, WAV switch) gets re-wired automatically.
+        self._monitor = None
+
         # Audio pipeline
         self.queue      = queue.Queue(maxsize=200)
         self.capture    = self._make_capture(channels=1)
@@ -271,10 +276,34 @@ class RecordingEntity:
         or a WAV file.
         """
         if self.input_source == 'wav_file' and self.wav_file_path:
-            return WavFileCapture(self.queue, self.wav_file_path,
-                                  channels=channels, loop=self.wav_loop)
-        return AudioCapture(self.queue, device=self.device_id,
-                            channels=channels, samplerate=self.sample_rate)
+            cap = WavFileCapture(self.queue, self.wav_file_path,
+                                 channels=channels, loop=self.wav_loop)
+        else:
+            cap = AudioCapture(self.queue, device=self.device_id,
+                               channels=channels, samplerate=self.sample_rate)
+        # Re-wire the monitor on every new capture so a device / SR /
+        # WAV-file switch doesn't silently drop the loopback (#7).
+        if self._monitor is not None:
+            try:
+                cap.set_monitor(self._monitor, id(self))
+            except Exception:
+                pass
+        return cap
+
+    def set_monitor(self, monitor) -> None:
+        """Attach (or detach with ``None``) the shared AudioMonitor.
+
+        The monitor gates by ``source_id == id(entity)`` so a stream
+        only reaches the output when this entity has been selected as
+        the monitor source via ``monitor.set_source(id(entity))``.
+        """
+        self._monitor = monitor
+        cap = self.capture
+        if cap is not None:
+            try:
+                cap.set_monitor(monitor, id(self) if monitor is not None else None)
+            except Exception:
+                pass
 
     # ── Device change ─────────────────────────────────────────────────────
 
