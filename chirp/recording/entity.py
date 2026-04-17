@@ -158,6 +158,11 @@ class RecordingEntity:
 
         # Display state
         self.saturated  = False   # True when current chunk contains clipped audio
+        # #28: latched "has ever saturated since last reset" flag —
+        # sticky indicator so brief clips that happen while the user
+        # isn't watching are still surfaced after the fact. Cleared
+        # explicitly via clear_saturation_flag().
+        self.saturated_ever = False
         self.amp_ylim   = 1.05    # amplitude y-axis max (persists across mode switches)
         self.display_mode = 'Spectrogram'  # 'Spectrogram', 'Waveform', or 'Both'
 
@@ -187,6 +192,25 @@ class RecordingEntity:
         self._samples_total = 0
         self.write_head = 0
         self.col_head   = 0
+
+    # ── #28 / #29: sticky session flags ───────────────────────────────────
+
+    def clear_saturation_flag(self) -> None:
+        """Clear the sticky ``saturated_ever`` flag (#28).
+
+        The transient ``saturated`` flag is unaffected — it will turn
+        back on immediately if the next chunk is still clipping.
+        """
+        self.saturated_ever = False
+
+    def clear_drop_flag(self) -> None:
+        """Clear the sticky dropped-audio stats on the attached capture
+        (#29). Safe to call whether or not the capture exposes the
+        ``reset_drop_stats`` method (legacy / test captures may not).
+        """
+        cap = getattr(self, 'capture', None)
+        if cap is not None and hasattr(cap, 'reset_drop_stats'):
+            cap.reset_drop_stats()
 
     # ── Freq mapping ──────────────────────────────────────────────────────
 
@@ -598,6 +622,10 @@ class RecordingEntity:
         else:
             raw_peak = float(np.max(np.abs(display)))
         self.saturated = raw_peak >= 0.99
+        if self.saturated:
+            # #28: latch the session-wide flag. Cleared only on
+            # explicit user request via clear_saturation_flag().
+            self.saturated_ever = True
 
         # Trigger peak + filtered signal for amplitude display
         freq_on = self.freq_filter_enabled

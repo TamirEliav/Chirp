@@ -1577,6 +1577,9 @@ class ChirpWindow(QMainWindow):
         self._sidebar.delete_requested.connect(self._remove_recording)
         self._sidebar.move_requested.connect(self._move_recording)
         self._sidebar.item_renamed.connect(self._on_item_renamed)
+        # #28 / #29: sticky session-flag resets.
+        self._sidebar.clear_sat_requested.connect(self._on_clear_sat)
+        self._sidebar.clear_drops_requested.connect(self._on_clear_drops)
 
     # ──────────────────────────────────────────────────────────────────────
     # Write-through: widgets → selected entity
@@ -1909,6 +1912,22 @@ class ChirpWindow(QMainWindow):
             # Keep the monitor-source combo labels in sync with renames.
             self._refresh_monitor_source_combo()
             self._mark_dirty()
+
+    # ── #28 / #29: sticky-flag reset handlers ────────────────────────────
+
+    def _on_clear_sat(self, idx: int):
+        """Clear the sticky saturation flag on the idx-th stream."""
+        if 0 <= idx < len(self._entities):
+            self._entities[idx].clear_saturation_flag()
+            # Push a fresh update so the badge goes grey immediately
+            # without waiting for the next plot tick.
+            self._sidebar.update_item_saturation_sticky(idx, False)
+
+    def _on_clear_drops(self, idx: int):
+        """Clear the sticky drop stats on the idx-th stream."""
+        if 0 <= idx < len(self._entities):
+            self._entities[idx].clear_drop_flag()
+            self._sidebar.update_item_drop_sticky(idx, False, 0)
 
     # ──────────────────────────────────────────────────────────────────────
     # Transport callbacks (operate on selected entity)
@@ -3298,7 +3317,8 @@ class ChirpWindow(QMainWindow):
     def _update_plot(self):
         # 1. Ingestion now happens on per-entity background threads
         # (#19 / c21). The main thread only reads the ring buffers and
-        # updates the display. Drop badges still need polling here.
+        # updates the display. Drop / saturation badges still need
+        # polling here.
         for idx, e in enumerate(self._entities):
             if hasattr(e.capture, 'consume_drop_count'):
                 n_drops = e.capture.consume_drop_count()
@@ -3307,6 +3327,20 @@ class ChirpWindow(QMainWindow):
                         self._sidebar.update_item_drops(idx, n_drops)
                     except Exception:
                         pass
+            if hasattr(self, '_sidebar'):
+                # #28: sticky saturation flag.
+                try:
+                    self._sidebar.update_item_saturation_sticky(
+                        idx, bool(getattr(e, 'saturated_ever', False)))
+                except Exception:
+                    pass
+                # #29: sticky persistent-drops flag.
+                try:
+                    has_ever = bool(getattr(e.capture, 'has_ever_dropped', False))
+                    total    = int(getattr(e.capture, 'drop_count_total', 0))
+                    self._sidebar.update_item_drop_sticky(idx, has_ever, total)
+                except Exception:
+                    pass
 
         # 2. Branch on mode
         if self._view_mode:
