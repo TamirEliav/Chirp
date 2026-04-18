@@ -4,7 +4,7 @@
 
 Chirp is a desktop application for multi-stream audio monitoring, visualization, and threshold-triggered recording. It was designed with bioacoustics research in mind but works for any audio analysis task.
 
-![Version](https://img.shields.io/badge/Version-v1.2.0-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
+![Version](https://img.shields.io/badge/Version-v2.1.0-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 ---
 
@@ -34,6 +34,7 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - Drag the threshold line directly on the amplitude plot
 - **Stereo channel selection** — trigger on Left Channel, Right Channel, Average, Any Channel, or Both Channels
 - **Auto-Calibrate** — automatically measure ambient noise and set threshold with configurable calibration duration and margin multiplier
+- **Detect / record events strip** beneath the amplitude plot — a yellow row lights up for every sample the trigger condition is met, a green row for every sample being written to the WAV file. Derived from the same per-sample mask the state machine consumes (no parallel computation), so the strip is exact — including bandpass and spectral-entropy gating. Visible in both Config and View modes.
 
 ### Spectral Entropy Trigger
 - Detect tonal sounds by monitoring spectral entropy computed from FFT magnitudes
@@ -48,6 +49,13 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 ### Saturation Detection
 - Real-time clipping detection when audio peaks reach ≥ 99% of full scale
 - Amplitude waveform turns **red** to alert on saturation
+- **Sticky `S` badge** in the sidebar latches on the first clip and stays lit until clicked — brief clips are never missed
+- In View Mode the per-tile `SAT` overlay surfaces the same state across the monitoring grid
+
+### Dropped-Callback Tracking
+- `D` badge in the sidebar flashes on each dropped audio callback (queue full)
+- Persistent `D` badge latches for the session; click to clear
+- In View Mode a per-tile `DROP×N` overlay shows the running session total
 
 ### Bandpass Filter
 - Optional Butterworth bandpass filter per stream
@@ -78,6 +86,23 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 
 ### Sync Controls
 - Optionally synchronize threshold, spectrogram settings, frequency range, and sample rate across all streams
+
+### Audio Monitor Loopback
+- Per-stream monitor toggle routes raw audio to a shared output device for live listening
+
+### WAV File Replay (Testing)
+- Swap the live capture for a WAV file (`WavFileCapture`) to feed a reproducible signal through the full pipeline — trigger, writer, spectrogram, entropy — for regression testing and offline analysis
+
+---
+
+## What's New in v2.1.0
+
+- **Sticky health badges (#28, #29)** — sidebar gets session-wide `S` (saturation) and `D` (drops) indicators that latch on the first event and stay lit until clicked, so brief clips and single dropped audio callbacks never slip by. Mirrored as `SAT` / `DROP×N` overlays in View Mode so the monitoring grid surfaces the same flags.
+- **Detect / record events strip (#32)** — a two-row strip under the amplitude plot shows, sample by sample, when the trigger fired (yellow) and when audio was captured (green). Shared with the state machine (one source of truth, respects bandpass filter + spectral entropy gating). Visible in both Config and View modes.
+- **Audio monitor loopback (#7)** — per-stream toggle sends raw audio to a shared output device.
+- **WAV file replay (#27)** — swap the live input for a WAV file to feed reproducible signals through the full pipeline (useful for regression tests and offline analysis).
+- **Compact UI** — config panels merged into a single row and sliders removed, freeing canvas space.
+- **Robustness** — dropped-callback counter per capture, per-entity ingestion thread to decouple DSP from the PortAudio callback.
 
 ---
 

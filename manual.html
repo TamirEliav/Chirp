@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Chirp v2.0.0 — User Manual</title>
+<title>Chirp v2.1.0 — User Manual</title>
 <style>
   :root {
     --base: #1e1e2e;
@@ -304,7 +304,7 @@
 <nav class="sidebar">
   <div class="logo">
     <h1>Chirp</h1>
-    <span>User Manual &mdash; v2.0.0</span>
+    <span>User Manual &mdash; v2.1.0</span>
   </div>
   <ul>
     <li><a href="#overview">Overview</a></li>
@@ -363,7 +363,7 @@
 <header class="hero">
   <h1>Chirp</h1>
   <p class="subtitle">Real-Time Audio Monitoring, Visualization &amp; Triggered Recording</p>
-  <span class="version">v2.0.0</span>
+  <span class="version">v2.1.0</span>
 </header>
 
 <!-- ── 1. Overview ── -->
@@ -439,6 +439,15 @@ python chirp.py</code></pre>
       <span style="color:var(--green)">ACQ</span> (acquiring, green),
       <span style="color:var(--green)">REC</span> (recording, green),
       <span style="color:var(--red)">TRIG</span> (triggered, red)</li>
+    <li><strong>Sticky health badges</strong> (v2.1) &mdash;
+      <span style="color:var(--red); font-weight:bold">S</span> latches when this stream has saturated
+      (clipped) at any point during the session;
+      <span style="color:var(--red); font-weight:bold">D</span> latches when the audio capture has
+      dropped any callback chunks (with the total count in its tooltip). Both stay lit until you
+      <strong>click the badge to clear</strong>, so a brief clip or a single dropped callback can't
+      slip by unnoticed.</li>
+    <li><strong>Transient drop flash</strong> &mdash; a short per-tick indicator that blinks when a
+      drop occurs in the current UI tick, alongside the sticky <span style="color:var(--red); font-weight:bold">D</span> badge.</li>
     <li><strong>Mini amplitude preview</strong> &mdash; a small real-time level meter</li>
     <li><strong>Reorder buttons</strong> &mdash; move streams up or down in the list</li>
     <li><strong>Delete button</strong> &mdash; remove a stream</li>
@@ -453,6 +462,14 @@ python chirp.py</code></pre>
     The central area hosts the matplotlib figure showing the spectrogram, waveform, and amplitude
     plots for the currently selected stream. A vertical green cursor line indicates the current
     write position in the circular buffer.
+  </p>
+  <p>
+    A thin <strong>detect / record events strip</strong> (v2.1) sits directly beneath the amplitude
+    plot with two rows: a yellow bar lights up for every sample the trigger condition is met
+    (<em>detect</em>), and a green bar lights up for every sample the writer is actually capturing
+    (<em>record</em>). The detect row is driven by the same per-sample trigger mask the recording
+    state machine consumes &mdash; there is no second computation, so what you see is exactly what
+    the trigger did, including any bandpass filtering and spectral-entropy gating.
   </p>
 
   <h3 id="transport-bar">Transport Bar</h3>
@@ -565,7 +582,14 @@ python chirp.py</code></pre>
   <ul>
     <li><strong>Cursor line</strong> (green) &mdash; marks the current write position in the circular buffer.</li>
     <li><strong>Saturation warning</strong> &mdash; the waveform and amplitude lines turn red when
-        the signal reaches 99% of full scale or higher.</li>
+        the signal reaches 99% of full scale or higher. The transient red tint clears as soon as a
+        clean chunk arrives; the <strong>sticky
+        <span style="color:var(--red); font-weight:bold">S</span> badge</strong> (v2.1) on the
+        sidebar entry latches until you click it, so a brief clip is never missed.</li>
+    <li><strong>Drop warning</strong> (v2.1) &mdash; the sticky
+        <span style="color:var(--red); font-weight:bold">D</span> badge on the sidebar entry latches
+        as soon as the audio capture callback drops any chunk (queue full, slow consumer, etc.), with
+        a running session total in its tooltip. Click to clear.</li>
   </ul>
 
   <div class="callout warning">
@@ -790,9 +814,17 @@ python chirp.py</code></pre>
   </p>
   <ul>
     <li>All active streams are displayed simultaneously in a configurable grid (1 to 6 columns).</li>
-    <li>Each cell shows a compact spectrogram or waveform, amplitude plot, threshold line, and
-        status text.</li>
+    <li>Each cell shows a compact spectrogram or waveform, amplitude plot, threshold line,
+        detect / record events strip (v2.1), and status text.</li>
     <li>The sidebar and configuration panels are hidden to maximize display area.</li>
+    <li><strong>Sticky health badges</strong> (v2.1) are overlaid on each tile:
+      <span style="color:var(--red); font-weight:bold">SAT</span> lights up if the stream has ever
+      clipped, and <span style="color:var(--red); font-weight:bold">DROP&times;N</span> lights up if
+      the capture has ever dropped chunks (with the session-total count). Since view mode hides the
+      sidebar, these overlays are how you spot health problems while monitoring; clearing them is
+      done from config mode by clicking the sidebar
+      <span style="color:var(--red); font-weight:bold">S</span> /
+      <span style="color:var(--red); font-weight:bold">D</span> badges.</li>
     <li>Panel height is adjustable for each stream.</li>
     <li>Click <strong>Config Mode</strong> to return to the single-stream editing view.</li>
   </ul>
@@ -933,7 +965,7 @@ python chirp.py</code></pre>
 
 <!-- Footer -->
 <footer style="margin-top:3rem; padding-top:1.5rem; border-top:1px solid var(--surface0); text-align:center; color:var(--overlay0); font-size:0.82rem;">
-  <p>Chirp v2.0.0 &mdash; User Manual</p>
+  <p>Chirp v2.1.0 &mdash; User Manual</p>
   <p>Designed for bioacoustics research. Built with Python, PyQt5, and matplotlib.</p>
 </footer>
 
