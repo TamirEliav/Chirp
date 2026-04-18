@@ -163,6 +163,15 @@ class RecordingEntity:
         # isn't watching are still surfaced after the fact. Cleared
         # explicitly via clear_saturation_flag().
         self.saturated_ever = False
+        # #44: surface ingestion thread errors. The old _ingest_loop
+        # swallowed every exception into traceback.print_exc() — in a
+        # GUI build nobody sees stdout, and a recurring DSP error would
+        # silently starve the display without any user-visible signal.
+        # These counters back the sidebar `!` error badge.
+        self.ingest_error_count       = 0      # transient per-tick counter
+        self.ingest_error_count_total = 0      # session-wide monotonic
+        self.has_ever_ingest_errored  = False
+        self.last_ingest_error: str | None = None  # short str(exc) for tooltip
         self.amp_ylim   = 1.05    # amplitude y-axis max (persists across mode switches)
         self.display_mode = 'Spectrogram'  # 'Spectrogram', 'Waveform', or 'Both'
 
@@ -211,6 +220,29 @@ class RecordingEntity:
         cap = getattr(self, 'capture', None)
         if cap is not None and hasattr(cap, 'reset_drop_stats'):
             cap.reset_drop_stats()
+
+    def clear_error_flag(self) -> None:
+        """Clear the sticky error stats (#44).
+
+        Resets both the entity's ingest error counters and any
+        capture-layer error stats (``os_drop_count_total`` /
+        ``has_ever_os_dropped``, ``open_error``). The writer-pool
+        error stats are global and cleared separately by the window.
+        """
+        self.ingest_error_count       = 0
+        self.ingest_error_count_total = 0
+        self.has_ever_ingest_errored  = False
+        self.last_ingest_error        = None
+        cap = getattr(self, 'capture', None)
+        if cap is not None and hasattr(cap, 'reset_error_stats'):
+            cap.reset_error_stats()
+
+    def consume_ingest_error_count(self) -> int:
+        """Return & clear the transient ingest-error counter. Polled
+        once per UI tick so the sidebar can flash on new errors."""
+        n = self.ingest_error_count
+        self.ingest_error_count = 0
+        return n
 
     # ── Freq mapping ──────────────────────────────────────────────────────
 
@@ -550,10 +582,19 @@ class RecordingEntity:
                 continue
             try:
                 self.ingest_chunk(chunk)
-            except Exception:
-                # Don't let a processing error crash the ingestion
-                # thread — log and continue. The display will stall
-                # briefly but recover on the next chunk.
+            except Exception as exc:
+                # #44: don't let a processing error crash the ingestion
+                # thread — bump counters so the sidebar can surface a
+                # sticky `!` badge, preserve the message for the
+                # tooltip, and log a traceback for post-mortem. The
+                # display will stall briefly but recover on the next
+                # chunk.
+                self.ingest_error_count       += 1
+                self.ingest_error_count_total += 1
+                self.has_ever_ingest_errored   = True
+                # Keep the message short — tooltips truncate and
+                # the full traceback is on stderr anyway.
+                self.last_ingest_error = f'{type(exc).__name__}: {exc}'[:200]
                 import traceback
                 traceback.print_exc()
 

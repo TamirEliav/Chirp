@@ -87,6 +87,9 @@ class RecordingSidebarItem(QWidget):
     # #28 / #29: click-to-clear sticky session flags.
     clear_sat_requested   = pyqtSignal(int)
     clear_drops_requested = pyqtSignal(int)
+    # #43 / #44 / #48: click-to-clear sticky error badge (ingest
+    # exceptions, OS-level audio drops, open errors, writer errors).
+    clear_errors_requested = pyqtSignal(int)
 
     def __init__(self, index: int, name: str, parent=None):
         super().__init__(parent)
@@ -130,6 +133,13 @@ class RecordingSidebarItem(QWidget):
         self._sat_lit    = False
         self._drop_sticky_lit = False
         self._drop_sticky_total = 0
+        # #43 / #44 / #48: session-wide error flag. Latches on the
+        # first ingest exception, OS-level drop, capture open
+        # failure, or WAV writer failure. Tooltip shows a short
+        # breakdown; click to clear.
+        self._lbl_err = QLabel('!')
+        self._err_lit = False
+        self._err_tip = 'No pipeline errors recorded for this stream.'
         self._lbl_acq .setToolTip('Acquisition status (live monitoring)')
         self._lbl_rec .setToolTip('Recording status (threshold-triggered WAV saving enabled)')
         self._lbl_trig.setToolTip('Trigger status (currently writing to a WAV file)')
@@ -142,12 +152,13 @@ class RecordingSidebarItem(QWidget):
             'Saturation has not been detected on this stream.')
         self._lbl_drop_sticky.setToolTip(
             'No dropped chunks recorded for this stream.')
+        self._lbl_err.setToolTip(self._err_tip)
         for lbl in (self._lbl_acq, self._lbl_rec, self._lbl_trig):
             lbl.setFixedWidth(12)
             lbl.setStyleSheet(f'color: {C["surface2"]}; font-size: 8pt;')
         self._lbl_drop.setFixedWidth(12)
         self._lbl_drop.setStyleSheet(f'color: {C["surface2"]}; font-weight: bold; font-size: 9pt;')
-        for lbl in (self._lbl_sat, self._lbl_drop_sticky):
+        for lbl in (self._lbl_sat, self._lbl_drop_sticky, self._lbl_err):
             lbl.setFixedWidth(14)
             lbl.setStyleSheet(
                 f'color: {C["surface2"]}; font-weight: bold; font-size: 9pt;')
@@ -160,6 +171,7 @@ class RecordingSidebarItem(QWidget):
         # drop flash, then live status dots.
         row1.addWidget(self._lbl_sat)
         row1.addWidget(self._lbl_drop_sticky)
+        row1.addWidget(self._lbl_err)
         row1.addWidget(self._lbl_drop)
         row1.addWidget(self._lbl_acq)
         row1.addWidget(self._lbl_rec)
@@ -260,6 +272,27 @@ class RecordingSidebarItem(QWidget):
             if ever else
             'Saturation has not been detected on this stream.')
 
+    def update_error_sticky(self, has_errors: bool, tooltip: str):
+        """#43 / #44 / #48: update the sticky error badge and its
+        tooltip. ``tooltip`` is authored by the caller (it knows which
+        error categories fired — ingest vs OS-drop vs open vs writer).
+        """
+        has_errors = bool(has_errors)
+        tooltip = str(tooltip or (
+            'No pipeline errors recorded for this stream.'))
+        # Always refresh the tooltip if it changed while lit, but skip
+        # the stylesheet write when nothing visual changed.
+        tip_changed = tooltip != self._err_tip
+        if has_errors == self._err_lit and not tip_changed:
+            return
+        self._err_tip = tooltip
+        if has_errors != self._err_lit:
+            self._err_lit = has_errors
+            color = C['peach'] if has_errors else C['surface2']
+            self._lbl_err.setStyleSheet(
+                f'color: {color}; font-weight: bold; font-size: 9pt;')
+        self._lbl_err.setToolTip(tooltip)
+
     def update_drop_sticky(self, has_ever: bool, total: int):
         """#29: update the sticky persistent-drops badge. Called each
         UI tick with the capture's ``has_ever_dropped`` flag and the
@@ -297,6 +330,9 @@ class RecordingSidebarItem(QWidget):
             return
         if child is self._lbl_drop_sticky and self._drop_sticky_lit:
             self.clear_drops_requested.emit(self._index)
+            return
+        if child is self._lbl_err and self._err_lit:
+            self.clear_errors_requested.emit(self._index)
             return
         self.clicked.emit(self._index)
 
@@ -337,6 +373,8 @@ class RecordingSidebar(QWidget):
     # #28 / #29: click-to-clear sticky session flags.
     clear_sat_requested   = pyqtSignal(int)
     clear_drops_requested = pyqtSignal(int)
+    # #43 / #44 / #48: click-to-clear sticky error badge.
+    clear_errors_requested = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -410,6 +448,7 @@ class RecordingSidebar(QWidget):
         item.renamed.connect(self.item_renamed.emit)
         item.clear_sat_requested.connect(self.clear_sat_requested.emit)
         item.clear_drops_requested.connect(self.clear_drops_requested.emit)
+        item.clear_errors_requested.connect(self.clear_errors_requested.emit)
         self._scroll_layout.insertWidget(idx, item)
         self._items.append(item)
         return idx
@@ -460,6 +499,11 @@ class RecordingSidebar(QWidget):
         """#29: update the sticky persistent-drops badge for one item."""
         if 0 <= idx < len(self._items):
             self._items[idx].update_drop_sticky(has_ever, total)
+
+    def update_item_error_sticky(self, idx: int, has_errors: bool, tooltip: str):
+        """#43 / #44 / #48: update the sticky error badge for one item."""
+        if 0 <= idx < len(self._items):
+            self._items[idx].update_error_sticky(has_errors, tooltip)
 
     def update_item_name(self, idx: int, name: str):
         if 0 <= idx < len(self._items):
