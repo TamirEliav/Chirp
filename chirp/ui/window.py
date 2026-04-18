@@ -2100,13 +2100,38 @@ class ChirpWindow(QMainWindow):
         )
 
     def _write_settings_to_path(self, path: str, data: dict) -> bool:
+        # #52: atomic settings write. Serialize to JSON in memory
+        # first so a formatting error can't leave the target
+        # truncated. Then write to a sibling ``<path>.tmp``, fsync,
+        # and ``os.replace`` onto the canonical path — either the
+        # previous good config survives or the new one fully
+        # replaces it. A crash between truncation and json.dump used
+        # to wipe the user's settings file.
+        tmp_path = path + '.tmp'
         try:
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            payload = json.dumps(data, indent=2, ensure_ascii=False)
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                f.write(payload)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    # Some filesystems / platforms don't support
+                    # fsync on writable text-mode file objects;
+                    # fall back to relying on the OS flush.
+                    pass
+            os.replace(tmp_path, path)
             self._current_config_path = path
             self._mark_clean()  # #11 / c22
             return True
         except Exception as exc:
+            # Best-effort cleanup of the tmp sibling so a failed save
+            # doesn't leak files next to the user's config.
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
             QMessageBox.warning(self, 'Save Error', f'Could not save settings:\n{exc}')
             return False
 
