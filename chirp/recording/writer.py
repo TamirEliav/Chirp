@@ -54,6 +54,13 @@ def write_wav_sync(buf_snapshot: list, output_dir: str,
 
     Returns the output path. Raises on I/O failure — the worker
     thread in the pool catches and logs but does not propagate.
+
+    #52: the write is atomic — ``scipy.io.wavfile.write`` lands the
+    bytes at ``<target>.tmp``, the tmp is fsynced, and
+    ``os.replace(tmp, target)`` publishes it in one step. A crash
+    mid-write (power loss, OOM-kill, force-close during drain)
+    leaves either the old file untouched or the new file complete —
+    never a truncated RIFF header with a wrong sample count.
     """
     audio = np.concatenate(buf_snapshot)
     if audio.ndim == 1:
@@ -72,7 +79,24 @@ def write_wav_sync(buf_snapshot: list, output_dir: str,
                          suffix.lstrip('_')] if p]
     fname = '_'.join(parts) + '.wav'
     path  = os.path.join(output_dir, fname)
-    scipy.io.wavfile.write(path, sample_rate, pcm16)
+    # #52: write to a sibling tmp file then rename atomically. Keep the
+    # tmp file on the SAME directory as the target so ``os.replace``
+    # stays an in-filesystem atomic rename (cross-filesystem would
+    # fall back to a non-atomic copy).
+    tmp_path = path + '.tmp'
+    scipy.io.wavfile.write(tmp_path, sample_rate, pcm16)
+    # Best-effort fsync so the bytes are durable before the rename
+    # publishes the file. A missing / unsupported fsync (e.g.
+    # certain FUSE filesystems) must not fail the write.
+    try:
+        fd = os.open(tmp_path, os.O_RDWR)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+    os.replace(tmp_path, path)
     ch_str = 'stereo' if audio.ndim == 2 else 'mono'
     print(f'[REC] saved {path}  ({n_samples/sample_rate:.2f} s, {ch_str})')
     return path
