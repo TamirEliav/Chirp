@@ -3649,10 +3649,22 @@ class ChirpWindow(QMainWindow):
                 return
         self._timer.stop()
 
+        # #56: close-event teardown used to run bare `stop_acq` /
+        # `close` / writer-drain calls — one exception from any of
+        # them would skip the rest, orphaning ingest threads and
+        # silently discarding in-flight recordings from every
+        # remaining entity. Now each step gets its own try/except and
+        # errors are collected for a single post-teardown modal.
+        teardown_errors: list[str] = []
+
         # #19 / c21: stop all ingestion threads before flushing, so no
         # new chunks are processed while we're draining pending events.
         for e in self._entities:
-            e.stop_acq()
+            try:
+                e.stop_acq()
+            except Exception as exc:
+                teardown_errors.append(f'stop_acq({e.name}): {exc}')
+                print(f'[Chirp] stop_acq failed for {e.name}: {exc}')
 
         # #17 / c16: flush any in-flight trigger events to the writer
         # pool, then drain the pool so non-daemon worker threads finish
@@ -3671,12 +3683,18 @@ class ChirpWindow(QMainWindow):
                     reason='app shutdown',
                 )
             except Exception as exc:
+                teardown_errors.append(f'flush_all({e.name}): {exc}')
                 print(f'[Chirp] flush_all failed for {e.name}: {exc}')
 
-        pending = _writer.pending()
+        try:
+            pending = _writer.pending()
+        except Exception as exc:
+            pending = 0
+            teardown_errors.append(f'writer.pending: {exc}')
         if pending:
             # Show a non-cancellable modal so the user knows we're
             # waiting on disk I/O and not just frozen.
+            msg = None
             try:
                 msg = QMessageBox(self)
                 msg.setIcon(QMessageBox.Information)
@@ -3685,22 +3703,64 @@ class ChirpWindow(QMainWindow):
                 msg.setStandardButtons(QMessageBox.NoButton)
                 msg.show()
                 QApplication.processEvents()
-                _writer.drain(timeout=30.0)
-                msg.close()
             except Exception:
-                _writer.drain(timeout=30.0)
-        _writer.shutdown(timeout=5.0)
+                msg = None
+            try:
+                drained = _writer.drain(timeout=30.0)
+                if not drained:
+                    # #56: drain timeout means queued WAVs will be
+                    # abandoned. Record it so the user sees a warning
+                    # instead of a "clean" exit.
+                    remaining = _writer.pending()
+                    teardown_errors.append(
+                        f'writer drain timed out with {remaining} '
+                        f'recording(s) still queued — they will be lost')
+            except Exception as exc:
+                teardown_errors.append(f'writer.drain: {exc}')
+            finally:
+                if msg is not None:
+                    try:
+                        msg.close()
+                    except Exception:
+                        pass
+        try:
+            _writer.shutdown(timeout=5.0)
+        except Exception as exc:
+            teardown_errors.append(f'writer.shutdown: {exc}')
 
         # #7: close the monitor loopback before closing entities — the
         # output stream's callback could otherwise read a buffer that
         # feeders are tearing down.
         try:
             self._monitor.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            teardown_errors.append(f'monitor.close: {exc}')
 
         for e in self._entities:
-            e.close()
+            try:
+                e.close()
+            except Exception as exc:
+                teardown_errors.append(f'close({e.name}): {exc}')
+                print(f'[Chirp] close failed for {e.name}: {exc}')
+
+        # #56: if anything went wrong, show a modal so the user knows
+        # the session did not exit cleanly before the window dies.
+        if teardown_errors:
+            try:
+                detail = '\n'.join(f'• {line}' for line in teardown_errors[:12])
+                extra = ''
+                if len(teardown_errors) > 12:
+                    extra = f'\n…and {len(teardown_errors) - 12} more.'
+                QMessageBox.warning(
+                    self, 'Chirp — shutdown incomplete',
+                    'Some steps failed while closing the app. Any recordings '
+                    'listed below may not have been saved.\n\n' + detail + extra,
+                )
+            except Exception:
+                # If even the modal fails, swallow — we're exiting
+                # anyway and the console log still has the details.
+                pass
+
         super().closeEvent(event)
 
 
