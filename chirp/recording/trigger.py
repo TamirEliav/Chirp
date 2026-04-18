@@ -327,6 +327,13 @@ class ThresholdRecorder:
             'target_kept':     None,
             'onset_time':      onset,
             'global_start':    global_start,
+            # #46: pin the sample rate at event-open time so a
+            # mid-event session-SR change can't mislabel the WAV
+            # header. ``_flush_event`` uses this instead of the
+            # caller-supplied ``sample_rate`` — belt-and-suspenders
+            # for the case where the per-entity flush on SR change
+            # (#45 / PR 2) somehow misses an event.
+            'sample_rate':     sample_rate,
         }
 
     @staticmethod
@@ -373,8 +380,14 @@ class ThresholdRecorder:
                      filename_prefix: str, filename_suffix: str,
                      sample_rate: int, filename_stream: str) -> None:
         trimmed = self._trim_event(ev)
+        # #46: prefer the SR pinned at event-open time. The caller's
+        # ``sample_rate`` is the *current* session rate — if the user
+        # changed it mid-event the WAV header must still reflect the
+        # rate at which the samples were captured, otherwise the file
+        # plays back at the wrong speed.
+        ev_sr = ev.get('sample_rate', sample_rate)
         self._start_flush(trimmed, output_dir, filename_prefix,
-                          filename_suffix, sample_rate=sample_rate,
+                          filename_suffix, sample_rate=ev_sr,
                           onset_time=ev['onset_time'],
                           filename_stream=filename_stream)
 
