@@ -202,6 +202,75 @@ class RecordingEntity:
         self.write_head = 0
         self.col_head   = 0
 
+    # ── #45: safe teardown helpers ─────────────────────────────────────
+
+    def _effective_output_dir(self) -> str:
+        """Return the output directory the next WAV would land in —
+        includes the ``ref_date`` day-subfolder when that's configured.
+        Centralised so teardown flushes and ``ingest_chunk`` compute
+        the same path.
+        """
+        out_dir = self.output_dir
+        if self.ref_date is not None:
+            days = (datetime.date.today() - self.ref_date).days
+            out_dir = os.path.join(out_dir, f'{self.dph_folder_prefix}{days}')
+        return out_dir
+
+    def _flush_active_events(self, reason: str = '') -> int:
+        """#45: flush every still-open event to disk via the recorder's
+        ``flush_all``. Returns the number of events flushed. Safe to
+        call when the recorder has no active events (returns 0).
+
+        Callers must have already stopped the ingest thread — otherwise
+        concurrent mutation of ``_active_events`` could race the flush.
+        """
+        rec = getattr(self, 'recorder', None)
+        if rec is None:
+            return 0
+        try:
+            return rec.flush_all(
+                output_dir       = self._effective_output_dir(),
+                filename_prefix  = self.filename_prefix,
+                filename_suffix  = self.filename_suffix,
+                sample_rate      = self.sample_rate,
+                filename_stream  = self.name,
+                reason           = reason,
+            )
+        except Exception:
+            # A flush failure must not prevent the rest of teardown —
+            # the writer pool's own error counter surfaces the
+            # failure through the sidebar `!` badge (#44).
+            import traceback
+            traceback.print_exc()
+            return 0
+
+    def _stop_ingest_and_flush(self, reason: str = '') -> None:
+        """#45: stop the ingest thread, drain any queued chunks, and
+        flush still-open trigger events. Idempotent — safe to call
+        from any teardown path (``stop_acq``, ``change_device``,
+        ``change_sample_rate``, ``use_wav_file``, ``close``, or
+        ``_load_settings`` during its per-entity loop).
+
+        Must be called *before* closing the capture / rebuilding
+        buffers. Order matters: stop ingestion → drain queue → flush
+        trigger → rebuild. Reordering risks either a concurrent
+        ``_active_events`` mutation or dropping the last chunk of
+        audio that held the post-trigger tail.
+        """
+        if self._ingest_thread is not None:
+            self._ingest_stop.set()
+            self._ingest_thread.join(timeout=2.0)
+            self._ingest_thread = None
+        # Drain queue stragglers. The ingest thread may have exited
+        # between a ``put_nowait`` on the capture side and the next
+        # ``get`` — in which case the last chunk sits untouched.
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
+        self._flush_active_events(reason=reason)
+
     # ── #28 / #29: sticky session flags ───────────────────────────────────
 
     def clear_saturation_flag(self) -> None:
@@ -379,7 +448,13 @@ class RecordingEntity:
         if was_running:
             self.capture.pause()
             self.acq_running = False
+        # #45: flush in-flight events before tearing down the capture.
+        # Preserves rec_enabled so the caller's recording state
+        # survives the swap.
+        self._stop_ingest_and_flush(reason='change_device')
         self.capture.close()
+        # Queue was drained by the helper but keep this defensive
+        # drain in case a chunk hit the queue between pause and close.
         while not self.queue.empty():
             try:
                 self.queue.get_nowait()
@@ -392,8 +467,9 @@ class RecordingEntity:
             self.acq_running = False
             return False
         if was_running:
-            self.capture.resume()
-            self.acq_running = True
+            # Re-spin the ingest thread via start_acq so the new
+            # capture is consumed.
+            self.start_acq()
         return True
 
     def use_wav_file(self, path: str, loop: bool = True) -> tuple[bool, str | None]:
@@ -411,6 +487,8 @@ class RecordingEntity:
         if was_running:
             self.capture.pause()
             self.acq_running = False
+        # #45: flush in-flight events before swapping the input source.
+        self._stop_ingest_and_flush(reason='use_wav_file')
         self.capture.close()
         while not self.queue.empty():
             try:
@@ -450,8 +528,8 @@ class RecordingEntity:
             self.capture = probe
 
         if was_running and self.capture.valid:
-            self.capture.resume()
-            self.acq_running = True
+            # start_acq re-spins the ingest thread we stopped above.
+            self.start_acq()
         return True, warning
 
     # ── Sample rate change ──────────────────────────────────────────────
@@ -463,6 +541,10 @@ class RecordingEntity:
         if was_running:
             self.capture.pause()
             self.acq_running = False
+        # #45: flush in-flight events at the OLD sample rate — WAV
+        # playback would otherwise resume at the new rate with stale
+        # samples appended to an open event and render a garbled file.
+        self._stop_ingest_and_flush(reason='change_sample_rate')
         self.capture.close()
         while not self.queue.empty():
             try:
@@ -499,8 +581,8 @@ class RecordingEntity:
         self.rebuild_freq_mapping()
 
         if was_running and self.capture.valid:
-            self.capture.resume()
-            self.acq_running = True
+            # start_acq re-spins the ingest thread we stopped above.
+            self.start_acq()
 
     # ── Display buffer change ──────────────────────────────────────────────
 
@@ -554,11 +636,11 @@ class RecordingEntity:
             self.capture.pause()
             self.acq_running = False
             self.rec_enabled = False
-            # Stop ingestion thread (#19 / c21).
-            self._ingest_stop.set()
-            if self._ingest_thread is not None:
-                self._ingest_thread.join(timeout=2.0)
-                self._ingest_thread = None
+            # Stop ingestion thread + flush in-flight events (#19 / c21,
+            # #45). ``_stop_ingest_and_flush`` joins the ingest thread,
+            # drains the queue, and calls ``recorder.flush_all`` so any
+            # event still mid-recording or mid-tail lands on disk.
+            self._stop_ingest_and_flush(reason='stop_acq')
             self.bpf.reset()
             self.bpf_r.reset()
             self.spec_acc.reset()
@@ -1067,6 +1149,15 @@ class RecordingEntity:
     # ── Cleanup ───────────────────────────────────────────────────────────
 
     def close(self):
+        # #45: final flush. Covers "delete stream" and "Load settings"
+        # paths that drop the entity without a prior ``stop_acq``.
+        # Wrapped in try/except because a crash here would prevent the
+        # capture from closing and leak a PortAudio stream.
+        try:
+            self._stop_ingest_and_flush(reason='close')
+        except Exception:
+            import traceback
+            traceback.print_exc()
         try:
             self.capture.close()
         except Exception:
