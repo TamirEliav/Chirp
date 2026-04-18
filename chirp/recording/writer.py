@@ -39,10 +39,53 @@ from chirp.constants import SAMPLE_RATE
 
 _FILENAME_SAFE = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._")
 
+# #51: Windows reserved device names. Case-insensitive match on the
+# token minus any extension — ``CON.wav`` is still reserved. If a user
+# sets ``filename_prefix = 'CON'`` on Windows, ``os.path.join(out,
+# 'CON_...wav')`` will open the console device, not a file. Reject
+# these outright — the sanitized form gets an ``_r`` suffix so the name
+# remains stable + human-readable.
+_WIN_RESERVED = {
+    'CON', 'PRN', 'AUX', 'NUL',
+    *(f'COM{i}' for i in range(1, 10)),
+    *(f'LPT{i}' for i in range(1, 10)),
+}
+
+# #51: hard cap on any single token written into a filename. Windows'
+# MAX_PATH is 260; leaving ~64 chars per token keeps a four-token
+# filename under that even with a long output folder.
+_TOKEN_MAX_LEN = 64
+
 
 def _sanitize_token(s: str) -> str:
-    """Strip filename-hostile characters from a stream-name token."""
-    return ''.join(c if c in _FILENAME_SAFE else '_' for c in s).strip('_')
+    """#51: Strip filename-hostile characters from a filename token.
+
+    Guarantees:
+      - The return value contains only chars from ``_FILENAME_SAFE``
+        (ASCII alnum + ``-._``). Everything else — path separators,
+        drive letters, Unicode, whitespace, control bytes — becomes
+        ``_``.
+      - Reserved Windows device names (``CON``, ``PRN``, ``AUX``,
+        ``NUL``, ``COM1..9``, ``LPT1..9``) are never returned as-is;
+        they get an ``_r`` suffix so the rename is stable.
+      - Length is capped at ``_TOKEN_MAX_LEN`` so a pathological prefix
+        doesn't blow past ``MAX_PATH`` on Windows.
+      - Pure-dot inputs (``.``, ``..``) map to ``''`` so they can't
+        participate in path traversal.
+    """
+    if not s:
+        return ''
+    cleaned = ''.join(c if c in _FILENAME_SAFE else '_' for c in s).strip('_')
+    # A run of dots (``..`` or ``.``) sanitizes to itself under the
+    # char filter above — the ``.`` is in _FILENAME_SAFE. Strip those
+    # explicitly so they can't walk the path.
+    if cleaned.strip('.') == '':
+        return ''
+    if cleaned.upper() in _WIN_RESERVED:
+        cleaned = cleaned + '_r'
+    if len(cleaned) > _TOKEN_MAX_LEN:
+        cleaned = cleaned[:_TOKEN_MAX_LEN].rstrip('_')
+    return cleaned
 
 
 def write_wav_sync(buf_snapshot: list, output_dir: str,
@@ -62,6 +105,16 @@ def write_wav_sync(buf_snapshot: list, output_dir: str,
     leaves either the old file untouched or the new file complete —
     never a truncated RIFF header with a wrong sample count.
     """
+    # #50 / #51: reject obviously-invalid ``output_dir`` early. A blank
+    # string would turn ``os.path.join`` into a relative path next to
+    # the executable, silently stashing WAVs where the user can't find
+    # them. A non-str would crash later inside ``os.makedirs``; better
+    # to fail loudly now so the writer-pool error counter picks it up
+    # and the sidebar badge lights.
+    if not isinstance(output_dir, str) or not output_dir.strip():
+        raise ValueError(f'write_wav_sync: output_dir must be a non-empty '
+                         f'string, got {output_dir!r}')
+
     audio = np.concatenate(buf_snapshot)
     if audio.ndim == 1:
         audio = audio.flatten()
@@ -75,10 +128,28 @@ def write_wav_sync(buf_snapshot: list, output_dir: str,
         onset = datetime.datetime.now() - datetime.timedelta(seconds=audio_dur)
     epoch_ms = int(onset.timestamp() * 1000)
     local_ts = onset.strftime('%Y%m%d_%H%M%S_%f')[:-3]
-    parts = [p for p in [prefix.rstrip('_'), str(epoch_ms), local_ts,
-                         suffix.lstrip('_')] if p]
+    # #51: every user-controlled token that lands in the filename MUST
+    # be sanitized — a ``filename_prefix`` of ``../../escape`` would
+    # otherwise let a WAV land outside ``output_dir``. The
+    # ``filename_stream`` token is now ALSO included in ``parts`` so
+    # two streams that trigger on the same physical event (same
+    # ms-precision timestamp) do not clobber each other's files.
+    prefix_s = _sanitize_token(prefix)
+    suffix_s = _sanitize_token(suffix)
+    stream_s = _sanitize_token(filename_stream)
+    parts = [p for p in [prefix_s, str(epoch_ms), local_ts,
+                         stream_s, suffix_s] if p]
     fname = '_'.join(parts) + '.wav'
     path  = os.path.join(output_dir, fname)
+    # #51 belt: verify the final path is still inside output_dir. A
+    # sanitizer bug or a future refactor must not allow ``os.path.join``
+    # to escape the directory.
+    real_out = os.path.realpath(output_dir)
+    real_path = os.path.realpath(path)
+    if os.path.commonpath([real_out, real_path]) != real_out:
+        raise ValueError(
+            f'write_wav_sync: refusing to write outside output_dir '
+            f'(target={real_path!r}, output_dir={real_out!r})')
     # #52: write to a sibling tmp file then rename atomically. Keep the
     # tmp file on the SAME directory as the target so ``os.replace``
     # stays an in-filesystem atomic rename (cross-filesystem would

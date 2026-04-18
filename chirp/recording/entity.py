@@ -128,6 +128,14 @@ class RecordingEntity:
         self.filename_suffix = ''
         self.ref_date = None  # datetime.date or None; when set, files go into day-subfolder
         self.dph_folder_prefix = ''  # optional prefix for day subfolder name
+        # #50: ``output_dir`` validation stamp. The UI probes the path
+        # at every user-visible entry point (browse / text edit /
+        # config load) and writes the result here; the sidebar reads
+        # these to surface the error without waiting for the writer
+        # worker to fail. Default ``True`` so entities constructed in
+        # tests (which may never go through the UI) aren't flagged.
+        self.output_dir_valid = True
+        self.output_dir_error: str | None = None
 
         # Ring buffers
         self.n_freq_bins    = SPECTROGRAM_NPERSEG // 2 + 1
@@ -224,11 +232,16 @@ class RecordingEntity:
         includes the ``ref_date`` day-subfolder when that's configured.
         Centralised so teardown flushes and ``ingest_chunk`` compute
         the same path.
+
+        #51: ``dph_folder_prefix`` is user-editable — sanitize it so a
+        prefix of ``../../escape`` can't walk outside ``output_dir``.
         """
         out_dir = self.output_dir
         if self.ref_date is not None:
+            from chirp.recording.writer import _sanitize_token
             days = (datetime.date.today() - self.ref_date).days
-            out_dir = os.path.join(out_dir, f'{self.dph_folder_prefix}{days}')
+            prefix_s = _sanitize_token(self.dph_folder_prefix)
+            out_dir = os.path.join(out_dir, f'{prefix_s}{days}')
         return out_dir
 
     def _flush_active_events(self, reason: str = '') -> int:
@@ -990,11 +1003,11 @@ class RecordingEntity:
         self.write_head = self._samples_total % self._total_samples
         self.col_head   = (self._samples_total // CHUNK_FRAMES) % self._n_cols
 
-        # Compute effective output dir (with day subfolder if ref_date set)
-        out_dir = self.output_dir
-        if self.ref_date is not None:
-            days = (datetime.date.today() - self.ref_date).days
-            out_dir = os.path.join(out_dir, f'{self.dph_folder_prefix}{days}')
+        # #51: route through ``_effective_output_dir`` so the
+        # day-subfolder prefix is sanitized along the same path
+        # teardown uses. Previously duplicated the join here with a
+        # raw ``dph_folder_prefix``, susceptible to path-traversal.
+        out_dir = self._effective_output_dir()
 
         report = self.recorder.process_chunk(
             record,

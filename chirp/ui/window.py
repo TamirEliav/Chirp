@@ -1759,6 +1759,10 @@ class ChirpWindow(QMainWindow):
         self._folder_edit.setText(e.output_dir)
         self._prefix_edit.setText(e.filename_prefix)
         self._suffix_edit.setText(e.filename_suffix)
+        # #50: validate the loaded folder too — a config saved while a
+        # USB drive was mounted must not silently lose recordings when
+        # the drive is unplugged before reopening Chirp.
+        self._apply_folder_validation(e, e.output_dir)
 
         self._chk_ref_date.blockSignals(True)
         if e.ref_date is not None:
@@ -2655,6 +2659,60 @@ class ChirpWindow(QMainWindow):
     # Folder & device
     # ──────────────────────────────────────────────────────────────────────
 
+    # #50: output-folder validation. The writer worker used to be the
+    # first code that noticed a bad path — at which point the failure
+    # surfaced as a swallowed stdout print while the transport UI
+    # happily showed "REC RUNNING". Validate synchronously at every
+    # user-visible entry point (browse / text-edit / config-load) and
+    # stamp the result on the entity so the sidebar can light up.
+    _FOLDER_INVALID_STYLE = 'QLineEdit { border: 1px solid #f38ba8; }'
+
+    def _probe_output_dir(self, path: str) -> tuple[bool, str]:
+        """#50: return ``(ok, reason)`` for ``path``.
+
+        Checks (in order):
+          1. non-empty string
+          2. ``os.path.isdir``
+          3. writable (best-effort ``open(w)`` on a ``.chirp_write_test``
+             sibling, then cleanup)
+
+        Does NOT create the folder — that's deliberate, ``os.makedirs``
+        in the writer handles the "doesn't exist yet" case for normal
+        usage. Here we want to catch removed/disconnected drives and
+        obvious typos before the first trigger fires.
+        """
+        import os as _os
+        if not isinstance(path, str) or not path.strip():
+            return (False, 'output folder is empty')
+        if not _os.path.isdir(path):
+            return (False, f'not a directory: {path!r}')
+        probe = _os.path.join(path, '.chirp_write_test')
+        try:
+            with open(probe, 'w') as f:
+                f.write('')
+            try:
+                _os.remove(probe)
+            except OSError:
+                pass
+        except OSError as exc:
+            return (False, f'not writable: {exc}')
+        return (True, '')
+
+    def _apply_folder_validation(self, e, path: str) -> None:
+        """#50: run the probe, stamp ``output_dir_valid`` +
+        ``output_dir_error`` on the entity, and style the textbox red
+        on failure. Safe to call with ``e=None`` (style-only path)."""
+        ok, reason = self._probe_output_dir(path)
+        if e is not None:
+            e.output_dir_valid = ok
+            e.output_dir_error = None if ok else reason
+        self._folder_edit.setStyleSheet(
+            '' if ok else self._FOLDER_INVALID_STYLE)
+        if not ok:
+            self._folder_edit.setToolTip(reason)
+        else:
+            self._folder_edit.setToolTip('')
+
     def _on_browse(self):
         e = self._sel
         start = e.output_dir if e else RECORDINGS_DIR
@@ -2663,6 +2721,7 @@ class ChirpWindow(QMainWindow):
             if e:
                 e.output_dir = chosen
             self._folder_edit.setText(chosen)
+            self._apply_folder_validation(e, chosen)
 
     def _on_folder_changed(self):
         text = self._folder_edit.text().strip()
@@ -2670,6 +2729,7 @@ class ChirpWindow(QMainWindow):
         if e:
             e.output_dir = text if text else RECORDINGS_DIR
             self._mark_dirty()
+        self._apply_folder_validation(e, e.output_dir if e else text)
 
     def _on_prefix_changed(self):
         e = self._sel
