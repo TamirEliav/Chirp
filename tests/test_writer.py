@@ -19,7 +19,12 @@ def test_sanitize_token_strips_separators():
     assert _sanitize_token("///") == ""
 
 
-def test_filename_excludes_stream_name(tmp_path):
+def test_filename_includes_sanitized_stream_name(tmp_path):
+    """#51: ``filename_stream`` must appear in the filename — it is
+    the ONLY disambiguator between two streams that trigger on the
+    same physical event at the same ms timestamp. The old
+    test_filename_excludes_stream_name pinned the buggy behavior
+    (clobber!) — this replaces it."""
     onset = datetime.datetime(2024, 1, 2, 3, 4, 5, 678000)
     audio = np.zeros(1024, dtype=np.float32)
     path = write_wav_sync([audio], str(tmp_path),
@@ -28,8 +33,8 @@ def test_filename_excludes_stream_name(tmp_path):
                           onset_time=onset,
                           filename_stream='Channel 1')
     name = os.path.basename(path)
-    # Stream name should NOT appear in the filename
-    assert "Channel" not in name
+    # Sanitized stream name is present and disambiguates streams.
+    assert "Channel_1" in name
     assert name.startswith("bird_")
     assert name.endswith(".wav")
 
