@@ -1953,6 +1953,11 @@ class ChirpWindow(QMainWindow):
         ingest_ever = bool(getattr(e, 'has_ever_ingest_errored', False))
         os_drop_ever = bool(getattr(cap, 'has_ever_os_dropped', False))
         open_err = getattr(cap, 'open_error', None)
+        # #54: WAV-replay multi-channel truncation. The capture latches
+        # this on open when ``file_channels`` exceeds the session's
+        # configured channel count.
+        ch_trunc = bool(getattr(cap, 'channels_truncated', False))
+        ch_trunc_msg = getattr(cap, 'channels_truncated_msg', '') or ''
         # Writer error stats are process-global, not per-stream. We
         # surface them on every stream's badge because there's no
         # reliable way to attribute a given write failure to its
@@ -1963,7 +1968,8 @@ class ChirpWindow(QMainWindow):
         except Exception:
             wr_has, wr_total, wr_last = False, 0, None
 
-        any_err = ingest_ever or os_drop_ever or bool(open_err) or wr_has
+        any_err = (ingest_ever or os_drop_ever or bool(open_err)
+                   or ch_trunc or wr_has)
         if not any_err:
             tip = 'No pipeline errors recorded for this stream.'
         else:
@@ -1981,6 +1987,8 @@ class ChirpWindow(QMainWindow):
                     f'samples lost before our queue')
             if open_err:
                 parts.append(f'Capture open failed: {open_err}')
+            if ch_trunc:
+                parts.append(f'WAV channel truncation: {ch_trunc_msg}')
             if wr_has:
                 last = wr_last or '?'
                 parts.append(

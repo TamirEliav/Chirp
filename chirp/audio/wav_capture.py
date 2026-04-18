@@ -86,12 +86,29 @@ class WavFileCapture:
         self._samples: np.ndarray | None = None
         self._file_sample_rate: int | None = None
         self._file_channels: int = 1
+        # #54: latched once at open time when ``file_channels`` exceeds
+        # the session's configured channel count. ``_format_for_queue``
+        # silently truncates in this case (we keep the truncation —
+        # downstream FFT / trigger expects exactly ``channels`` cols);
+        # the entity surfaces the latch via the sidebar `!` badge.
+        self.channels_truncated     = False
+        self.channels_truncated_msg = ''
         self.wav_path = wav_path
         try:
             sr, samples = _load_wav(wav_path)
             self._samples = samples
             self._file_sample_rate = sr
             self._file_channels = 1 if samples.ndim == 1 else samples.shape[1]
+            if self._file_channels > self._channels:
+                self.channels_truncated = True
+                self.channels_truncated_msg = (
+                    f'WAV has {self._file_channels} channels; session '
+                    f'configured for {self._channels} — '
+                    f'channel{"s" if self._file_channels - self._channels > 1 else ""} '
+                    f'{self._channels + 1}'
+                    f'{f"–{self._file_channels}" if self._file_channels - self._channels > 1 else ""} '
+                    f'silently dropped')
+                print(f"[WavFileCapture] {self.channels_truncated_msg}")
         except Exception as exc:
             self.open_error = f'{type(exc).__name__}: {exc}'[:200]
             print(f"[WavFileCapture] Failed to open {wav_path}: {exc}")
