@@ -983,6 +983,18 @@ class ChirpWindow(QMainWindow):
         status_v.addWidget(self._lbl_trig_status)
         status_v.addWidget(self._lbl_entropy)
         self._blink_counter = 0
+        # #58: ``_update_plot`` exception bookkeeping. The Qt-timer
+        # slot used to swallow exceptions silently — Qt logs the
+        # traceback to stderr (invisible in the packaged build) and
+        # keeps firing, but the half-finished slot leaves blit cache
+        # invariants broken. The display freezes; the user assumes
+        # the app is dead and force-kills it (per #56 that orphans
+        # the writer pool). Counters are bumped from inside the
+        # top-level guard added in the same PR.
+        self._update_plot_err_count        = 0  # consecutive errors
+        self._update_plot_err_total        = 0  # session-wide
+        self._update_plot_last_err: str | None = None
+        self._update_plot_freeze_threshold = 5  # ticks before sticky note
 
         outer.addWidget(btn_box)
         outer.addWidget(status_box)
@@ -3648,9 +3660,75 @@ class ChirpWindow(QMainWindow):
                 except Exception:
                     pass
 
+        # #58: top-level guard around the main display body. The
+        # individual sidebar updates above are already try/except'd
+        # per-update; everything from here through the end of the slot
+        # used to run unguarded. A single matplotlib / numpy / shape
+        # exception (NaN sample, axes-rebuild race, buffer-resize
+        # race) propagated out of the slot — Qt swallowed it but the
+        # half-finished slot left blit-cache invariants broken
+        # (``_axes_changed`` half-set, background bbox captured
+        # mid-reallocation), and subsequent ticks compounded the
+        # problem until the display froze. The user assumed the app
+        # was dead and force-killed it (per #56 that orphans the
+        # writer pool — silent data loss).
+        try:
+            self._update_plot_body()
+        except Exception as exc:
+            self._on_update_plot_error(exc)
+
+    def _on_update_plot_error(self, exc: Exception) -> None:
+        """#58: handle an exception escaping ``_update_plot_body``.
+
+        Bumps the consecutive-error counter, stashes the message,
+        attempts to re-baseline the blit cache so the next tick can
+        recover, and after ``_update_plot_freeze_threshold`` straight
+        failures shows a sticky note in the trigger-status label so
+        the user knows the display is degraded (the mic and writer
+        keep working — they're on background threads — so the user
+        should NOT force-kill).
+        """
+        import traceback
+        self._update_plot_err_count += 1
+        self._update_plot_err_total += 1
+        self._update_plot_last_err = f'{type(exc).__name__}: {exc}'[:200]
+        # Stderr trace so a developer can debug from the console; the
+        # GUI will surface a sticky note after threshold is reached.
+        traceback.print_exc()
+        # Try to re-baseline the blit cache so the next tick has a
+        # clean background to restore from. ``draw()`` is expensive
+        # (~10 ms) but we only get here on error.
+        try:
+            if getattr(self, '_canvas', None) is not None:
+                self._canvas.draw()
+                if getattr(self, '_fig', None) is not None:
+                    self._bg = self._canvas.copy_from_bbox(self._fig.bbox)
+        except Exception:
+            # If even draw() fails, leave _bg alone — the next tick's
+            # ``if self._bg is not None`` short-circuit will skip the
+            # blit path until the user toggles a redraw.
+            pass
+        # Sticky note after N consecutive failures.
+        if (self._update_plot_err_count >= self._update_plot_freeze_threshold
+                and getattr(self, '_lbl_trig_status', None) is not None):
+            try:
+                self._lbl_trig_status.setText(
+                    f'TRIG  DISPLAY HALTED ({self._update_plot_err_count} '
+                    f'errors) — acquisition still running')
+                self._lbl_trig_status.setObjectName('trig_active')
+                self._lbl_trig_status.style().unpolish(self._lbl_trig_status)
+                self._lbl_trig_status.style().polish(self._lbl_trig_status)
+            except Exception:
+                pass
+
+    def _update_plot_body(self):
+        """#58: extracted from ``_update_plot`` so the top-level
+        try/except in the slot can wrap the entire main-display path
+        without indenting the whole body."""
         # 2. Branch on mode
         if self._view_mode:
             self._update_plot_view_mode()
+            self._update_plot_err_count = 0
             return
 
         # Refresh the WAV transport time label for the selected entity
@@ -3754,6 +3832,11 @@ class ChirpWindow(QMainWindow):
         else:
             self._lbl_entropy.setText('ENT  \u2014')
             self._lbl_entropy.setStyleSheet(f'color: {C["subtext"]}; font-size: 10pt;')
+
+        # #58: tick completed cleanly — reset the consecutive-error
+        # counter so a transient blip (one bad chunk) doesn't leave
+        # the "DISPLAY HALTED" sticky note up after recovery.
+        self._update_plot_err_count = 0
 
     # ──────────────────────────────────────────────────────────────────────
 
