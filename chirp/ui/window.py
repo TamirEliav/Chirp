@@ -463,6 +463,12 @@ class ChirpWindow(QMainWindow):
                          vm['entropy_thr_line']])
         if vm.get('events_im') is not None:
             arts.extend([vm['events_im'], vm['cursor_events']])
+        # #28 / #29: sticky saturation / drop indicator text — always
+        # present even when empty so the blitter keeps them in sync.
+        if vm.get('sat_text') is not None:
+            arts.append(vm['sat_text'])
+        if vm.get('drop_text') is not None:
+            arts.append(vm['drop_text'])
         return arts
 
     def _recapture_bg(self, event=None):
@@ -3187,6 +3193,26 @@ class ChirpWindow(QMainWindow):
             status_text = top_ax.text(
                 0.99, 1.02, '', transform=top_ax.transAxes, fontsize=8,
                 ha='right', va='bottom', fontfamily='Consolas')
+            # #28 / #29: sticky saturation + drop indicators, mirroring
+            # the sidebar 'S' / 'D' badges so view-mode (monitoring
+            # grid) surfaces the same session-wide flags. Placed at the
+            # top-right corner INSIDE the top axis with a backing box so
+            # they're readable over the spectrogram without crowding
+            # the title / status row above the axes. Display-only here
+            # — user flips to config mode to clear.
+            _badge_bbox = dict(facecolor=C['mantle'], edgecolor=C['red'],
+                               linewidth=0.6, boxstyle='round,pad=0.25',
+                               alpha=0.9)
+            sat_text = top_ax.text(
+                0.985, 0.97, 'SAT', transform=top_ax.transAxes, fontsize=8,
+                ha='right', va='top', fontfamily='Consolas',
+                color=C['red'], fontweight='bold', bbox=_badge_bbox,
+                visible=False)
+            drop_text = top_ax.text(
+                0.985, 0.82, '', transform=top_ax.transAxes, fontsize=8,
+                ha='right', va='top', fontfamily='Consolas',
+                color=C['red'], fontweight='bold', bbox=_badge_bbox,
+                visible=False)
 
             self._vm_axes.append({
                 'ax_spec': ax_spec, 'ax_amp': ax_amp, 'ax_wave': ax_wave,
@@ -3201,6 +3227,7 @@ class ChirpWindow(QMainWindow):
                 'cursor_events': cursor_events,
                 'thr_line': thr_line, 'entropy_thr_line': entropy_thr_line,
                 'title': title_obj, 'status_text': status_text,
+                'sat_text': sat_text, 'drop_text': drop_text,
             })
 
         # Set up blitting for view mode
@@ -3297,6 +3324,24 @@ class ChirpWindow(QMainWindow):
                 vm['status_text'].set_color(C['blue'])
             else:
                 vm['status_text'].set_color(C['surface2'])
+
+            # #28 / #29: sticky saturation / drop indicators. Mirror
+            # the sidebar 'S' / 'D' badges so view mode (which hides
+            # the sidebar) still surfaces session-wide flags. Toggle
+            # visibility rather than blanking the text — an empty
+            # string with a bbox still renders an empty pill outline.
+            if vm.get('sat_text') is not None:
+                vm['sat_text'].set_visible(
+                    bool(getattr(e, 'saturated_ever', False)))
+            if vm.get('drop_text') is not None:
+                cap = getattr(e, 'capture', None)
+                has_ever = bool(getattr(cap, 'has_ever_dropped', False))
+                if has_ever:
+                    total = int(getattr(cap, 'drop_count_total', 0))
+                    vm['drop_text'].set_text(f'DROP×{total}')
+                    vm['drop_text'].set_visible(True)
+                else:
+                    vm['drop_text'].set_visible(False)
 
             # Blit each animated artist
             for a in self._get_vm_artists(vm):
