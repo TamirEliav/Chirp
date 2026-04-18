@@ -2996,24 +2996,54 @@ class ChirpWindow(QMainWindow):
         new_sr = self._sr_combo.currentData()
         if new_sr is None or new_sr == e.sample_rate:
             return
-        e.change_sample_rate(new_sr)
-        # #7: if this entity is the monitor source, the output stream
-        # needs to be reopened at the new SR so playback isn't pitched.
-        if self._monitor.source_id == id(e):
-            self._apply_monitor_source(id(e))
-        # Update freq range limits
-        nyq = new_sr / 2
-        self._sb_freq_lo.setRange(1.0, nyq - 1)
-        self._sb_freq_hi.setRange(1.0, nyq - 1)
-        self._sb_disp_freq_lo.setRange(0.0, nyq - 1)
-        self._sb_disp_freq_hi.setRange(1.0, nyq)
-        if self._sb_disp_freq_hi.value() > nyq:
-            self._sb_disp_freq_hi.setValue(nyq)
-        # Rebuild axes with new buffer sizes
-        stereo = e.channel_mode == 'Stereo'
-        self._setup_axes(stereo=stereo)
-        self._update_spec_yticks(e)
-        self._refresh_transport_ui()
+        # #46: ``change_sample_rate`` is a multi-second operation —
+        # close stream, drain queue, rebuild filters/buffers, reopen.
+        # Block re-entrancy (rapid wheel-scroll, chained signal)
+        # explicitly: disable the combo until the rebuild completes,
+        # and gate the body behind ``_sr_change_busy``. Without this
+        # the prior call can be mid-``sd.InputStream.close()`` when
+        # the next one tries to touch the stream — double-close at
+        # best, PortAudio crash at worst.
+        if getattr(self, '_sr_change_busy', False):
+            return
+        self._sr_change_busy = True
+        self._sr_combo.setEnabled(False)
+        try:
+            e.change_sample_rate(new_sr)
+            # #46: if sync-settings is on, mirror the SR change to
+            # every other entity — otherwise the user silently ends
+            # up with mismatched SR across "linked" streams. Every
+            # per-entity change_sample_rate flushes its own in-flight
+            # events at the OLD rate first (PR 2), so no mixed-SR
+            # WAV can sneak out.
+            if self._chk_shared_spec.isChecked():
+                for ent in self._entities:
+                    if ent is not e and ent.sample_rate != new_sr:
+                        try:
+                            ent.change_sample_rate(new_sr)
+                        except Exception as exc:
+                            print(f'[Chirp] sync SR change failed for '
+                                  f'{ent.name}: {exc}')
+            # #7: if this entity is the monitor source, the output stream
+            # needs to be reopened at the new SR so playback isn't pitched.
+            if self._monitor.source_id == id(e):
+                self._apply_monitor_source(id(e))
+            # Update freq range limits
+            nyq = new_sr / 2
+            self._sb_freq_lo.setRange(1.0, nyq - 1)
+            self._sb_freq_hi.setRange(1.0, nyq - 1)
+            self._sb_disp_freq_lo.setRange(0.0, nyq - 1)
+            self._sb_disp_freq_hi.setRange(1.0, nyq)
+            if self._sb_disp_freq_hi.value() > nyq:
+                self._sb_disp_freq_hi.setValue(nyq)
+            # Rebuild axes with new buffer sizes
+            stereo = e.channel_mode == 'Stereo'
+            self._setup_axes(stereo=stereo)
+            self._update_spec_yticks(e)
+            self._refresh_transport_ui()
+        finally:
+            self._sr_change_busy = False
+            self._sr_combo.setEnabled(True)
 
     def _on_display_buffer_changed(self, _index: int):
         e = self._sel
