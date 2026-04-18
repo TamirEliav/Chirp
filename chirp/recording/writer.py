@@ -94,6 +94,15 @@ class _WriterPool:
         self._inflight = 0
         self._lock = threading.Lock()
         self._idle = threading.Condition(self._lock)
+        # #44: surface write failures. The worker loop used to swallow
+        # every exception into a stdout print() — in a GUI build the
+        # user has no way to tell that a recording never made it to
+        # disk. The window polls the transient counter each tick and
+        # latches the sticky flag for the sidebar error badge.
+        self._err_count       = 0     # transient per-tick
+        self._err_count_total = 0     # session-wide monotonic
+        self._has_ever_errored = False
+        self._last_error: str | None = None
         self._workers: list[threading.Thread] = []
         for i in range(n_workers):
             t = threading.Thread(
@@ -113,6 +122,14 @@ class _WriterPool:
             try:
                 write_wav_sync(*job[0], **job[1])
             except Exception as exc:
+                # #44: bump the session-wide counters so the window
+                # surfaces a sticky error badge. Still log to stderr
+                # for post-mortem diagnosis.
+                with self._lock:
+                    self._err_count       += 1
+                    self._err_count_total += 1
+                    self._has_ever_errored = True
+                    self._last_error = f'{type(exc).__name__}: {exc}'[:200]
                 print(f'[REC] WAV write failed: {exc}')
             finally:
                 with self._lock:
@@ -129,6 +146,31 @@ class _WriterPool:
     def pending(self) -> int:
         with self._lock:
             return self._inflight
+
+    def consume_error_count(self) -> int:
+        """#44: return & clear the transient error counter. Polled
+        once per UI tick."""
+        with self._lock:
+            n = self._err_count
+            self._err_count = 0
+            return n
+
+    def error_stats(self) -> tuple[bool, int, str | None]:
+        """#44: return (has_ever_errored, total_count, last_message).
+        Read-only snapshot — caller does not need the lock."""
+        with self._lock:
+            return (self._has_ever_errored,
+                    self._err_count_total,
+                    self._last_error)
+
+    def reset_error_stats(self) -> None:
+        """#44: clear all write-error stats (triggered by the user
+        clicking the sticky error badge)."""
+        with self._lock:
+            self._err_count        = 0
+            self._err_count_total  = 0
+            self._has_ever_errored = False
+            self._last_error       = None
 
     def drain(self, timeout: float | None = None) -> bool:
         """Block until all queued + in-flight writes finish.
@@ -183,6 +225,35 @@ def pending() -> int:
         if _pool is None:
             return 0
         return _pool.pending()
+
+
+def consume_error_count() -> int:
+    """#44: return & clear the transient write-error count on the
+    singleton pool. Safe to call when the pool was never used."""
+    with _pool_lock:
+        p = _pool
+    if p is None:
+        return 0
+    return p.consume_error_count()
+
+
+def error_stats() -> tuple[bool, int, str | None]:
+    """#44: (has_ever_errored, total, last_message) on the singleton
+    pool. Returns the "no errors" tuple when the pool was never used."""
+    with _pool_lock:
+        p = _pool
+    if p is None:
+        return (False, 0, None)
+    return p.error_stats()
+
+
+def reset_error_stats() -> None:
+    """#44: clear write-error stats on the singleton pool. No-op
+    when the pool hasn't been created yet."""
+    with _pool_lock:
+        p = _pool
+    if p is not None:
+        p.reset_error_stats()
 
 
 def drain(timeout: float | None = None) -> bool:

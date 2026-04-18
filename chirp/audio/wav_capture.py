@@ -66,6 +66,14 @@ class WavFileCapture:
         # for the rationale. Sidebar uses these for the sticky badge.
         self.drop_count_total = 0
         self.has_ever_dropped = False
+        # #43 / #48: WavFileCapture has no PortAudio layer so these
+        # stay zero, but the fields must exist with matching names so
+        # the sidebar's uniform polling path works for both capture
+        # types (same contract as the drop_count mirror).
+        self.os_drop_count        = 0
+        self.os_drop_count_total  = 0
+        self.has_ever_os_dropped  = False
+        self.open_error: str | None = None
         # #7: optional monitor loopback — see AudioCapture.set_monitor.
         self._monitor = None
         self._monitor_source_id = None
@@ -85,6 +93,7 @@ class WavFileCapture:
             self._file_sample_rate = sr
             self._file_channels = 1 if samples.ndim == 1 else samples.shape[1]
         except Exception as exc:
+            self.open_error = f'{type(exc).__name__}: {exc}'[:200]
             print(f"[WavFileCapture] Failed to open {wav_path}: {exc}")
 
     @property
@@ -137,6 +146,21 @@ class WavFileCapture:
         self.drop_count = 0
         self.drop_count_total = 0
         self.has_ever_dropped = False
+
+    def consume_os_drop_count(self) -> int:
+        """Mirror of AudioCapture.consume_os_drop_count (#43). Always
+        returns 0 for WAV playback — there's no PortAudio layer to
+        lose samples."""
+        n = self.os_drop_count
+        self.os_drop_count = 0
+        return n
+
+    def reset_error_stats(self) -> None:
+        """Mirror of AudioCapture.reset_error_stats (#43 / #48)."""
+        self.os_drop_count       = 0
+        self.os_drop_count_total = 0
+        self.has_ever_os_dropped = False
+        self.open_error          = None
 
     def resume(self) -> None:
         if self._samples is None:

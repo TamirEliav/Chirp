@@ -469,6 +469,8 @@ class ChirpWindow(QMainWindow):
             arts.append(vm['sat_text'])
         if vm.get('drop_text') is not None:
             arts.append(vm['drop_text'])
+        if vm.get('err_text') is not None:
+            arts.append(vm['err_text'])
         return arts
 
     def _recapture_bg(self, event=None):
@@ -1586,6 +1588,8 @@ class ChirpWindow(QMainWindow):
         # #28 / #29: sticky session-flag resets.
         self._sidebar.clear_sat_requested.connect(self._on_clear_sat)
         self._sidebar.clear_drops_requested.connect(self._on_clear_drops)
+        # #43 / #44 / #48: sticky error-flag reset.
+        self._sidebar.clear_errors_requested.connect(self._on_clear_errors)
 
     # ──────────────────────────────────────────────────────────────────────
     # Write-through: widgets → selected entity
@@ -1934,6 +1938,67 @@ class ChirpWindow(QMainWindow):
         if 0 <= idx < len(self._entities):
             self._entities[idx].clear_drop_flag()
             self._sidebar.update_item_drop_sticky(idx, False, 0)
+
+    def _update_error_sticky(self, idx: int, e) -> None:
+        """#43 / #44 / #48: compose ingest / OS-drop / open / writer
+        error state into a single sticky badge. The tooltip lists
+        whichever categories have fired so the user can tell at a
+        glance why the `!` lit up.
+        """
+        cap = getattr(e, 'capture', None)
+        ingest_ever = bool(getattr(e, 'has_ever_ingest_errored', False))
+        os_drop_ever = bool(getattr(cap, 'has_ever_os_dropped', False))
+        open_err = getattr(cap, 'open_error', None)
+        # Writer error stats are process-global, not per-stream. We
+        # surface them on every stream's badge because there's no
+        # reliable way to attribute a given write failure to its
+        # originating stream from here.
+        try:
+            from chirp.recording import writer as _writer
+            wr_has, wr_total, wr_last = _writer.error_stats()
+        except Exception:
+            wr_has, wr_total, wr_last = False, 0, None
+
+        any_err = ingest_ever or os_drop_ever or bool(open_err) or wr_has
+        if not any_err:
+            tip = 'No pipeline errors recorded for this stream.'
+        else:
+            parts = []
+            if ingest_ever:
+                n = int(getattr(e, 'ingest_error_count_total', 0))
+                last = getattr(e, 'last_ingest_error', None) or '?'
+                parts.append(
+                    f'{n} DSP ingestion error{"s" if n != 1 else ""} '
+                    f'(last: {last})')
+            if os_drop_ever:
+                n = int(getattr(cap, 'os_drop_count_total', 0))
+                parts.append(
+                    f'{n} OS-level input overflow{"s" if n != 1 else ""} — '
+                    f'samples lost before our queue')
+            if open_err:
+                parts.append(f'Capture open failed: {open_err}')
+            if wr_has:
+                last = wr_last or '?'
+                parts.append(
+                    f'{int(wr_total)} WAV write failure'
+                    f'{"s" if wr_total != 1 else ""} (last: {last})')
+            tip = ' · '.join(parts) + ' — click to clear.'
+        self._sidebar.update_item_error_sticky(idx, any_err, tip)
+
+    def _on_clear_errors(self, idx: int):
+        """#43 / #44 / #48: clear sticky error flags on the idx-th
+        stream. Resets the entity's ingest error counters and the
+        capture's OS-drop / open-error stats, plus the global
+        writer-pool error stats (which aren't per-stream but are
+        surfaced on every sidebar badge for visibility).
+        """
+        if 0 <= idx < len(self._entities):
+            self._entities[idx].clear_error_flag()
+            # Writer errors are global — clearing once clears for all.
+            from chirp.recording import writer as _writer
+            _writer.reset_error_stats()
+            self._sidebar.update_item_error_sticky(
+                idx, False, 'No pipeline errors recorded for this stream.')
 
     # ──────────────────────────────────────────────────────────────────────
     # Transport callbacks (operate on selected entity)
@@ -3213,6 +3278,17 @@ class ChirpWindow(QMainWindow):
                 ha='right', va='top', fontfamily='Consolas',
                 color=C['red'], fontweight='bold', bbox=_badge_bbox,
                 visible=False)
+            # #43 / #44 / #48: pipeline error overlay. Peach accent so
+            # it reads as "attention" rather than "clipping / data loss"
+            # (the red SAT / DROP badges).
+            _err_bbox = dict(facecolor=C['mantle'], edgecolor=C['peach'],
+                             linewidth=0.6, boxstyle='round,pad=0.25',
+                             alpha=0.9)
+            err_text = top_ax.text(
+                0.985, 0.67, 'ERR', transform=top_ax.transAxes, fontsize=8,
+                ha='right', va='top', fontfamily='Consolas',
+                color=C['peach'], fontweight='bold', bbox=_err_bbox,
+                visible=False)
 
             self._vm_axes.append({
                 'ax_spec': ax_spec, 'ax_amp': ax_amp, 'ax_wave': ax_wave,
@@ -3228,6 +3304,7 @@ class ChirpWindow(QMainWindow):
                 'thr_line': thr_line, 'entropy_thr_line': entropy_thr_line,
                 'title': title_obj, 'status_text': status_text,
                 'sat_text': sat_text, 'drop_text': drop_text,
+                'err_text': err_text,
             })
 
         # Set up blitting for view mode
@@ -3343,6 +3420,36 @@ class ChirpWindow(QMainWindow):
                 else:
                     vm['drop_text'].set_visible(False)
 
+            # #43 / #44 / #48: pipeline error overlay — visible when any
+            # of ingest exceptions, OS-level overflows, capture open
+            # failure, or WAV writer failures have fired on this stream.
+            if vm.get('err_text') is not None:
+                cap = getattr(e, 'capture', None)
+                ingest_ever = bool(getattr(e, 'has_ever_ingest_errored', False))
+                os_ever = bool(getattr(cap, 'has_ever_os_dropped', False))
+                open_err = getattr(cap, 'open_error', None)
+                try:
+                    from chirp.recording import writer as _writer
+                    wr_has, _, _ = _writer.error_stats()
+                except Exception:
+                    wr_has = False
+                if ingest_ever or os_ever or bool(open_err) or wr_has:
+                    # Differentiate categories in the label so the grid
+                    # conveys which failure mode hit without a tooltip.
+                    tag_parts = []
+                    if ingest_ever:
+                        tag_parts.append('DSP')
+                    if os_ever:
+                        tag_parts.append('OS')
+                    if open_err:
+                        tag_parts.append('OPEN')
+                    if wr_has:
+                        tag_parts.append('WAV')
+                    vm['err_text'].set_text('ERR ' + '/'.join(tag_parts))
+                    vm['err_text'].set_visible(True)
+                else:
+                    vm['err_text'].set_visible(False)
+
             # Blit each animated artist
             for a in self._get_vm_artists(vm):
                 a.axes.draw_artist(a)
@@ -3384,6 +3491,14 @@ class ChirpWindow(QMainWindow):
                     has_ever = bool(getattr(e.capture, 'has_ever_dropped', False))
                     total    = int(getattr(e.capture, 'drop_count_total', 0))
                     self._sidebar.update_item_drop_sticky(idx, has_ever, total)
+                except Exception:
+                    pass
+                # #43 / #44 / #48: aggregate sticky error flag. Composes
+                # four independent failure modes into a single badge so
+                # the user doesn't need a dashboard to notice something
+                # broke.
+                try:
+                    self._update_error_sticky(idx, e)
                 except Exception:
                     pass
 

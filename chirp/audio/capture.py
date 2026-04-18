@@ -32,6 +32,20 @@ class AudioCapture:
         # badge visible until the user explicitly clears it.
         self.drop_count_total = 0
         self.has_ever_dropped = False
+        # #43: PortAudio-level drops. When the audio interface or the
+        # OS input ring buffer loses samples between the driver and our
+        # callback, sounddevice raises the ``input_overflow`` flag on
+        # the ``status`` argument. The previous implementation ignored
+        # ``status`` entirely, so upstream dropouts were completely
+        # invisible. These counters feed the sidebar `!` error badge.
+        self.os_drop_count        = 0      # transient per-tick
+        self.os_drop_count_total  = 0      # session-wide monotonic
+        self.has_ever_os_dropped  = False
+        # #48: stream-open failure reason. The constructor used to
+        # swallow the exception with a print() call — in a GUI build
+        # nothing reaches the user. Callers can now check ``valid`` and
+        # read ``open_error`` to surface a message.
+        self.open_error: str | None = None
         # #7: optional monitor loopback. When wired by the owning
         # RecordingEntity, the callback also forwards raw samples to
         # the shared AudioMonitor — the monitor itself gates on
@@ -46,6 +60,7 @@ class AudioCapture:
                 callback=self._callback,
             )
         except Exception as exc:
+            self.open_error = f'{type(exc).__name__}: {exc}'[:200]
             print(f"[AudioCapture] Failed to open device {device}: {exc}")
 
     def set_monitor(self, monitor, source_id) -> None:
@@ -58,6 +73,20 @@ class AudioCapture:
         return self._stream is not None
 
     def _callback(self, indata, frames, time_info, status):
+        # #43: inspect the PortAudio status flags. ``input_overflow``
+        # means the driver's input ring buffer wrapped before we
+        # serviced it — samples were lost upstream of our queue. This
+        # is a separate failure mode from our own queue.Full and must
+        # surface independently.
+        if status is not None:
+            try:
+                overflow = bool(getattr(status, 'input_overflow', False))
+            except Exception:
+                overflow = False
+            if overflow:
+                self.os_drop_count       += 1
+                self.os_drop_count_total += 1
+                self.has_ever_os_dropped  = True
         # Feed the monitor first — it's the lowest-latency path and
         # doesn't care whether the DSP queue is full.
         mon = self._monitor
@@ -100,6 +129,26 @@ class AudioCapture:
         self.drop_count = 0
         self.drop_count_total = 0
         self.has_ever_dropped = False
+
+    def consume_os_drop_count(self) -> int:
+        """#43: return and clear the transient OS-level drop counter.
+        Polled once per UI tick so the sidebar error badge can flash.
+        Does NOT touch the sticky session stats.
+        """
+        n = self.os_drop_count
+        self.os_drop_count = 0
+        return n
+
+    def reset_error_stats(self) -> None:
+        """#43 / #48: clear OS-drop stats and any cached open-error
+        message. Triggered by the user clicking the sticky error
+        badge. Kept separate from ``reset_drop_stats`` because the
+        two have distinct badges.
+        """
+        self.os_drop_count       = 0
+        self.os_drop_count_total = 0
+        self.has_ever_os_dropped = False
+        self.open_error          = None
 
     def resume(self):
         if self._stream is not None:
