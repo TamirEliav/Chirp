@@ -180,6 +180,21 @@ class RecordingEntity:
         self.rec_enabled = False
         self._ingest_stop = threading.Event()
         self._ingest_thread: threading.Thread | None = None
+        # #53: serialise DSP-state mutation against the ingest thread.
+        # ``ingest_chunk`` holds this for the duration of one chunk;
+        # every rebuild path (buffer resize, FFT-param change, filter
+        # reset, capture swap) acquires it so we never tear down state
+        # the ingest thread is concurrently reading from. Rebuild
+        # paths that tear down the ingest thread first (change_device,
+        # change_sample_rate, use_wav_file, stop_acq) still take the
+        # lock as belt-and-suspenders.
+        self._dsp_lock = threading.Lock()
+        # #53: if ``stop_acq`` / ``_stop_ingest_and_flush`` times out
+        # waiting for the ingest thread, latch the failure so
+        # ``start_acq`` refuses to spawn a second ingest thread
+        # (silent double-spawn was the original bug). Cleared by
+        # ``clear_error_flag()``.
+        self._ingest_join_failed = False
 
         # Freq mapping
         self.freq_map_idx_floor = None
@@ -259,8 +274,28 @@ class RecordingEntity:
         """
         if self._ingest_thread is not None:
             self._ingest_stop.set()
-            self._ingest_thread.join(timeout=2.0)
-            self._ingest_thread = None
+            # #53: the old 2-second join let a stuck ingest thread
+            # silently survive — a subsequent start_acq would then
+            # spawn a *second* thread draining the same queue. Use a
+            # longer join window (ingest_chunk is bounded by the
+            # chunk duration + filter / FFT / trigger runtime, all
+            # well under 10 s) and if the thread still hasn't
+            # exited, LATCH the failure so start_acq refuses to
+            # double-spawn.
+            self._ingest_thread.join(timeout=10.0)
+            if self._ingest_thread.is_alive():
+                self._ingest_join_failed   = True
+                self.has_ever_ingest_errored = True
+                self.last_ingest_error = (
+                    'ingest thread failed to stop within 10s — '
+                    'acquisition locked until app restart')
+                print(f'[Chirp] {self.name}: ingest thread stuck; '
+                      f'not respawning to avoid double-ingest')
+                # Keep the (stuck) reference so start_acq's guard
+                # fires. It's a daemon thread so interpreter exit
+                # will still kill it.
+            else:
+                self._ingest_thread = None
         # Drain queue stragglers. The ingest thread may have exited
         # between a ``put_nowait`` on the capture side and the next
         # ``get`` — in which case the last chunk sits untouched.
@@ -302,6 +337,9 @@ class RecordingEntity:
         self.ingest_error_count_total = 0
         self.has_ever_ingest_errored  = False
         self.last_ingest_error        = None
+        # #53: also clear the stuck-ingest-thread latch so the user
+        # can try acquisition again after restarting the device.
+        self._ingest_join_failed      = False
         cap = getattr(self, 'capture', None)
         if cap is not None and hasattr(cap, 'reset_error_stats'):
             cap.reset_error_stats()
@@ -349,19 +387,22 @@ class RecordingEntity:
     # ── FFT param change ──────────────────────────────────────────────────
 
     def change_fft_params(self, nperseg: int, window: str):
-        self.spec_nperseg = nperseg
-        self.spec_window  = window
-        # Fresh accumulators start un-primed — c10 / #14.
-        self.spec_acc   = SpectrogramAccumulator(nperseg, window)
-        self.spec_acc_r = SpectrogramAccumulator(nperseg, window)
-        self.n_freq_bins  = nperseg // 2 + 1
-        self.spec_buffer  = np.full(
-            (self.n_freq_bins, self._n_cols), SPEC_DB_MIN, dtype=np.float32)
-        self.spec_buffer_r = np.full(
-            (self.n_freq_bins, self._n_cols), SPEC_DB_MIN, dtype=np.float32)
-        self.rebuild_freq_mapping()
-        # Rebuild analysis split when display params change (#12 / c19).
-        self._rebuild_analysis_split()
+        # #53: serialise against the ingest thread — this mutates
+        # spec_acc, spec_buffer, n_freq_bins which ingest_chunk reads.
+        with self._dsp_lock:
+            self.spec_nperseg = nperseg
+            self.spec_window  = window
+            # Fresh accumulators start un-primed — c10 / #14.
+            self.spec_acc   = SpectrogramAccumulator(nperseg, window)
+            self.spec_acc_r = SpectrogramAccumulator(nperseg, window)
+            self.n_freq_bins  = nperseg // 2 + 1
+            self.spec_buffer  = np.full(
+                (self.n_freq_bins, self._n_cols), SPEC_DB_MIN, dtype=np.float32)
+            self.spec_buffer_r = np.full(
+                (self.n_freq_bins, self._n_cols), SPEC_DB_MIN, dtype=np.float32)
+            self.rebuild_freq_mapping()
+            # Rebuild analysis split when display params change (#12 / c19).
+            self._rebuild_analysis_split()
 
     def change_analysis_fft_params(self, nperseg: int, window: str):
         """Change the analysis FFT parameters independently of display (#12 / c19).
@@ -370,9 +411,13 @@ class RecordingEntity:
         path reuses the display accumulator (zero overhead). Otherwise
         a dedicated analysis accumulator is created.
         """
-        self.analysis_nperseg = nperseg
-        self.analysis_window  = window
-        self._rebuild_analysis_split()
+        # #53: serialise against the ingest thread — this mutates
+        # _analysis_acc which ingest_chunk reads via the analysis_acc
+        # property.
+        with self._dsp_lock:
+            self.analysis_nperseg = nperseg
+            self.analysis_window  = window
+            self._rebuild_analysis_split()
 
     def _rebuild_analysis_split(self):
         """Create or destroy the dedicated analysis accumulator.
@@ -589,30 +634,49 @@ class RecordingEntity:
     def change_display_seconds(self, new_secs: float):
         if new_secs == self.display_seconds:
             return
-        self.display_seconds = float(new_secs)
-        self._n_cols        = max(1, int(self.display_seconds * self.sample_rate / CHUNK_FRAMES))
-        self._total_samples = self._n_cols * CHUNK_FRAMES
+        # #53: serialise buffer reallocation against the ingest
+        # thread. Without the lock, ingest_chunk can mid-write a
+        # half-freed buffer and crash with a shape mismatch.
+        with self._dsp_lock:
+            self.display_seconds = float(new_secs)
+            self._n_cols        = max(1, int(self.display_seconds * self.sample_rate / CHUNK_FRAMES))
+            self._total_samples = self._n_cols * CHUNK_FRAMES
 
-        # Rebuild buffers
-        self.amp_buffer       = np.zeros(self._total_samples, dtype=np.float32)
-        self.amp_buffer_r     = np.zeros(self._total_samples, dtype=np.float32)
-        self.abs_amp_buffer   = np.zeros(self._total_samples, dtype=np.float32)
-        self.abs_amp_buffer_r = np.zeros(self._total_samples, dtype=np.float32)
-        self.spec_buffer  = np.full(
-            (self.n_freq_bins, self._n_cols), SPEC_DB_MIN, dtype=np.float32)
-        self.spec_buffer_r = np.full(
-            (self.n_freq_bins, self._n_cols), SPEC_DB_MIN, dtype=np.float32)
-        self.entropy_buffer = np.ones(self._n_cols, dtype=np.float32)
-        self.detect_mask_buffer = np.zeros(self._total_samples, dtype=bool)
-        self.record_mask_buffer = np.zeros(self._total_samples, dtype=bool)
-        self._samples_total = 0
-        self.write_head = 0
-        self.col_head   = 0
+            # Rebuild buffers
+            self.amp_buffer       = np.zeros(self._total_samples, dtype=np.float32)
+            self.amp_buffer_r     = np.zeros(self._total_samples, dtype=np.float32)
+            self.abs_amp_buffer   = np.zeros(self._total_samples, dtype=np.float32)
+            self.abs_amp_buffer_r = np.zeros(self._total_samples, dtype=np.float32)
+            self.spec_buffer  = np.full(
+                (self.n_freq_bins, self._n_cols), SPEC_DB_MIN, dtype=np.float32)
+            self.spec_buffer_r = np.full(
+                (self.n_freq_bins, self._n_cols), SPEC_DB_MIN, dtype=np.float32)
+            self.entropy_buffer = np.ones(self._n_cols, dtype=np.float32)
+            self.detect_mask_buffer = np.zeros(self._total_samples, dtype=bool)
+            self.record_mask_buffer = np.zeros(self._total_samples, dtype=bool)
+            self._samples_total = 0
+            self.write_head = 0
+            self.col_head   = 0
 
     # ── Transport ─────────────────────────────────────────────────────────
 
     def start_acq(self):
         if not self.acq_running and self.capture.valid:
+            # #53: refuse to start if a prior ingest thread got stuck
+            # and a stop attempt couldn't join it. Without this guard
+            # we would silently double-spawn — both threads draining
+            # the same queue, ring-buffer writes racing, chunks
+            # arbitrarily split between two pipelines.
+            if (self._ingest_thread is not None
+                    and self._ingest_thread.is_alive()):
+                self._ingest_join_failed   = True
+                self.has_ever_ingest_errored = True
+                self.last_ingest_error = (
+                    'cannot start acquisition — previous ingest thread '
+                    'is still alive (restart the app)')
+                print(f'[Chirp] {self.name}: refusing to double-spawn '
+                      f'ingest thread; prior thread still alive')
+                return
             # Clear stale overlap so the first few FFT columns after a
             # restart don't mix zero-padding into the spectrum (#14).
             self.spec_acc.reset()
@@ -691,6 +755,16 @@ class RecordingEntity:
     # ── Chunk ingestion ───────────────────────────────────────────────────
 
     def ingest_chunk(self, raw_chunk: np.ndarray):
+        """#53: public entry point — holds the DSP lock for the
+        duration of one chunk so buffer / filter / accumulator
+        mutations from UI-thread rebuild paths cannot race the
+        ingestion pipeline. The lock is per-chunk (not per-session) so
+        rebuild paths get a turn between chunks.
+        """
+        with self._dsp_lock:
+            self._ingest_chunk_locked(raw_chunk)
+
+    def _ingest_chunk_locked(self, raw_chunk: np.ndarray):
         mode = self.channel_mode
         if raw_chunk.ndim == 2:
             left  = raw_chunk[:, 0]
