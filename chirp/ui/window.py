@@ -2169,8 +2169,23 @@ class ChirpWindow(QMainWindow):
             QMessageBox.warning(self, 'Load Error', f'Could not read file:\n{exc}')
             return
 
-        if not isinstance(data, dict) or 'recordings' not in data:
-            QMessageBox.warning(self, 'Load Error', 'Invalid settings file format.')
+        # #55: route through ``load_settings_dict`` so version /
+        # migration / unknown-key warnings actually run on real loads.
+        # The previous code path validated only ``'recordings' in data``
+        # and instantiated entities directly, leaving the schema
+        # version guard, the migration chain, and the unknown-key
+        # warnings as dead code (only exercised by tests).
+        from chirp.config import load_settings_dict
+        try:
+            entities, view_mode, schema_warnings = load_settings_dict(data)
+        except ValueError as exc:
+            # Invalid format / future-version file / pre-migration
+            # error. Leave the existing UI state intact — bailing here
+            # is safer than half-loading a config that the schema
+            # already rejected.
+            QMessageBox.warning(
+                self, 'Load Error',
+                f'Could not load settings:\n{exc}')
             return
 
         # Stop timer while rebuilding
@@ -2187,10 +2202,11 @@ class ChirpWindow(QMainWindow):
         self._sidebar.clear_all()
         self._selected_idx = -1
 
-        # Restore view mode globals
-        vm = data.get('view_mode', {})
-        self._vm_n_cols = vm.get('columns', 1)
-        self._vm_panel_height = vm.get('panel_height', 300)
+        # Restore view mode globals (already validated by
+        # load_settings_dict — view_mode is a dict with the right keys
+        # even if the on-disk file had garbage).
+        self._vm_n_cols = view_mode['columns']
+        self._vm_panel_height = view_mode['panel_height']
         self._vm_cols_spin.blockSignals(True)
         self._vm_cols_spin.setValue(self._vm_n_cols)
         self._vm_cols_spin.blockSignals(False)
@@ -2198,16 +2214,15 @@ class ChirpWindow(QMainWindow):
         self._vm_height_spin.setValue(self._vm_panel_height)
         self._vm_height_spin.blockSignals(False)
 
-        # Create entities from saved data
-        warnings = []
-        for rec_d in data['recordings']:
-            ent, warn = RecordingEntity.from_dict(rec_d)
+        # Per-entity device warnings come back inside ``schema_warnings``
+        # already (load_settings_dict appends RecordingEntity.from_dict's
+        # warning). Surface them all in a single modal at the end.
+        warnings = list(schema_warnings)
+        for ent in entities:
             # #7: re-wire the monitor on every freshly-loaded entity.
             ent.set_monitor(self._monitor)
             self._entities.append(ent)
             self._sidebar.add_item(ent.name)
-            if warn:
-                warnings.append(warn)
         # Rebuild monitor-source combo from the loaded entities.
         self._refresh_monitor_source_combo()
 
@@ -2243,10 +2258,18 @@ class ChirpWindow(QMainWindow):
         self._timer.start()
 
         if warnings:
+            # Combine schema warnings (unknown keys, version notes,
+            # device fallbacks) into one modal. Cap the displayed
+            # count at 20 so a really gnarly file doesn't produce a
+            # screen-tall dialog.
+            shown = warnings[:20]
+            extra = len(warnings) - len(shown)
+            body = '\n'.join(f'• {w}' for w in shown)
+            if extra > 0:
+                body += f'\n\n…and {extra} more warning(s).'
             QMessageBox.information(
-                self, 'Device Warnings',
-                'Some devices were not found:\n\n' + '\n'.join(warnings)
-                + '\n\nDefault device was used instead.')
+                self, 'Settings Loaded with Warnings',
+                f'Settings loaded with {len(warnings)} warning(s):\n\n{body}')
 
     def _refresh_transport_ui(self):
         e = self._sel
