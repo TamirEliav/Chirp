@@ -127,34 +127,84 @@ class _WriterPool:
         self._err_count_total = 0     # session-wide monotonic
         self._has_ever_errored = False
         self._last_error: str | None = None
-        self._workers: list[threading.Thread] = []
+        # #47: worker supervisor — if a worker dies from an
+        # unexpected BaseException (MemoryError, a bug in
+        # write_wav_sync, etc), the pool respawns it so the queue
+        # keeps draining. ``_respawn_count`` is exposed for tests.
+        self._shutting_down = False
+        self._respawn_count = 0
+        # #47: queue-backlog high watermark. Tracks the largest size
+        # the queue has ever reached — the UI can surface a warning
+        # when this exceeds a sane threshold on slow output targets.
+        self._queue_high_watermark = 0
+        self._workers: list[threading.Thread | None] = [None] * n_workers
         for i in range(n_workers):
-            t = threading.Thread(
-                target=self._worker_loop,
-                name=f'chirp-wav-writer-{i}',
-                daemon=False,
-            )
-            t.start()
-            self._workers.append(t)
+            self._spawn_worker(i)
 
-    def _worker_loop(self) -> None:
+    def _spawn_worker(self, worker_id: int) -> None:
+        """#47: create + start a worker thread at slot ``worker_id``.
+        Used both at pool startup and for supervisor respawns."""
+        t = threading.Thread(
+            target=self._worker_loop,
+            args=(worker_id,),
+            name=f'chirp-wav-writer-{worker_id}',
+            daemon=False,
+        )
+        with self._lock:
+            self._workers[worker_id] = t
+        t.start()
+
+    def _worker_loop(self, worker_id: int) -> None:
         while True:
-            job = self._queue.get()
+            # Dequeue — if this fails the thread hasn't consumed a
+            # job yet, so there's no accounting to unwind.
+            try:
+                job = self._queue.get()
+            except BaseException as dequeue_exc:
+                self._on_worker_death(worker_id, dequeue_exc,
+                                      decrement_inflight=False,
+                                      task_done_needed=False)
+                return
+
             if job is self._stop:
                 self._queue.task_done()
                 return
+
+            # Process the job. The ``finally`` block runs on both
+            # regular returns and on BaseException propagation, so
+            # accounting is always consistent — the outer supervisor
+            # only needs to arrange the respawn.
             try:
-                write_wav_sync(*job[0], **job[1])
-            except Exception as exc:
-                # #44: bump the session-wide counters so the window
-                # surfaces a sticky error badge. Still log to stderr
-                # for post-mortem diagnosis.
-                with self._lock:
-                    self._err_count       += 1
-                    self._err_count_total += 1
-                    self._has_ever_errored = True
-                    self._last_error = f'{type(exc).__name__}: {exc}'[:200]
-                print(f'[REC] WAV write failed: {exc}')
+                try:
+                    write_wav_sync(*job[0], **job[1])
+                except Exception as exc:
+                    # #44: ordinary Exception path — log + bump counters,
+                    # keep the worker alive for the next job.
+                    with self._lock:
+                        self._err_count       += 1
+                        self._err_count_total += 1
+                        self._has_ever_errored = True
+                        self._last_error = f'{type(exc).__name__}: {exc}'[:200]
+                    print(f'[REC] WAV write failed: {exc}')
+                except BaseException as base_exc:
+                    # #47: a BaseException subclass escaped the inner
+                    # ``except Exception`` — e.g. a bug raising
+                    # SystemExit from inside scipy, or something
+                    # similarly unusual. Log + arrange respawn; the
+                    # ``finally`` below still runs and keeps accounting
+                    # consistent.
+                    print(f'[REC] writer worker {worker_id} died during write: '
+                          f'{type(base_exc).__name__}: {base_exc!r}; respawning')
+                    with self._lock:
+                        self._err_count_total += 1
+                        self._has_ever_errored = True
+                        self._last_error = (
+                            f'worker died: {type(base_exc).__name__}'[:200])
+                        self._respawn_count += 1
+                        shutting_down = self._shutting_down
+                    if not shutting_down:
+                        self._spawn_worker(worker_id)
+                    return
             finally:
                 with self._lock:
                     self._inflight -= 1
@@ -162,14 +212,55 @@ class _WriterPool:
                         self._idle.notify_all()
                 self._queue.task_done()
 
+    def _on_worker_death(self, worker_id: int, exc: BaseException,
+                         decrement_inflight: bool,
+                         task_done_needed: bool) -> None:
+        """#47: shared cleanup for the "worker died before finishing
+        its job" paths. Logs, bumps the sticky error flag, respawns a
+        fresh worker at ``worker_id`` unless the pool is shutting
+        down, and optionally unwinds inflight / task_done accounting
+        so ``drain()`` doesn't hang forever."""
+        print(f'[REC] writer worker {worker_id} died: '
+              f'{type(exc).__name__}: {exc!r}; respawning')
+        with self._lock:
+            self._err_count_total += 1
+            self._has_ever_errored = True
+            self._last_error = f'worker died: {type(exc).__name__}'[:200]
+            if decrement_inflight:
+                self._inflight -= 1
+                if self._inflight == 0:
+                    self._idle.notify_all()
+            self._respawn_count += 1
+            shutting_down = self._shutting_down
+        if task_done_needed:
+            try:
+                self._queue.task_done()
+            except ValueError:
+                pass
+        if not shutting_down:
+            self._spawn_worker(worker_id)
+
     def submit(self, args: tuple, kwargs: dict) -> None:
         with self._lock:
             self._inflight += 1
+            # #47: track queue-backlog high watermark before we put so
+            # the reading is "after this submit, how deep can it get".
+            depth = self._inflight
+            if depth > self._queue_high_watermark:
+                self._queue_high_watermark = depth
         self._queue.put((args, kwargs))
 
     def pending(self) -> int:
         with self._lock:
             return self._inflight
+
+    def queue_stats(self) -> tuple[int, int, int]:
+        """#47: return (inflight, high_watermark, respawn_count). UI
+        uses this to surface queue-backlog + worker-death telemetry."""
+        with self._lock:
+            return (self._inflight,
+                    self._queue_high_watermark,
+                    self._respawn_count)
 
     def consume_error_count(self) -> int:
         """#44: return & clear the transient error counter. Polled
@@ -212,9 +303,15 @@ class _WriterPool:
     def shutdown(self, timeout: float | None = None) -> None:
         """Drain + send stop sentinels + join the worker threads."""
         self.drain(timeout=timeout)
-        for _ in self._workers:
+        # #47: mark the pool as shutting down so any worker that dies
+        # AFTER drain returns doesn't get respawned into a zombie that
+        # would keep the interpreter alive past closeEvent.
+        with self._lock:
+            self._shutting_down = True
+            workers = [w for w in self._workers if w is not None]
+        for _ in workers:
             self._queue.put(self._stop)
-        for t in self._workers:
+        for t in workers:
             t.join(timeout=timeout)
 
 
@@ -249,6 +346,16 @@ def pending() -> int:
         if _pool is None:
             return 0
         return _pool.pending()
+
+
+def queue_stats() -> tuple[int, int, int]:
+    """#47: (inflight, high_watermark, respawn_count) snapshot of the
+    singleton pool. Zero/zero/zero when the pool was never created."""
+    with _pool_lock:
+        p = _pool
+    if p is None:
+        return (0, 0, 0)
+    return p.queue_stats()
 
 
 def consume_error_count() -> int:
