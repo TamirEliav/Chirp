@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Chirp is a real-time sound analysis and threshold-triggered recording desktop app for bioacoustics research. Built with Python/PyQt5. Organized as the `chirp/` package after the Phase 1 refactor (was previously a ~4200-line `chirp.py` monolith). Current version: v2.0.0.
+Chirp is a real-time sound analysis and threshold-triggered recording desktop app for bioacoustics research. Built with Python/PyQt5. Organized as the `chirp/` package after the Phase 1 refactor (was previously a ~4200-line `chirp.py` monolith). Current version: v2.1.0.
 
 ## Running the App
 
