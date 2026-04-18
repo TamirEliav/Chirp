@@ -191,6 +191,13 @@ class ThresholdRecorder:
         # ── Walk every active event through this chunk ───────────────────
         threshold_silent = max(1, hold_samps)
         to_remove = []
+        # #57: Continuations spawned by force-split during this chunk are
+        # collected here and appended after the loop — we cannot mutate
+        # ``self._active_events`` while iterating it. Each continuation
+        # has already had the leftover samples of the boundary chunk
+        # walked through it for silent_samps accounting (see force-split
+        # branch below).
+        to_add: list[dict] = []
         for ev in self._active_events:
             if ev is just_created:
                 # Just opened; walk samples after trigger_pos. The trigger
@@ -233,16 +240,48 @@ class ThresholdRecorder:
                 continue
 
             # Force-split events longer than max_rec.
+            #
+            # #57: Pre-fix the first half was kept verbatim
+            # (``target_kept = samples_kept``) and a fresh event had to
+            # re-qualify through ``min_cross`` from scratch — up to
+            # ``min_cross_sec`` of audio was silently lost between the
+            # two WAVs. Post-fix the first half is pinned to exactly
+            # ``max_samps`` for a clean sample-accurate boundary and a
+            # butt-joined continuation event opens immediately at that
+            # boundary (no min_cross gate, no pre-trigger lookback).
+            # Both halves are tagged with ``split_index`` so writer
+            # composes ``..._part01.wav`` / ``..._part02.wav`` and the
+            # researcher sees the WAVs are a contiguous series.
             if ev['samples_kept'] >= max_samps:
-                ev['target_kept'] = ev['samples_kept']
+                overshoot = ev['samples_kept'] - max_samps
+                ev['target_kept'] = max_samps
+                # First-half part-index defaults to 1; on a 3-way split
+                # the second-half (already split_index=2) keeps its
+                # value when IT trips the next force-split.
+                ev['split_index'] = ev.get('split_index') or 1
                 flushed_spans.append(self._span_for_flush(ev))
                 self._flush_event(ev, output_dir, filename_prefix,
                                   filename_suffix, sample_rate, filename_stream)
                 to_remove.append(ev)
 
+                cont = self._open_continuation(
+                    ev, chunk, mask, n, overshoot,
+                    post_trig_samps=post_trig_samps,
+                    threshold_silent=threshold_silent,
+                    sample_rate=sample_rate,
+                    global_chunk_end=global_chunk_end,
+                )
+                to_add.append(cont)
+
         for ev in to_remove:
             if ev in self._active_events:
                 self._active_events.remove(ev)
+        # #57: append continuations spawned during the iteration. They
+        # are already partially walked through the leftover samples of
+        # the boundary chunk, so they participate in active_spans
+        # reporting below and are walked further by the next chunk.
+        for ev in to_add:
+            self._active_events.append(ev)
 
         # ── Build span report for still-open events ──────────────────────
         if global_chunk_end is not None:
@@ -336,6 +375,96 @@ class ThresholdRecorder:
             'sample_rate':     sample_rate,
         }
 
+    def _open_continuation(self, parent_ev: dict, chunk: np.ndarray,
+                           mask: np.ndarray, n: int, overshoot: int, *,
+                           post_trig_samps: int,
+                           threshold_silent: int,
+                           sample_rate: int,
+                           global_chunk_end: int | None) -> dict:
+        """#57: Open a butt-joined continuation event after a force-split.
+
+        The parent event has just been flushed with exactly
+        ``max_samps`` samples; this continuation owns sample
+        ``max_samps`` onwards. There is no pre-trigger lookback (the
+        boundary is exact, not a re-qualification) and no
+        ``min_cross`` gate (we know the signal was above threshold at
+        the boundary because that's how we got here).
+
+        ``overshoot`` = ``parent_ev['samples_kept'] - max_samps`` —
+        the number of samples after the boundary that already arrived
+        in the boundary chunk. Those samples become the continuation's
+        initial buffer and are walked here for ``silent_samps``
+        accounting (they may already trip the hold timer if the signal
+        went silent right at / after the boundary).
+        """
+        # Position in the chunk where the continuation begins. Clamped
+        # defensively for the pathological case where pre_trig +
+        # lookback caused the parent's samples_kept to exceed max_samps
+        # at open time (boundary in the lookback, before the chunk).
+        cont_chunk_pos = max(0, min(n, n - overshoot))
+        boundary_overshoot = n - cont_chunk_pos
+
+        if boundary_overshoot > 0:
+            buf_init = [chunk[cont_chunk_pos:].copy()]
+        else:
+            buf_init = []
+        samples_kept = boundary_overshoot
+
+        # Walk the leftover samples for hold accounting. last_above_kept
+        # defaults to ``samples_kept - 1`` (the boundary sample is by
+        # definition above-threshold) when the chunk has any leftover.
+        # When the boundary lands exactly at chunk end (overshoot == 0)
+        # we initialise to -1 — the next chunk's walk will set it
+        # correctly the first time it sees an above sample.
+        sil = 0
+        last_above_kept = samples_kept - 1 if samples_kept > 0 else -1
+        ended = False
+        target_kept: int | None = None
+        for i in range(cont_chunk_pos, n):
+            if mask[i]:
+                sil = 0
+                last_above_kept = i - cont_chunk_pos
+            else:
+                sil += 1
+                if sil >= threshold_silent:
+                    ended = True
+                    target_kept = last_above_kept + 1 + post_trig_samps
+                    break
+
+        # Continuation's onset is parent's onset + parent's duration so
+        # the timestamps reflect the actual capture time of the
+        # continuation's first sample (not the parent's start).
+        parent_kept = parent_ev['target_kept']
+        parent_sr = parent_ev.get('sample_rate', sample_rate)
+        onset = (parent_ev['onset_time']
+                 + datetime.timedelta(seconds=parent_kept / parent_sr))
+
+        # Continuation's global_start is right after parent's end so
+        # the active_spans / flushed_spans reports stay contiguous.
+        pgs = parent_ev.get('global_start')
+        if pgs is None or global_chunk_end is None:
+            global_start = None
+        else:
+            global_start = pgs + parent_kept
+
+        return {
+            'buf':             buf_init,
+            'start_offset':    0,
+            'samples_kept':    samples_kept,
+            'last_above_kept': last_above_kept,
+            'silent_samps':    sil,
+            'ended':           ended,
+            'target_kept':     target_kept,
+            'onset_time':      onset,
+            # Continuations inherit the parent's pinned sample rate —
+            # the original capture rate (#46) — so a mid-event SR change
+            # doesn't relabel part2 with the new rate while part1 still
+            # carries the old one.
+            'global_start':    global_start,
+            'sample_rate':     parent_sr,
+            'split_index':     (parent_ev.get('split_index') or 1) + 1,
+        }
+
     @staticmethod
     def _span_for_flush(ev: dict) -> tuple[int, int]:
         """Return ``(g_start, g_end)`` for an event about to be flushed.
@@ -386,8 +515,21 @@ class ThresholdRecorder:
         # rate at which the samples were captured, otherwise the file
         # plays back at the wrong speed.
         ev_sr = ev.get('sample_rate', sample_rate)
+        # #57: tag halves of a force-split event with a ``partNN`` token
+        # in the filename so the researcher sees they belong to one
+        # contiguous capture. The token is injected into the suffix so
+        # the writer's existing filename composition handles it without
+        # special casing — the sanitizer accepts ``part01`` as-is and
+        # the parts list filters empties, so a blank user suffix is
+        # fine.
+        eff_suffix = filename_suffix
+        si = ev.get('split_index')
+        if si:
+            part_tok = f'part{si:02d}'
+            eff_suffix = (f'{filename_suffix}_{part_tok}'
+                          if filename_suffix else part_tok)
         self._start_flush(trimmed, output_dir, filename_prefix,
-                          filename_suffix, sample_rate=ev_sr,
+                          eff_suffix, sample_rate=ev_sr,
                           onset_time=ev['onset_time'],
                           filename_stream=filename_stream)
 
