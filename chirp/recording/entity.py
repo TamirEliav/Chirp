@@ -561,26 +561,47 @@ class RecordingEntity:
         need_ch = 2 if self.channel_mode != 'Mono' else 1
         probe = self._make_capture(channels=need_ch)
         if not probe.valid:
-            # Fall back to live device on failure.
-            probe.close()
-            self.input_source = 'device'
-            self.wav_file_path = None
-            self.capture = self._make_capture(channels=need_ch)
-            return False, f"Could not open WAV file: {path}"
+            # #49: do NOT fall back to the live device. The user
+            # explicitly requested WAV replay; silently switching to
+            # the default microphone produces "wrong source"
+            # data-corruption — a researcher analyses what they think
+            # is the canned clip but is actually mic hiss. Keep the
+            # invalid capture in place — its ``open_error`` is
+            # surfaced via the sidebar's `!` badge through the
+            # existing ``_update_error_sticky`` plumbing.
+            self.capture = probe  # invalid, but its open_error is set
+            err = f"Could not open WAV file: {path}"
+            self.last_ingest_error = (probe.open_error or err)[:200]
+            self.has_ever_ingest_errored = True
+            return False, err
 
         warning = None
+        # #54: WAV has more channels than the session is configured to
+        # use → silently truncated. Surface it so the user knows.
+        if probe.file_channels > need_ch:
+            warning = (f"WAV file has {probe.file_channels} channels but "
+                       f"session is configured for {need_ch} — "
+                       f"channels {need_ch + 1}–{probe.file_channels} "
+                       f"will be ignored")
+            # Latch a sticky warning on the entity so the sidebar can
+            # surface it past the initial load modal.
+            self.last_ingest_error = warning[:200]
+            self.has_ever_ingest_errored = True
+
         file_sr = probe.file_sample_rate
         if file_sr and file_sr != self.sample_rate and file_sr in self.SUPPORTED_RATES:
             probe.close()
             # change_sample_rate will call _make_capture again with the
             # new rate, reusing the WAV source we just configured.
             self.change_sample_rate(file_sr)
-            warning = (f"Session sample rate changed to {file_sr} Hz to "
-                       f"match WAV file")
+            sr_warning = (f"Session sample rate changed to {file_sr} Hz to "
+                          f"match WAV file")
+            warning = f"{warning}; {sr_warning}" if warning else sr_warning
         elif file_sr and file_sr != self.sample_rate:
-            warning = (f"WAV file sample rate ({file_sr} Hz) is not a "
-                       f"supported session rate — resampling is not "
-                       f"performed; timing will be off")
+            sr_warning = (f"WAV file sample rate ({file_sr} Hz) is not a "
+                          f"supported session rate — resampling is not "
+                          f"performed; timing will be off")
+            warning = f"{warning}; {sr_warning}" if warning else sr_warning
             self.capture = probe
         else:
             self.capture = probe
@@ -1227,8 +1248,16 @@ class RecordingEntity:
         # attributes; __init__ already created a live-device capture).
         if e.input_source == 'wav_file' and e.wav_file_path:
             ok, wav_warning = e.use_wav_file(e.wav_file_path, loop=e.wav_loop)
-            if not ok and wav_warning:
-                warning = f"{warning}; {wav_warning}" if warning else wav_warning
+            # #49: ALWAYS propagate the warning — both on failure
+            # ("could not open WAV") and on success-with-caveat
+            # (channel truncation, SR change). Pre-fix only the
+            # ``not ok and wav_warning`` branch was forwarded, so a
+            # successful WAV open with channel truncation never
+            # reached the user.
+            if wav_warning:
+                rec_name = e.name or '<unnamed>'
+                tag = f"[{rec_name}] {wav_warning}"
+                warning = f"{warning}; {tag}" if warning else tag
 
         e.rebuild_freq_mapping()
         return e, warning

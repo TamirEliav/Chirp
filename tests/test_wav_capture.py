@@ -206,14 +206,24 @@ def test_entity_use_wav_file_syncs_sample_rate(tmp_path):
 
 
 def test_entity_use_wav_file_bad_path_returns_false(tmp_path):
+    """#49: a missing WAV file must NOT fall back to the live device.
+    Pre-fix this test pinned the buggy fall-back; post-fix the entity
+    keeps the invalid WavFileCapture in place so the user can see the
+    error and fix the path without silently recording from the
+    default microphone."""
     e = RecordingEntity(name='test', device_id=None)
     try:
-        ok, warning = e.use_wav_file(str(tmp_path / 'missing.wav'))
+        bad = str(tmp_path / 'missing.wav')
+        ok, warning = e.use_wav_file(bad)
         assert not ok
         assert warning and 'Could not open' in warning
-        # Entity should have reverted to a live-device capture.
-        assert e.input_source == 'device'
-        assert e.wav_file_path is None
+        # #49: input_source stays 'wav_file' and wav_file_path is
+        # preserved — the user retries by editing the path; the entity
+        # is in a clearly-broken state (capture.valid == False) until
+        # they do.
+        assert e.input_source == 'wav_file'
+        assert e.wav_file_path == bad
+        assert e.capture.valid is False
     finally:
         e.close()
 

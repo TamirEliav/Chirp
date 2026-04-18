@@ -251,6 +251,11 @@ def test_use_wav_file_flushes_in_flight_event(captured_flushes, monkeypatch, tmp
     class _FakeWavCap:
         valid = True
         file_sample_rate = e.sample_rate  # same rate → no SR rebuild path
+        # #54: use_wav_file now reads file_channels to detect channel
+        # truncation. Mirror the real WavFileCapture surface.
+        file_channels = 1
+        channels_truncated = False
+        channels_truncated_msg = ''
         def __init__(self, *a, **kw): pass
         def close(self): pass
         def pause(self): pass
