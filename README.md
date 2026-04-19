@@ -4,7 +4,7 @@
 
 Chirp is a desktop application for multi-stream audio monitoring, visualization, and threshold-triggered recording. It was designed with bioacoustics research in mind but works for any audio analysis task.
 
-![Version](https://img.shields.io/badge/Version-v2.2.0-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
+![Version](https://img.shields.io/badge/Version-v2.2.1-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 ---
 
@@ -94,6 +94,12 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - Swap the live capture for a WAV file (`WavFileCapture`) to feed a reproducible signal through the full pipeline — trigger, writer, spectrogram, entropy — for regression testing and offline analysis
 
 ---
+
+## What's New in v2.2.1
+
+A single-issue patch release fixing a v2.1.0 regression that prevented threshold-triggered recording from firing on narrowband signals (pure tones, bandpassed bioacoustic calls, whistles).
+
+- **Envelope-based amplitude trigger** — `amp_mask` is now built from the analytic-signal envelope (`|hilbert(filt)|`) rather than `|filt|`. The pre-fix per-sample compare dipped to zero at every waveform zero crossing, which reset `_above_streak` in the state machine on every half-cycle; a sustained 1 kHz sine whose envelope was 5× threshold could never satisfy `min_cross` because the raw-amplitude compare only ever accumulated ~20 consecutive above samples between zero crossings. The yellow detect strip also flickered at the signal frequency instead of being solid during a tone. Regression introduced in v2.1.0 by the sample-accurate state-machine rewrite (#15); pre-v2.1 versions compared a chunk-level peak and were unaffected. Fix lives in the new `chirp/dsp/envelope.py` module; regression test in `tests/test_envelope_trigger.py`.
 
 ## What's New in v2.2.0
 
