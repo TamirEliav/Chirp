@@ -2715,18 +2715,25 @@ class ChirpWindow(QMainWindow):
 
         Checks (in order):
           1. non-empty string
-          2. ``os.path.isdir``
-          3. writable (best-effort ``open(w)`` on a ``.chirp_write_test``
-             sibling, then cleanup)
-
-        Does NOT create the folder — that's deliberate, ``os.makedirs``
-        in the writer handles the "doesn't exist yet" case for normal
-        usage. Here we want to catch removed/disconnected drives and
-        obvious typos before the first trigger fires.
+          2. if the path doesn't exist, attempt ``os.makedirs(...,
+             exist_ok=True)`` — first-run with the default
+             ``./recordings`` is the common case and silently creating
+             it is the right behaviour. Only fall through to "invalid"
+             when the create fails (read-only filesystem, no permission,
+             illegal name on this OS, etc.).
+          3. ``os.path.isdir`` (catches the "exists but is a file" case)
+          4. writable (best-effort ``open(w)`` on a ``.chirp_write_test``
+             sibling, then cleanup) — catches removed / disconnected
+             drives where the path string is fine but the mount is gone.
         """
         import os as _os
         if not isinstance(path, str) or not path.strip():
             return (False, 'output folder is empty')
+        if not _os.path.exists(path):
+            try:
+                _os.makedirs(path, exist_ok=True)
+            except OSError as exc:
+                return (False, f'could not create directory: {exc}')
         if not _os.path.isdir(path):
             return (False, f'not a directory: {path!r}')
         probe = _os.path.join(path, '.chirp_write_test')
