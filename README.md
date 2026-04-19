@@ -4,7 +4,7 @@
 
 Chirp is a desktop application for multi-stream audio monitoring, visualization, and threshold-triggered recording. It was designed with bioacoustics research in mind but works for any audio analysis task.
 
-![Version](https://img.shields.io/badge/Version-v2.1.0-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
+![Version](https://img.shields.io/badge/Version-v2.2.0-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 ---
 
@@ -94,6 +94,24 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - Swap the live capture for a WAV file (`WavFileCapture`) to feed a reproducible signal through the full pipeline — trigger, writer, spectrogram, entropy — for regression testing and offline analysis
 
 ---
+
+## What's New in v2.2.0
+
+A robustness-focused release: every issue tagged `data-loss` / `bug` / `robustness` from the v2.1.x audit (#43–#58) is now closed. No new user-facing features; the focus is on never silently losing a recording.
+
+- **Error surfacing** — sticky red badge in the sidebar latches on the first writer-pool / ingest-thread failure with a tooltip and reset-on-click (#44, #43, #48).
+- **Safe teardown flush** — Stop Acq, change device, change sample rate, switch-to-WAV, and remove-stream all now flush in-flight trigger events through `_stop_ingest_and_flush` so a tone in progress is never discarded (#45).
+- **Atomic WAV writes** — every WAV is written to a sibling `.tmp` file, fsynced, then `os.replace`-d, so a crash mid-write leaves the old file untouched or the new file complete — never a truncated header (#52).
+- **Writer-pool resilience** — workers are supervised and respawn on death; queue-backlog watermark + respawn count exposed for telemetry (#47).
+- **Graceful close** — `closeEvent` drains the writer pool with a modal progress dialog and surfaces partial-failure summaries (#56).
+- **DSP lock + ingest thread** — buffer reallocation across sample-rate changes is locked against concurrent ingest (#53).
+- **Sample-rate hardening** — events flushed mid-SR-change carry the original capture rate in the WAV header (#46).
+- **Filename + path hygiene** — Windows reserved names, path traversal, length caps, blank `output_dir`, and realpath containment all guarded at the writer entry point (#51, #50).
+- **Schema-validated config loader** — `_load_settings` routes through the schema validator and bails BEFORE teardown on a bad file, surfacing warnings in a modal (#55).
+- **WAV replay correctness** — missing-file no longer falls back to the live mic; multi-channel WAV truncation is surfaced in the sidebar (#49, #54).
+- **Display-thread guard** — `_update_plot` body wrapped in a top-level try/except; on persistent failure a sticky "DISPLAY HALTED — acquisition still running" note appears so the user knows NOT to force-kill (#58).
+- **`max_rec` butt-joined continuation** — a force-split now opens a continuation event immediately at the boundary (no `min_cross` re-qualification gate). The two halves butt-join sample-accurately and carry `_part01` / `_part02` filename suffixes so the WAV series is unambiguous (#57).
+- **Default folder auto-create** — the default `./recordings` folder is created on first run instead of being flagged as an invalid path.
 
 ## What's New in v2.1.0
 

@@ -198,10 +198,48 @@ def test_probe_output_dir_ok(tmp_path):
     assert reason == ''
 
 
-def test_probe_output_dir_missing_path(tmp_path):
+def test_probe_output_dir_creates_missing_folder(tmp_path):
+    """A missing path is the common first-run case (default
+    ``./recordings``). The probe must silently create it rather than
+    flagging the textbox red — that was the wrong UX."""
+    import os as _os
     win = _make_window_for_folder_tests()
-    bad = str(tmp_path / 'does-not-exist')
+    target = str(tmp_path / 'recordings')
+    assert not _os.path.exists(target)
+
+    ok, reason = win._probe_output_dir(target)
+
+    assert ok is True
+    assert reason == ''
+    assert _os.path.isdir(target)
+
+
+def test_probe_output_dir_uncreatable_path_is_invalid(tmp_path):
+    """When the path can't be created (e.g. nested under a file), the
+    probe still flags it invalid so the user sees something is wrong."""
+    win = _make_window_for_folder_tests()
+    # Create a regular file, then try to use a path nested INSIDE it as
+    # a directory — os.makedirs will raise on every platform.
+    blocker = tmp_path / 'a-file'
+    blocker.write_text('x')
+    bad = str(blocker / 'nested')
+
     ok, reason = win._probe_output_dir(bad)
+
+    assert ok is False
+    assert 'create' in reason.lower() or 'directory' in reason.lower()
+
+
+def test_probe_output_dir_existing_file_is_invalid(tmp_path):
+    """A path that exists but is a file (not a directory) must still
+    be flagged invalid — auto-create only kicks in when the path
+    doesn't exist at all."""
+    win = _make_window_for_folder_tests()
+    f = tmp_path / 'somefile.txt'
+    f.write_text('x')
+
+    ok, reason = win._probe_output_dir(str(f))
+
     assert ok is False
     assert 'directory' in reason.lower()
 
@@ -225,8 +263,10 @@ def test_apply_folder_validation_stamps_entity(tmp_path):
     assert e.output_dir_valid is True
     assert e.output_dir_error is None
 
-    # Invalid path
-    win._apply_folder_validation(e, str(tmp_path / 'nope'))
+    # Invalid path — an unreachable nested location (parent is a file).
+    blocker = tmp_path / 'a-file'
+    blocker.write_text('x')
+    win._apply_folder_validation(e, str(blocker / 'nested'))
     assert e.output_dir_valid is False
     assert e.output_dir_error is not None
     # And the textbox was styled red.
@@ -244,8 +284,10 @@ def test_apply_folder_validation_clears_style_on_ok(tmp_path):
     win = _make_window_for_folder_tests()
     e = RecordingEntity(name='t', device_id=None)
 
-    win._apply_folder_validation(e, str(tmp_path / 'nope'))  # invalid
-    win._apply_folder_validation(e, str(tmp_path))           # valid
+    blocker = tmp_path / 'a-file'
+    blocker.write_text('x')
+    win._apply_folder_validation(e, str(blocker / 'nested'))  # invalid
+    win._apply_folder_validation(e, str(tmp_path))            # valid
     # Last style-sheet call cleared the style.
     last_call = win._folder_edit.setStyleSheet.call_args_list[-1]
     assert last_call[0][0] == ''
