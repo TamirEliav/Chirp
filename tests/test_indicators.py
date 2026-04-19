@@ -203,14 +203,34 @@ def test_entity_has_indicator_buffers_matching_amp_size():
 
 
 def test_entity_detect_buffer_mirrors_threshold_crossings(captured_flushes):
+    """Detect mask lights up in the region where a burst is present,
+    stays dark elsewhere. Uses a 1 kHz sine burst because the mask is
+    now built from the analytic-signal envelope (see envelope.py) —
+    the envelope of a rectangular DC pulse has Hilbert sidelobes that
+    bleed into the silent regions, while a sine burst gives a clean
+    step transition.
+    """
     e = _make_entity()
     try:
+        sr = e.sample_rate
         chunk = np.zeros(CHUNK_FRAMES, dtype=np.float32)
-        chunk[100:500] = 0.9
+        # 1 kHz sine at amp 0.9 over samples [200:800]. Margins of
+        # ~200 samples on each side give the Hilbert transient enough
+        # room to decay below threshold (0.5).
+        burst_lo, burst_hi = 200, 800
+        n_burst = burst_hi - burst_lo
+        t = np.arange(n_burst, dtype=np.float64) / sr
+        chunk[burst_lo:burst_hi] = (
+            0.9 * np.sin(2 * np.pi * 1000 * t)).astype(np.float32)
         e.ingest_chunk(chunk)
-        assert e.detect_mask_buffer[100:500].all()
-        assert not e.detect_mask_buffer[:100].any()
-        assert not e.detect_mask_buffer[500:CHUNK_FRAMES].any()
+        # Interior of the burst is solidly True.
+        assert e.detect_mask_buffer[burst_lo + 50:burst_hi - 50].all()
+        # Far from the burst, mask is False (skip a guard band around
+        # each edge for the Hilbert transient).
+        guard = 100
+        assert not e.detect_mask_buffer[:burst_lo - guard].any()
+        assert not e.detect_mask_buffer[
+            burst_hi + guard:CHUNK_FRAMES].any()
     finally:
         e.close()
 
@@ -363,28 +383,45 @@ def test_entity_detect_mask_is_same_array_state_machine_sees(
 
     monkeypatch.setattr(e.recorder, 'process_chunk', _spy)
     try:
+        sr = e.sample_rate
+        # Two 1 kHz sine bursts inside one chunk, separated by silence.
+        # The distinction between chunk-uniform broadcast and per-sample
+        # walking only matters for signals whose mask changes mid-chunk.
+        # Using sine bursts (not DC) because the mask is built from the
+        # analytic envelope.
         chunk = np.zeros(CHUNK_FRAMES, dtype=np.float32)
-        # Mixed above/below threshold inside one chunk — the
-        # distinction between chunk-uniform broadcast and per-sample
-        # walking only matters for signals like this.
-        chunk[100:200] = 0.9
-        chunk[400:450] = 0.9
+        b1_lo, b1_hi = 150, 400   # first burst (250 samples wide)
+        b2_lo, b2_hi = 550, 800   # second burst (250 samples wide)
+        for lo, hi in ((b1_lo, b1_hi), (b2_lo, b2_hi)):
+            n = hi - lo
+            t = np.arange(n, dtype=np.float64) / sr
+            chunk[lo:hi] = (
+                0.9 * np.sin(2 * np.pi * 1000 * t)).astype(np.float32)
         e.ingest_chunk(chunk)
         tm = seen['trigger_mask']
         assert tm is not None, 'entity must pass trigger_mask to recorder'
         assert tm.dtype == bool
         assert tm.shape == (CHUNK_FRAMES,)
         # detect_mask_buffer for this chunk's ring region must equal
-        # the recorder's trigger_mask, element for element.
+        # the recorder's trigger_mask, element for element — the
+        # single-source-of-truth invariant.
         np.testing.assert_array_equal(
             e.detect_mask_buffer[:CHUNK_FRAMES], tm)
-        # And it must NOT be a chunk-uniform broadcast — it must have
-        # per-sample granularity matching the above/below pattern.
-        assert tm[100:200].all()
-        assert tm[400:450].all()
-        assert not tm[:100].any()
-        assert not tm[200:400].any()
-        assert not tm[450:].any()
+        # Per-sample granularity: interior of each burst is True,
+        # interior of each silent region is False (skip guard bands
+        # around each boundary for the Hilbert transient). This
+        # proves the mask is NOT a chunk-uniform broadcast.
+        guard = 50
+        assert tm[b1_lo + guard:b1_hi - guard].all()
+        assert tm[b2_lo + guard:b2_hi - guard].all()
+        # Gap between bursts has a True→False→True transition in the
+        # middle — check the center of the gap, away from edges.
+        gap_center = (b1_hi + b2_lo) // 2
+        assert not tm[gap_center - 30:gap_center + 30].any()
+        # Leading silence is False, well away from the first burst.
+        assert not tm[:b1_lo - guard].any()
+        # Trailing silence likewise.
+        assert not tm[b2_hi + guard:].any()
     finally:
         e.close()
 

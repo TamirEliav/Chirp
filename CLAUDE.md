@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Chirp is a real-time sound analysis and threshold-triggered recording desktop app for bioacoustics research. Built with Python/PyQt5. Organized as the `chirp/` package after the Phase 1 refactor (was previously a ~4200-line `chirp.py` monolith). Current version: v2.2.0.
+Chirp is a real-time sound analysis and threshold-triggered recording desktop app for bioacoustics research. Built with Python/PyQt5. Organized as the `chirp/` package after the Phase 1 refactor (was previously a ~4200-line `chirp.py` monolith). Current version: v2.2.1.
 
 ## Running the App
 
@@ -50,6 +50,7 @@ chirp/
 ├── dsp/
 │   ├── spectrogram.py   SpectrogramAccumulator
 │   ├── filter.py        BandpassFilter
+│   ├── envelope.py      analytic_envelope (Hilbert magnitude)
 │   └── entropy.py       normalized_spectral_entropy
 ├── audio/
 │   ├── capture.py       AudioCapture (sounddevice.InputStream wrapper)
@@ -86,6 +87,7 @@ AudioCapture callback → queue → [ingestion thread] RecordingEntity.ingest_ch
 
 - **Ring buffers** use modulo-arithmetic write heads (`write_head`, `col_head`) for O(1) circular writes. Includes amplitude, spectrogram, and entropy buffers.
 - **Frequency scales**: Linear, Log, and Mel modes via lookup-table interpolation in `rebuild_freq_mapping()`.
+- **Amplitude trigger**: Per-sample `envelope >= threshold` mask, where envelope is the magnitude of the analytic signal (Hilbert transform of the bandpassed waveform). Chosen over `|x| >= threshold` because the latter dips to zero at every waveform zero crossing — for narrowband signals (pure tones, bandpassed calls) that reset `_above_streak` on every half-cycle and prevented `min_cross` from ever being satisfied. See `chirp/dsp/envelope.py` and `tests/test_envelope_trigger.py`.
 - **Spectral entropy trigger**: Normalized Shannon entropy (0=pure tone, 1=white noise) computed from FFT magnitudes. Four modes: Amplitude Only, Spectral Only, Amp AND Spectral, Amp OR Spectral. Triggers when entropy falls *below* threshold. Entropy trace plot with draggable threshold appears when a spectral mode is active.
 - **Stereo trigger modes**: Left Channel, Right Channel, Any Channel, Both Channels, Average — applies to both amplitude and entropy triggers.
 - **Auto-calibrate**: Measures ambient noise to set threshold automatically.

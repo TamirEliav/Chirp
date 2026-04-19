@@ -43,6 +43,7 @@ from chirp.constants import (
     SPECTROGRAM_NPERSEG,
 )
 from chirp.dsp import BandpassFilter, SpectrogramAccumulator
+from chirp.dsp import analytic_envelope as _envelope
 from chirp.dsp import normalized_spectral_entropy as _spectral_entropy
 from chirp.recording.trigger import ThresholdRecorder
 
@@ -921,27 +922,35 @@ class RecordingEntity:
         #       not a parallel per-sample computation that can drift
         #       from what the recorder sees.
         #
-        # Amplitude component: per-sample |filtered signal| ≥ threshold
-        # under the active `trigger_mode` rule. Spectral component: the
-        # entropy trigger is chunk-level (one entropy value per FFT
-        # column), so it contributes a scalar AND/OR gate.
+        # Amplitude component: per-sample ENVELOPE ≥ threshold under
+        # the active `trigger_mode` rule. Envelope = |analytic signal|
+        # (Hilbert transform magnitude), which is smooth across
+        # waveform zero crossings. Using |filtered signal| instead
+        # (pre-fix) made narrowband signals — pure tones, bandpassed
+        # bioacoustic calls — dip below threshold every half-cycle,
+        # so the consecutive-above-samples streak could never reach
+        # ``min_cross_samps``. See chirp/dsp/envelope.py and
+        # tests/test_envelope_trigger.py for details. Spectral
+        # component: the entropy trigger is chunk-level (one entropy
+        # value per FFT column), so it contributes a scalar AND/OR
+        # gate.
         if mode == 'Stereo':
-            abs_fl = np.abs(filt_l)
-            abs_fr = np.abs(filt_r)
+            env_fl = _envelope(filt_l)
+            env_fr = _envelope(filt_r)
             tm = self.trigger_mode
             if tm == 'Left Channel':
-                filt_combined_abs = abs_fl
+                filt_combined_env = env_fl
             elif tm == 'Right Channel':
-                filt_combined_abs = abs_fr
+                filt_combined_env = env_fr
             elif tm == 'Any Channel':
-                filt_combined_abs = np.maximum(abs_fl, abs_fr)
+                filt_combined_env = np.maximum(env_fl, env_fr)
             elif tm == 'Both Channels':
-                filt_combined_abs = np.minimum(abs_fl, abs_fr)
+                filt_combined_env = np.minimum(env_fl, env_fr)
             else:  # Average
-                filt_combined_abs = (abs_fl + abs_fr) * 0.5
+                filt_combined_env = (env_fl + env_fr) * 0.5
         else:
-            filt_combined_abs = np.abs(filt)
-        amp_mask = filt_combined_abs >= self.threshold
+            filt_combined_env = _envelope(filt)
+        amp_mask = filt_combined_env >= self.threshold
 
         stm = self.spectral_trigger_mode
         # #14: spectral entropy is meaningless during FFT warm-up. Use

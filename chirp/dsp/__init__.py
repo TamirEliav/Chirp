@@ -8,11 +8,13 @@ graph and should stay cheap to import and easy to unit-test.
 """
 
 from chirp.dsp.entropy import normalized_spectral_entropy
+from chirp.dsp.envelope import analytic_envelope
 from chirp.dsp.filter import BandpassFilter
 from chirp.dsp.spectrogram import SpectrogramAccumulator
 
 __all__ = [
     "BandpassFilter",
     "SpectrogramAccumulator",
+    "analytic_envelope",
     "normalized_spectral_entropy",
 ]
