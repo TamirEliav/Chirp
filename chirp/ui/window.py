@@ -383,14 +383,22 @@ class ChirpWindow(QMainWindow):
             self._cursor_wave_r = None
 
         # -- Amplitude envelope axis --
+        # Initial Y data must already be in display units (linear or
+        # dB) so the line lands at the right position the moment the
+        # background snapshot is captured. Plotting linear zeros under
+        # a log axis would otherwise render the seed line at y=0 (the
+        # top edge of the dB range), which sticks until something
+        # forces a full re-render of the figure background.
+        scale = getattr(e, 'amp_scale', 'linear') if e else 'linear'
+        seed = _amp_to_display(np.zeros(ts), scale)
         (self._amp_line,) = self._ax_amp.plot(
-            t_axis, np.zeros(ts),
+            t_axis, seed,
             color=C['blue'], linewidth=0.7, antialiased=False,
             label='L' if stereo else None,
         )
         if stereo:
             (self._amp_line_r,) = self._ax_amp.plot(
-                t_axis, np.zeros(ts),
+                t_axis, seed,
                 color=C['pink'], linewidth=0.7, antialiased=False, label='R',
             )
             self._ax_amp.legend(loc='upper right', fontsize=8,
@@ -399,7 +407,6 @@ class ChirpWindow(QMainWindow):
         else:
             self._amp_line_r = None
 
-        scale = getattr(e, 'amp_scale', 'linear') if e else 'linear'
         amp_lo, amp_hi = _amp_axis_limits(e)
         self._ax_amp.set_xlim(0.0, disp_secs)
         self._ax_amp.set_ylim(amp_lo, amp_hi)
@@ -3530,17 +3537,21 @@ class ChirpWindow(QMainWindow):
 
             ax_amp = self._fig.add_subplot(inner[inner_idx['amp']], sharex=first_ax)
 
+            # Seed the line in display units so an initial linear-zero
+            # snapshot doesn't render at y=0 of a dB-axis (the top edge)
+            # and stick there until something forces a full re-render.
+            scale = getattr(e, 'amp_scale', 'linear')
+            seed = _amp_to_display(np.zeros(e_ts), scale)
             (amp_line,) = ax_amp.plot(
-                e_t_axis, np.zeros(e_ts),
+                e_t_axis, seed,
                 color=C['blue'], linewidth=0.6, antialiased=False,
             )
             amp_line_r = None
             if e.channel_mode == 'Stereo':
                 (amp_line_r,) = ax_amp.plot(
-                    e_t_axis, np.zeros(e_ts),
+                    e_t_axis, seed,
                     color=C['pink'], linewidth=0.6, antialiased=False,
                 )
-            scale = getattr(e, 'amp_scale', 'linear')
             amp_lo, amp_hi = _amp_axis_limits(e)
             ax_amp.set_xlim(0.0, e_disp)
             ax_amp.set_ylim(amp_lo, amp_hi)
