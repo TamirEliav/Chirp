@@ -52,7 +52,7 @@ _KNOWN_RECORDING_KEYS: frozenset[str] = frozenset({
     "display_freq_lo", "display_freq_hi",
     "output_dir", "filename_prefix", "filename_suffix",
     "ref_date", "dph_folder_prefix",
-    "amp_ylim",
+    "amp_ylim", "amp_scale",
     "spectral_trigger_mode", "spectral_threshold",
     "display_mode",
     "analysis_nperseg", "analysis_window",

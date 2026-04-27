@@ -18,7 +18,7 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 
 ### Real-Time Visualization
 - **Spectrogram** display with configurable FFT size, window function, and frequency scale (Linear / Log / Mel)
-- **Amplitude envelope** with scrollable Y-axis zoom
+- **Amplitude envelope** with scrollable Y-axis zoom and per-stream **linear / log (dB) Y scale** (right-click the amp plot to switch; defaults to log)
 - **Raw waveform** display showing signed audio samples (teal color)
 - Adjustable display buffer duration (5s – 60s)
 - Gain, dB floor, and dB ceiling controls for spectrogram contrast

@@ -223,3 +223,59 @@ def test_legacy_config_without_analysis_keys_defaults_to_display():
     assert ent.analysis_nperseg == 2048
     assert ent.analysis_window == 'blackman'
     assert ent._analysis_acc is None  # same as display → shared
+
+
+# ── amp_scale (linear/log Y on the amplitude plot) ────────────────────────
+
+def test_amp_scale_default_is_log():
+    """New entities default to log/dB display — the request that
+    introduced this preference asked specifically for log to be the
+    default since envelopes range over many orders of magnitude."""
+    e = _entity()
+    assert e.amp_scale == 'log'
+
+
+def test_amp_scale_round_trip_linear():
+    e = _entity()
+    e.amp_scale = 'linear'
+    d = e.to_dict()
+    assert d['amp_scale'] == 'linear'
+    e2, _ = RecordingEntity.from_dict(d)
+    assert e2.amp_scale == 'linear'
+
+
+def test_amp_scale_legacy_dict_defaults_to_log():
+    """Configs saved before the amp_scale field existed must load
+    cleanly with the new default ('log') so existing setups don't
+    break on upgrade."""
+    d = {'name': 'Legacy'}
+    e, _ = RecordingEntity.from_dict(d)
+    assert e.amp_scale == 'log'
+
+
+def test_amp_display_helpers_linear_and_log():
+    """Verify the conversion helpers used by the amp axis are consistent
+    end-to-end: a value's display form (log) round-trips through the
+    inverse to the original linear value (within tolerance)."""
+    from chirp.ui.window import (
+        _amp_to_display, _thr_to_display, _display_to_thr,
+    )
+    # Linear is identity
+    assert _thr_to_display(0.1, 'linear') == 0.1
+    assert _display_to_thr(0.1, 'linear') == 0.1
+
+    # Log: 0.1 → -20 dB; round-trip back to 0.1
+    assert _thr_to_display(0.1, 'log') == -20.0
+    assert _display_to_thr(-20.0, 'log') == 0.1
+    # Full scale → 0 dB
+    assert _thr_to_display(1.0, 'log') == 0.0
+    # Zero clamps at the floor (no -inf), and stays clipped
+    from chirp.constants import AMP_DB_MIN
+    assert _thr_to_display(0.0, 'log') == AMP_DB_MIN
+    # Buffer conversion clamps below the floor
+    arr = np.array([0.0, 1e-6, 0.1, 1.0])
+    out = _amp_to_display(arr, 'log')
+    assert out[0] == AMP_DB_MIN  # clamped
+    assert np.isfinite(out).all()
+    assert out[2] == -20.0
+    assert out[3] == 0.0

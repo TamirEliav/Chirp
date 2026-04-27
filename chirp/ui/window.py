@@ -33,9 +33,10 @@ from PyQt5.QtWidgets import (
     QGridLayout, QGroupBox, QPushButton, QLabel, QLineEdit,
     QFileDialog, QFrame, QSizePolicy, QDoubleSpinBox, QComboBox, QCheckBox,
     QScrollArea, QStackedLayout, QDialog, QCalendarWidget, QMessageBox, QSpinBox,
+    QMenu, QAction, QActionGroup,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QSize, QDate, QPointF
-from PyQt5.QtGui import QFont, QPainter, QColor, QPainterPath, QPen, QPolygonF
+from PyQt5.QtGui import QFont, QPainter, QColor, QPainterPath, QPen, QPolygonF, QCursor
 
 # Re-exports used throughout the window code. The star-import brings in
 # all the module-level constants and the palette (C, QSS) so the class
@@ -56,6 +57,74 @@ from chirp.ui.sidebar import (
     RecordingSidebar,
     RecordingSidebarItem,  # noqa: F401
 )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Amplitude-axis display helpers
+#
+# The envelope buffer (``RecordingEntity.abs_amp_buffer``) is always
+# stored in linear [0, 1] full-scale units. The user can flip the amp
+# plot between linear and log (dB) views via right-click on the axis.
+# These helpers do the data / threshold / axis conversions so the rest
+# of the rendering code can stay scale-agnostic.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _amp_to_display(buf, scale: str):
+    """Convert a linear envelope buffer into the value range plotted on
+    screen. ``scale='linear'`` is identity; ``scale='log'`` returns
+    ``20*log10(|x|)`` with values below ``AMP_DB_EPS`` clamped at the
+    floor so a zero sample doesn't blow up to ``-inf``."""
+    if scale == 'log':
+        return 20.0 * np.log10(np.maximum(np.abs(buf), AMP_DB_EPS))
+    return buf
+
+
+def _thr_to_display(thr: float, scale: str) -> float:
+    """Convert a linear-scale threshold (0..1) into its on-axis y value
+    for the current scale. Mirror of ``_amp_to_display`` but for a
+    scalar (avoids the array-allocation overhead)."""
+    if scale == 'log':
+        return max(20.0 * np.log10(max(thr, AMP_DB_EPS)), AMP_DB_MIN)
+    return thr
+
+
+def _display_to_thr(yval: float, scale: str) -> float:
+    """Inverse of ``_thr_to_display`` — used during a threshold drag to
+    convert ``event.ydata`` (in axis units) back into the linear
+    threshold the rest of the pipeline operates on. Result is clipped
+    to [0, 1]."""
+    if scale == 'log':
+        return float(np.clip(10.0 ** (yval / 20.0), 0.0, 1.0))
+    return float(np.clip(yval, 0.0, 1.0))
+
+
+def _amp_axis_limits(e) -> tuple[float, float]:
+    """Y-axis limits for the amp plot. Linear: 0..amp_ylim (zoomable
+    via scroll wheel). Log: fixed AMP_DB_MIN..AMP_DB_MAX — the dB
+    range is wide enough that a per-stream zoom isn't worth the
+    complexity, and a fixed range keeps tile-to-tile comparisons in
+    view mode meaningful."""
+    if getattr(e, 'amp_scale', 'linear') == 'log':
+        return (AMP_DB_MIN, AMP_DB_MAX)
+    return (0.0, e.amp_ylim if e is not None else 1.05)
+
+
+def _amp_axis_label(e) -> str:
+    return 'Amplitude (dB)' if getattr(e, 'amp_scale', 'linear') == 'log' else 'Amplitude'
+
+
+def _thr_label_text(thr: float, scale: str) -> str:
+    if scale == 'log':
+        return f'thr = {_thr_to_display(thr, scale):.1f} dB'
+    return f'thr = {thr:.3f}'
+
+
+def _thr_label_y_offset(scale: str) -> float:
+    """Offset (in axis units) used to position the ``thr = ...`` text
+    just above the threshold line. Different scales pick different
+    offsets so the label sits at a sensible visual distance — 3% of a
+    [0,1] axis vs 1.5 dB on a 80 dB axis."""
+    return 1.5 if scale == 'log' else 0.03
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ChirpWindow
@@ -330,16 +399,20 @@ class ChirpWindow(QMainWindow):
         else:
             self._amp_line_r = None
 
+        scale = getattr(e, 'amp_scale', 'linear') if e else 'linear'
+        amp_lo, amp_hi = _amp_axis_limits(e)
         self._ax_amp.set_xlim(0.0, disp_secs)
-        self._ax_amp.set_ylim(0.0, e.amp_ylim if e else 1.05)
+        self._ax_amp.set_ylim(amp_lo, amp_hi)
         self._ax_amp.set_xlabel('Time (s)')
-        self._ax_amp.set_ylabel('Amplitude')
+        self._ax_amp.set_ylabel(_amp_axis_label(e))
 
+        thr_disp = _thr_to_display(threshold, scale)
         self._threshold_line = self._ax_amp.axhline(
-            y=threshold, color=C['yellow'], linewidth=1.5, linestyle=(0, (6, 3)),
+            y=thr_disp, color=C['yellow'], linewidth=1.5, linestyle=(0, (6, 3)),
         )
         self._threshold_label = self._ax_amp.text(
-            0.005, threshold + 0.03, f'thr = {threshold:.3f}',
+            0.005, thr_disp + _thr_label_y_offset(scale),
+            _thr_label_text(threshold, scale),
             transform=self._ax_amp.get_yaxis_transform(),
             color=C['yellow'], fontsize=8,
         )
@@ -2325,9 +2398,12 @@ class ChirpWindow(QMainWindow):
         self._sync_thr_line(val)
 
     def _sync_thr_line(self, val: float):
-        self._threshold_line.set_ydata([val, val])
-        self._threshold_label.set_y(val + 0.03)
-        self._threshold_label.set_text(f'thr = {val:.3f}')
+        e = self._sel
+        scale = getattr(e, 'amp_scale', 'linear') if e else 'linear'
+        thr_disp = _thr_to_display(val, scale)
+        self._threshold_line.set_ydata([thr_disp, thr_disp])
+        self._threshold_label.set_y(thr_disp + _thr_label_y_offset(scale))
+        self._threshold_label.set_text(_thr_label_text(val, scale))
         self._canvas.draw_idle()
 
     def _sync_entropy_thr_line(self, val: float):
@@ -2438,13 +2514,23 @@ class ChirpWindow(QMainWindow):
     # ──────────────────────────────────────────────────────────────────────
 
     def _on_mpl_press(self, event):
+        # Right-click on an amp axis pops the scale-selection menu.
+        # Resolves the target entity from the clicked axis so the same
+        # gesture works in both config mode (single amp axis) and view
+        # mode (per-tile amp axis).
+        if event.button == 3:
+            target = self._resolve_amp_axis_click(event.inaxes)
+            if target is not None:
+                self._show_amp_scale_menu(target)
+            return
         if self._view_mode:
             return
         e = self._sel
         if not e or event.button != 1:
             return
         if event.inaxes is self._ax_amp:
-            _, y_disp = self._ax_amp.transData.transform((0.0, e.threshold))
+            thr_disp = _thr_to_display(e.threshold, getattr(e, 'amp_scale', 'linear'))
+            _, y_disp = self._ax_amp.transData.transform((0.0, thr_disp))
             if abs(event.y - y_disp) <= 12:
                 self._dragging = True
                 self._timer.stop()
@@ -2458,8 +2544,9 @@ class ChirpWindow(QMainWindow):
         if self._dragging:
             if event.inaxes is not self._ax_amp:
                 return
-            val = float(np.clip(event.ydata, 0.0, 1.0))
             e = self._sel
+            scale = getattr(e, 'amp_scale', 'linear') if e else 'linear'
+            val = _display_to_thr(event.ydata, scale)
             if e:
                 e.threshold = val
             self._set_thr_silent(val)
@@ -2481,6 +2568,90 @@ class ChirpWindow(QMainWindow):
             self._dragging = False
             self._dragging_entropy = False
             self._timer.start()
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Amp-axis right-click menu (linear / log scale toggle)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _resolve_amp_axis_click(self, ax) -> "RecordingEntity | None":
+        """Return the entity whose amp axis was clicked, or None.
+        Works in both config mode (single ``self._ax_amp`` belongs to
+        ``self._sel``) and view mode (each tile's ``vm['ax_amp']``
+        maps to ``self._entities[i]``)."""
+        if ax is None:
+            return None
+        if not self._view_mode:
+            if ax is getattr(self, '_ax_amp', None):
+                return self._sel
+            return None
+        for i, vm in enumerate(self._vm_axes):
+            if ax is vm.get('ax_amp'):
+                if i < len(self._entities):
+                    return self._entities[i]
+                return None
+        return None
+
+    def _show_amp_scale_menu(self, e) -> None:
+        """Pop a context menu at the cursor with Linear / Log radio
+        choices for the amp-axis scale on entity ``e``."""
+        menu = QMenu(self._canvas)
+        header = QAction(f'Y axis — {e.name}', menu)
+        header.setEnabled(False)
+        menu.addAction(header)
+        menu.addSeparator()
+        group = QActionGroup(menu)
+        group.setExclusive(True)
+        current = getattr(e, 'amp_scale', 'linear')
+        for label, value in (('Linear', 'linear'), ('Log (dB)', 'log')):
+            act = QAction(label, menu, checkable=True)
+            act.setChecked(current == value)
+            act.triggered.connect(
+                lambda _checked=False, v=value, ent=e: self._set_amp_scale(ent, v))
+            group.addAction(act)
+            menu.addAction(act)
+        menu.exec_(QCursor.pos())
+
+    def _set_amp_scale(self, e, scale: str) -> None:
+        """Apply ``scale`` to entity ``e`` and refresh the affected
+        axis in place. No full-figure rebuild — only the amp axis's
+        ylim, ylabel, line ydata, and threshold position need to
+        change."""
+        if scale not in ('linear', 'log'):
+            return
+        if scale == getattr(e, 'amp_scale', 'linear'):
+            return
+        e.amp_scale = scale
+        self._mark_dirty()
+
+        if not self._view_mode and e is self._sel:
+            ax = self._ax_amp
+            lo, hi = _amp_axis_limits(e)
+            ax.set_ylim(lo, hi)
+            ax.set_ylabel(_amp_axis_label(e))
+            self._amp_line.set_ydata(_amp_to_display(e.abs_amp_buffer, scale))
+            if self._amp_line_r is not None:
+                self._amp_line_r.set_ydata(
+                    _amp_to_display(e.abs_amp_buffer_r, scale))
+            self._sync_thr_line(e.threshold)
+            self._recapture_bg()
+            return
+
+        if self._view_mode:
+            for i, vm in enumerate(self._vm_axes):
+                if i >= len(self._entities) or self._entities[i] is not e:
+                    continue
+                ax = vm['ax_amp']
+                lo, hi = _amp_axis_limits(e)
+                ax.set_ylim(lo, hi)
+                ax.set_ylabel('Amp (dB)' if scale == 'log' else 'Amp', fontsize=7)
+                vm['amp_line'].set_ydata(_amp_to_display(e.abs_amp_buffer, scale))
+                if vm['amp_line_r'] is not None:
+                    vm['amp_line_r'].set_ydata(
+                        _amp_to_display(e.abs_amp_buffer_r, scale))
+                thr_disp = _thr_to_display(e.threshold, scale)
+                vm['thr_line'].set_ydata([thr_disp, thr_disp])
+                self._recapture_bg()
+                return
 
     @staticmethod
     def _zoom_axis_centered(ax, event_ydata, step, anchor_zero=False):
@@ -2505,11 +2676,27 @@ class ChirpWindow(QMainWindow):
         if self._view_mode:
             for i, vm in enumerate(self._vm_axes):
                 if event.inaxes is vm['ax_amp'] or (vm.get('ax_wave') and event.inaxes is vm['ax_wave']):
-                    _, new_ymax = self._zoom_axis_centered(vm['ax_amp'], event.ydata, event.step, anchor_zero=True)
+                    if i >= len(self._entities):
+                        return
+                    e = self._entities[i]
+                    # Log-scale amp axis is fixed at AMP_DB_MIN..MAX —
+                    # scroll-zoom is only meaningful on the linear axis.
+                    # If the user scrolled on the wave axis we still
+                    # rescale the wave (always linear, signed) but skip
+                    # the amp side.
+                    if getattr(e, 'amp_scale', 'linear') == 'log':
+                        if vm.get('ax_wave') is not None and event.inaxes is vm['ax_wave']:
+                            scale = 0.85 if event.step > 0 else 1.0 / 0.85
+                            new_ylim = max(0.01, e.amp_ylim * scale)
+                            e.amp_ylim = new_ylim
+                            vm['ax_wave'].set_ylim(-new_ylim, new_ylim)
+                            self._recapture_bg()
+                        return
+                    _, new_ymax = self._zoom_axis_centered(
+                        vm['ax_amp'], event.ydata, event.step, anchor_zero=True)
                     if vm.get('ax_wave') is not None:
                         vm['ax_wave'].set_ylim(-new_ymax, new_ymax)
-                    if i < len(self._entities):
-                        self._entities[i].amp_ylim = new_ymax
+                    e.amp_ylim = new_ymax
                     self._recapture_bg()
                     return
                 if vm.get('ax_entropy') is not None and event.inaxes is vm['ax_entropy']:
@@ -2535,15 +2722,22 @@ class ChirpWindow(QMainWindow):
                 e.amp_ylim = new_ylim
                 for wax in wave_axes:
                     wax.set_ylim(-new_ylim, new_ylim)
-                self._ax_amp.set_ylim(0.0, new_ylim)
+                # Mirror the change onto the amp axis only when the
+                # amp plot is in linear mode — log mode owns its own
+                # fixed dB range.
+                if getattr(e, 'amp_scale', 'linear') != 'log':
+                    self._ax_amp.set_ylim(0.0, new_ylim)
                 self._recapture_bg()
             return
 
         # Config mode — amplitude axis (anchored at zero)
         if event.inaxes is not self._ax_amp:
             return
-        _, new_ymax = self._zoom_axis_centered(self._ax_amp, event.ydata, event.step, anchor_zero=True)
         e = self._sel
+        if e and getattr(e, 'amp_scale', 'linear') == 'log':
+            # Fixed dB range — ignore zoom on the log amp axis.
+            return
+        _, new_ymax = self._zoom_axis_centered(self._ax_amp, event.ydata, event.step, anchor_zero=True)
         if e:
             e.amp_ylim = new_ymax
             for wax in wave_axes:
@@ -3346,12 +3540,15 @@ class ChirpWindow(QMainWindow):
                     e_t_axis, np.zeros(e_ts),
                     color=C['pink'], linewidth=0.6, antialiased=False,
                 )
+            scale = getattr(e, 'amp_scale', 'linear')
+            amp_lo, amp_hi = _amp_axis_limits(e)
             ax_amp.set_xlim(0.0, e_disp)
-            ax_amp.set_ylim(0.0, e.amp_ylim)
+            ax_amp.set_ylim(amp_lo, amp_hi)
             cursor_amp = ax_amp.axvline(x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
 
             thr_line = ax_amp.axhline(
-                y=e.threshold, color=C['yellow'], linewidth=1.0,
+                y=_thr_to_display(e.threshold, scale),
+                color=C['yellow'], linewidth=1.0,
                 linestyle=(0, (6, 3)),
             )
 
@@ -3359,7 +3556,7 @@ class ChirpWindow(QMainWindow):
             # strip and/or entropy axis come below). Hide its x tick
             # labels; whichever axis ends up last will carry the label.
             ax_amp.tick_params(labelbottom=False)
-            ax_amp.set_ylabel('Amp', fontsize=7)
+            ax_amp.set_ylabel('Amp (dB)' if scale == 'log' else 'Amp', fontsize=7)
 
             # #32: detect/record events strip (row 0 = det / yellow,
             # row 1 = rec / green). Same construction as config mode.
@@ -3523,15 +3720,17 @@ class ChirpWindow(QMainWindow):
                 vm['wave_line_r'].set_color(wave_color_r)
                 vm['wave_line_r'].set_ydata(e.amp_buffer_r)
 
-            # Amplitude envelope
+            # Amplitude envelope (per-entity linear/log display).
+            scale = getattr(e, 'amp_scale', 'linear')
             vm['amp_line'].set_color(amp_color_l)
-            vm['amp_line'].set_ydata(e.abs_amp_buffer)
+            vm['amp_line'].set_ydata(_amp_to_display(e.abs_amp_buffer, scale))
             if vm['amp_line_r'] is not None and e.channel_mode == 'Stereo':
                 vm['amp_line_r'].set_color(amp_color_r)
-                vm['amp_line_r'].set_ydata(e.abs_amp_buffer_r)
+                vm['amp_line_r'].set_ydata(_amp_to_display(e.abs_amp_buffer_r, scale))
 
             vm['cursor_amp'].set_xdata([cursor_x, cursor_x])
-            vm['thr_line'].set_ydata([e.threshold, e.threshold])
+            thr_disp = _thr_to_display(e.threshold, scale)
+            vm['thr_line'].set_ydata([thr_disp, thr_disp])
 
             # Entropy
             if vm.get('entropy_line') is not None:
@@ -3774,12 +3973,14 @@ class ChirpWindow(QMainWindow):
                 if self._cursor_wave_r is not None:
                     self._cursor_wave_r.set_xdata([cursor_x, cursor_x])
 
-            # Amplitude envelope
+            # Amplitude envelope (converted to display scale per
+            # `e.amp_scale` — linear identity, or 20*log10 for dB).
+            scale = getattr(e, 'amp_scale', 'linear')
             self._amp_line.set_color(amp_color_l)
-            self._amp_line.set_ydata(e.abs_amp_buffer)
+            self._amp_line.set_ydata(_amp_to_display(e.abs_amp_buffer, scale))
             if self._is_stereo_layout and self._amp_line_r is not None:
                 self._amp_line_r.set_color(amp_color_r)
-                self._amp_line_r.set_ydata(e.abs_amp_buffer_r)
+                self._amp_line_r.set_ydata(_amp_to_display(e.abs_amp_buffer_r, scale))
             self._cursor_amp .set_xdata([cursor_x, cursor_x])
 
             # Entropy trace
