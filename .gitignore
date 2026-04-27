@@ -12,3 +12,4 @@ dist/
 .claude/
 .vscode/
 =5.15
+chirp_errors.log

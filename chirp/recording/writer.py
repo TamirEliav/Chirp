@@ -35,6 +35,7 @@ import numpy as np
 import scipy.io.wavfile
 
 from chirp.constants import SAMPLE_RATE
+from chirp.error_log import log as _err_log
 
 
 _FILENAME_SAFE = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._")
@@ -118,6 +119,11 @@ def write_wav_sync(buf_snapshot: list, output_dir: str,
     audio = np.concatenate(buf_snapshot)
     if audio.ndim == 1:
         audio = audio.flatten()
+    # Saturation detection: matches the per-chunk threshold used in
+    # RecordingEntity (raw_peak >= 0.99). Logged once per saturated
+    # file (after the path is finalised below) so the user can find
+    # exactly which recordings had clipping without per-sample noise.
+    saturated = bool(np.abs(audio).max() >= 0.99)
     pcm16 = (audio * 32767.0).clip(-32768, 32767).astype(np.int16)
     os.makedirs(output_dir, exist_ok=True)
     n_samples = audio.shape[0]
@@ -170,6 +176,11 @@ def write_wav_sync(buf_snapshot: list, output_dir: str,
     os.replace(tmp_path, path)
     ch_str = 'stereo' if audio.ndim == 2 else 'mono'
     print(f'[REC] saved {path}  ({n_samples/sample_rate:.2f} s, {ch_str})')
+    if saturated:
+        peak = float(np.abs(audio).max())
+        _err_log('saturation', filename_stream or 'global',
+                 f'recording contains clipped samples (peak={peak:.4f})',
+                 wav_path=path)
     return path
 
 
@@ -257,6 +268,14 @@ class _WriterPool:
                         self._has_ever_errored = True
                         self._last_error = f'{type(exc).__name__}: {exc}'[:200]
                     print(f'[REC] WAV write failed: {exc}')
+                    try:
+                        out_dir = job[0][1] if len(job[0]) > 1 else ''
+                        stream = job[1].get('filename_stream', '') or 'global'
+                    except Exception:
+                        out_dir, stream = '', 'global'
+                    _err_log('wav_writer', stream,
+                             f'{type(exc).__name__}: {exc}',
+                             wav_path=out_dir or None)
                 except BaseException as base_exc:
                     # #47: a BaseException subclass escaped the inner
                     # ``except Exception`` — e.g. a bug raising
@@ -273,6 +292,15 @@ class _WriterPool:
                             f'worker died: {type(base_exc).__name__}'[:200])
                         self._respawn_count += 1
                         shutting_down = self._shutting_down
+                    try:
+                        out_dir = job[0][1] if len(job[0]) > 1 else ''
+                        stream = job[1].get('filename_stream', '') or 'global'
+                    except Exception:
+                        out_dir, stream = '', 'global'
+                    _err_log('wav_writer', stream,
+                             f'worker died: {type(base_exc).__name__}: '
+                             f'{base_exc!r}',
+                             wav_path=out_dir or None)
                     if not shutting_down:
                         self._spawn_worker(worker_id)
                     return

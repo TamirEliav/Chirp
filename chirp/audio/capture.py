@@ -12,14 +12,18 @@ import queue
 import sounddevice as sd
 
 from chirp.constants import CHUNK_FRAMES, DTYPE, SAMPLE_RATE
+from chirp.error_log import log as _err_log
 
 
 class AudioCapture:
     def __init__(self, audio_queue: queue.Queue, device=None, channels=1,
-                 samplerate=SAMPLE_RATE):
+                 samplerate=SAMPLE_RATE, name: str = ''):
         self._queue    = audio_queue
         self._channels = channels
         self._stream   = None
+        # Stream label included in error-log entries so the user can
+        # tell which entity dropped chunks / overflowed.
+        self._name     = name
         # #13 / c15: count of audio chunks the PortAudio callback had
         # to drop because the queue was full. The UI samples this on
         # each plot tick to surface a drop-indicator badge in the
@@ -62,6 +66,9 @@ class AudioCapture:
         except Exception as exc:
             self.open_error = f'{type(exc).__name__}: {exc}'[:200]
             print(f"[AudioCapture] Failed to open device {device}: {exc}")
+            _err_log('open', self._name,
+                     f'failed to open device {device}: '
+                     f'{type(exc).__name__}: {exc}')
 
     def set_monitor(self, monitor, source_id) -> None:
         """Wire the shared audio monitor. Safe to call at any time."""
@@ -87,6 +94,9 @@ class AudioCapture:
                 self.os_drop_count       += 1
                 self.os_drop_count_total += 1
                 self.has_ever_os_dropped  = True
+                _err_log('os_drop', self._name,
+                         f'PortAudio input_overflow '
+                         f'(cumulative={self.os_drop_count_total})')
         # Feed the monitor first — it's the lowest-latency path and
         # doesn't care whether the DSP queue is full.
         mon = self._monitor
@@ -108,6 +118,9 @@ class AudioCapture:
             self.drop_count += 1
             self.drop_count_total += 1
             self.has_ever_dropped = True
+            _err_log('queue_full', self._name,
+                     f'audio queue full — chunk dropped '
+                     f'(cumulative={self.drop_count_total})')
 
     def consume_drop_count(self) -> int:
         """Return the drop count and reset it to zero. Intended to be
