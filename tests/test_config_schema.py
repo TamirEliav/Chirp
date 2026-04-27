@@ -85,6 +85,7 @@ def test_single_entity_roundtrip_preserves_scalar_params():
     e.filename_suffix = "_v1"
     e.dph_folder_prefix = "day_"
     e.display_mode = "Both"
+    e.amp_scale = "linear"
 
     data = build_settings_dict([e])
     encoded = json.dumps(data)
@@ -111,6 +112,7 @@ def test_single_entity_roundtrip_preserves_scalar_params():
     assert r.filename_suffix == "_v1"
     assert r.dph_folder_prefix == "day_"
     assert r.display_mode == "Both"
+    assert r.amp_scale == "linear"
 
     # View mode should also survive
     assert vm == DEFAULT_VIEW_MODE

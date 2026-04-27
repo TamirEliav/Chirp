@@ -597,6 +597,25 @@ python chirp.py</code></pre>
     <strong>Saturation:</strong> Persistent red lines indicate clipping. Reduce the input gain on
     your audio interface or move the microphone further from the source.
   </div>
+
+  <h4>Amplitude Y-Axis Scale</h4>
+  <p>
+    The amplitude envelope plot has two Y-axis scales:
+  </p>
+  <ul>
+    <li><strong>Log (dB)</strong> &mdash; the default. Y axis runs <code>-80 dB</code> to
+        <code>0 dB</code> full scale. Best for surfacing quiet signals that compress against
+        zero on the linear scale (faint vocalisations, distant calls).</li>
+    <li><strong>Linear</strong> &mdash; raw envelope, scrollable Y zoom. Best when you care
+        about the absolute peak level and want to see the shape of high-amplitude transients.</li>
+  </ul>
+  <p>
+    <strong>Right-click</strong> on the amplitude plot (in either Config or View mode) to pick
+    Linear or Log (dB) for that stream. The choice is per-stream and is saved to the JSON
+    settings file along with the rest of the configuration. The threshold line and its label
+    track the chosen scale automatically &mdash; in dB mode the label reads e.g.
+    <code>thr = -26.0 dB</code>; in linear mode it reads <code>thr = 0.050</code>.
+  </p>
 </section>
 
 <!-- ── 5. Triggered Recording ── -->
@@ -975,6 +994,7 @@ python chirp.py</code></pre>
       <tr><td>Scroll wheel</td><td>Waveform plot</td><td>Zoom Y-axis (symmetric around zero)</td></tr>
       <tr><td>Scroll wheel</td><td>Entropy plot</td><td>Zoom Y-axis (centered on mouse cursor)</td></tr>
       <tr><td>Scroll wheel</td><td>Spectrogram</td><td>No effect (use Display panel frequency controls)</td></tr>
+      <tr><td>Right-click</td><td>Amplitude plot</td><td>Context menu: switch Y axis between Linear and Log (dB)</td></tr>
       <tr><td>Right-click</td><td>Sidebar background</td><td>Context menu: Start All / Stop All</td></tr>
     </tbody>
   </table>

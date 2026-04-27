@@ -183,6 +183,12 @@ class RecordingEntity:
         self.has_ever_ingest_errored  = False
         self.last_ingest_error: str | None = None  # short str(exc) for tooltip
         self.amp_ylim   = 1.05    # amplitude y-axis max (persists across mode switches)
+        # Amplitude-plot Y scale: 'linear' (raw envelope, 0..amp_ylim)
+        # or 'log' (20*log10, AMP_DB_MIN..AMP_DB_MAX). User-toggled via
+        # right-click on the amp plot. Default is log because the
+        # envelope ranges over many orders of magnitude — pure tones at
+        # -40 dB are invisible on a 0..1 linear scale.
+        self.amp_scale  = 'log'
         self.display_mode = 'Spectrogram'  # 'Spectrogram', 'Waveform', or 'Both'
 
         # Runtime
@@ -1184,6 +1190,7 @@ class RecordingEntity:
             'ref_date':            self.ref_date.isoformat() if self.ref_date else None,
             'dph_folder_prefix':   self.dph_folder_prefix,
             'amp_ylim':            self.amp_ylim,
+            'amp_scale':           self.amp_scale,
             'spectral_trigger_mode': self.spectral_trigger_mode,
             'spectral_threshold':    self.spectral_threshold,
             'display_mode':        self.display_mode,
@@ -1216,7 +1223,7 @@ class RecordingEntity:
                      'freq_scale', 'gain_db', 'db_floor', 'db_ceil',
                      'display_freq_lo', 'display_freq_hi',
                      'output_dir', 'filename_prefix', 'filename_suffix',
-                     'dph_folder_prefix', 'amp_ylim',
+                     'dph_folder_prefix', 'amp_ylim', 'amp_scale',
                      'spectral_trigger_mode', 'spectral_threshold',
                      'display_mode',
                      'input_source', 'wav_file_path', 'wav_loop'):

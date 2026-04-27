@@ -26,6 +26,13 @@ ANIMATION_INTERVAL  = 50
 SPEC_DB_MIN         = -100.0
 SPEC_DB_MAX         = 0.0
 N_DISPLAY_ROWS      = 256
+# Amplitude axis — log (dB) display. The envelope buffer is in linear
+# [0, 1] full-scale units; for the dB view we plot 20*log10(|x|), with
+# values below AMP_DB_MIN clamped at the floor so a momentary zero
+# doesn't blow the line off the canvas.
+AMP_DB_MIN          = -80.0
+AMP_DB_MAX          =   0.0
+AMP_DB_EPS          = 1e-4   # 10**(AMP_DB_MIN/20) — linear floor
 
 # ── Recording defaults ─────────────────────────────────────────────────────────
 DEFAULT_THRESHOLD   = 0.05
@@ -164,6 +171,7 @@ __all__ = [
     # Display
     "DISPLAY_SECONDS", "SPECTROGRAM_NPERSEG", "COLORMAP",
     "ANIMATION_INTERVAL", "SPEC_DB_MIN", "SPEC_DB_MAX", "N_DISPLAY_ROWS",
+    "AMP_DB_MIN", "AMP_DB_MAX", "AMP_DB_EPS",
     # Recording defaults
     "DEFAULT_THRESHOLD", "DEFAULT_MIN_CROSS", "DEFAULT_HOLD",
     "DEFAULT_POST_TRIG", "DEFAULT_MAX_REC", "DEFAULT_PRE_TRIG",
