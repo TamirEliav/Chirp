@@ -1943,6 +1943,13 @@ class ChirpWindow(QMainWindow):
         if want_stereo != self._is_stereo_layout or axes_changed or display_mode_changed or want_entropy != has_entropy:
             self._setup_axes(stereo=want_stereo)
         self._update_spec_yticks(e)
+        # Sync the amp axis to this entity's scale. The above rebuild
+        # condition doesn't include amp_scale (it's a Y-axis change,
+        # not a layout change — full figure rebuild would be overkill),
+        # and on the very first call _setup_axes ran with no entity at
+        # all (linear placeholder). Without this the amp plot stays
+        # blank in log mode until the user toggles scale.
+        self._apply_amp_scale_to_axes(e)
 
     # ──────────────────────────────────────────────────────────────────────
     # Selection switching
@@ -2618,47 +2625,71 @@ class ChirpWindow(QMainWindow):
             menu.addAction(act)
         menu.exec_(QCursor.pos())
 
+    def _apply_amp_scale_to_axes(self, e) -> None:
+        """Sync the config-mode amp axis state to ``e.amp_scale``.
+
+        Idempotent — used by both the right-click toggle (``_set_amp_scale``)
+        and ``_load_params_from_entity`` so the axis ylim / ylabel /
+        line ydata / threshold position can never drift away from
+        ``e.amp_scale``. The latter callsite is load-bearing on first
+        run: ``_setup_axes`` is invoked once during ``_build_figure``
+        before any entity exists (``_selected_idx == -1`` → ``e=None``
+        → linear placeholder), and ``_load_params_from_entity`` only
+        rebuilds the figure on layout changes (stereo / display_mode /
+        entropy). Without this sync the amp axis stays linear even
+        though the entity defaults to log, leaving the plot blank
+        until the user toggles the scale.
+        """
+        if e is None or self._view_mode or self._ax_amp is None:
+            return
+        scale = getattr(e, 'amp_scale', 'linear')
+        ax = self._ax_amp
+        lo, hi = _amp_axis_limits(e)
+        ax.set_ylim(lo, hi)
+        ax.set_ylabel(_amp_axis_label(e))
+        if self._amp_line is not None:
+            self._amp_line.set_ydata(_amp_to_display(e.abs_amp_buffer, scale))
+        if self._amp_line_r is not None:
+            self._amp_line_r.set_ydata(
+                _amp_to_display(e.abs_amp_buffer_r, scale))
+        if self._threshold_line is not None:
+            self._sync_thr_line(e.threshold)
+        self._recapture_bg()
+
+    def _apply_amp_scale_to_vm_tile(self, e, vm) -> None:
+        """View-mode counterpart of ``_apply_amp_scale_to_axes`` —
+        updates a single tile in place."""
+        scale = getattr(e, 'amp_scale', 'linear')
+        ax = vm.get('ax_amp')
+        if ax is None:
+            return
+        lo, hi = _amp_axis_limits(e)
+        ax.set_ylim(lo, hi)
+        ax.set_ylabel('Amp (dB)' if scale == 'log' else 'Amp', fontsize=7)
+        vm['amp_line'].set_ydata(_amp_to_display(e.abs_amp_buffer, scale))
+        if vm.get('amp_line_r') is not None:
+            vm['amp_line_r'].set_ydata(
+                _amp_to_display(e.abs_amp_buffer_r, scale))
+        thr_disp = _thr_to_display(e.threshold, scale)
+        vm['thr_line'].set_ydata([thr_disp, thr_disp])
+        self._recapture_bg()
+
     def _set_amp_scale(self, e, scale: str) -> None:
-        """Apply ``scale`` to entity ``e`` and refresh the affected
-        axis in place. No full-figure rebuild — only the amp axis's
-        ylim, ylabel, line ydata, and threshold position need to
-        change."""
+        """Right-click handler: pick Linear or Log (dB) for ``e``."""
         if scale not in ('linear', 'log'):
             return
         if scale == getattr(e, 'amp_scale', 'linear'):
             return
         e.amp_scale = scale
         self._mark_dirty()
-
         if not self._view_mode and e is self._sel:
-            ax = self._ax_amp
-            lo, hi = _amp_axis_limits(e)
-            ax.set_ylim(lo, hi)
-            ax.set_ylabel(_amp_axis_label(e))
-            self._amp_line.set_ydata(_amp_to_display(e.abs_amp_buffer, scale))
-            if self._amp_line_r is not None:
-                self._amp_line_r.set_ydata(
-                    _amp_to_display(e.abs_amp_buffer_r, scale))
-            self._sync_thr_line(e.threshold)
-            self._recapture_bg()
+            self._apply_amp_scale_to_axes(e)
             return
-
         if self._view_mode:
             for i, vm in enumerate(self._vm_axes):
-                if i >= len(self._entities) or self._entities[i] is not e:
-                    continue
-                ax = vm['ax_amp']
-                lo, hi = _amp_axis_limits(e)
-                ax.set_ylim(lo, hi)
-                ax.set_ylabel('Amp (dB)' if scale == 'log' else 'Amp', fontsize=7)
-                vm['amp_line'].set_ydata(_amp_to_display(e.abs_amp_buffer, scale))
-                if vm['amp_line_r'] is not None:
-                    vm['amp_line_r'].set_ydata(
-                        _amp_to_display(e.abs_amp_buffer_r, scale))
-                thr_disp = _thr_to_display(e.threshold, scale)
-                vm['thr_line'].set_ydata([thr_disp, thr_disp])
-                self._recapture_bg()
-                return
+                if i < len(self._entities) and self._entities[i] is e:
+                    self._apply_amp_scale_to_vm_tile(e, vm)
+                    return
 
     @staticmethod
     def _zoom_axis_centered(ax, event_ydata, step, anchor_zero=False):
