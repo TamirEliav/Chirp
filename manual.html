@@ -349,6 +349,7 @@
     <li><a href="#channels">Channel Modes</a></li>
     <li><a href="#view-mode">View Mode</a></li>
     <li><a href="#settings-mgmt">Settings Management</a></li>
+    <li><a href="#error-log">Error Logging</a></li>
     <li><a href="#interactions">Mouse &amp; Keyboard</a></li>
     <li><a href="#tips">Tips &amp; Best Practices</a></li>
   </ul>
@@ -863,6 +864,103 @@ python chirp.py</code></pre>
     the hatch date. Recordings are then saved into subfolders named by the day count (e.g.,
     <code>day_042/</code>), simplifying longitudinal data organization.
   </p>
+</section>
+
+<!-- ── 11b. Error Logging ── -->
+<section id="error-log">
+  <h2>Error Logging</h2>
+  <p>
+    Every pipeline failure surfaced by the sidebar
+    <span style="color:var(--red); font-weight:bold">S</span> /
+    <span style="color:var(--red); font-weight:bold">D</span> /
+    <span style="color:var(--peach); font-weight:bold">!</span> indicators is also appended to a
+    plain-text log file named <code>chirp_errors.log</code>, written to the folder Chirp is launched
+    from. The file is created on first event, opened in append mode (so it survives across runs),
+    and never deleted automatically &mdash; manage rotation manually if it grows.
+  </p>
+
+  <h3>Line Format</h3>
+  <p>Each event is a single tab-separated line:</p>
+  <pre>&lt;ISO timestamp&gt;   &lt;category&gt;   stream=&lt;name&gt;   [file=&lt;path&gt;]   &lt;message&gt;</pre>
+  <p>Example:</p>
+  <pre>2026-04-27T14:32:18.412   saturation   stream=Mic A   file=D:\recordings\day_042\Mic_A_..._.wav   recording contains clipped samples (peak=1.0000)</pre>
+
+  <h3>Categories</h3>
+  <table>
+    <thead><tr><th>Category</th><th>What it means</th><th>File path</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>queue_full</code></td>
+        <td>Python audio queue overflowed &mdash; the ingestion thread fell behind and a chunk was
+            dropped (the sidebar <span style="color:var(--red); font-weight:bold">D</span> badge).
+            Throttled to one line per stream per second; the cumulative count is stamped on each
+            line so you can see how many drops were suppressed between two log entries.</td>
+        <td>&mdash;</td>
+      </tr>
+      <tr>
+        <td><code>os_drop</code></td>
+        <td>PortAudio reported <code>input_overflow</code> &mdash; the driver / OS lost samples
+            upstream of our queue (the <code>OS</code> tag on the <span style="color:var(--peach); font-weight:bold">!</span> badge).
+            Same throttling as <code>queue_full</code>.</td>
+        <td>&mdash;</td>
+      </tr>
+      <tr>
+        <td><code>ingest</code></td>
+        <td>An exception was raised inside the per-entity ingest loop (DSP / FFT / trigger).
+            The thread is preserved; a 3-frame traceback is included in the message. Every
+            event is logged.</td>
+        <td>&mdash;</td>
+      </tr>
+      <tr>
+        <td><code>open</code></td>
+        <td>The audio capture (<code>AudioCapture</code>) or WAV-replay capture
+            (<code>WavFileCapture</code>) failed to open. Every event is logged.</td>
+        <td>WAV-replay path on a WAV-open failure.</td>
+      </tr>
+      <tr>
+        <td><code>wav_writer</code></td>
+        <td>The writer pool failed to write a triggered WAV (disk full, bad path, permission,
+            scipy crash). Every event is logged. A worker that dies entirely is also logged with a
+            <code>worker died:&nbsp;...</code> message before the supervisor respawns it.</td>
+        <td>Output folder of the failed write.</td>
+      </tr>
+      <tr>
+        <td><code>saturation</code></td>
+        <td>A successfully-written WAV contained at least one sample at <code>|x| &ge; 0.99</code>
+            of full scale. Logged <strong>once per file</strong> (not per sample) so you can locate
+            and review every recording that clipped without flooding the log.</td>
+        <td>Full path of the WAV that clipped.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Throttling</h3>
+  <p>
+    <code>queue_full</code> and <code>os_drop</code> can fire on every audio chunk
+    (50+/second at the default sample rate / chunk size). To keep the log bounded and useful,
+    those two categories are limited to one entry per (stream, category) per second. The first
+    event in any burst always logs immediately; subsequent events within the window are
+    suppressed. Because each line carries a cumulative count, the difference between two adjacent
+    lines tells you how many events were suppressed in between.
+  </p>
+  <p>
+    All other categories &mdash; <code>ingest</code>, <code>open</code>, <code>wav_writer</code>,
+    <code>saturation</code> &mdash; are not throttled; every event produces a line.
+  </p>
+
+  <h3>Reliability</h3>
+  <p>
+    The logger is wrapped in a try/except &mdash; any I/O failure (path locked, disk full,
+    permission error) is swallowed silently. Losing log lines is strictly preferable to
+    crashing the audio pipeline.
+  </p>
+
+  <div class="callout tip">
+    <strong>Tip:</strong> When you spot a sticky badge mid-session, open
+    <code>chirp_errors.log</code> and search for the stream name. The timestamp on the first
+    matching line is when the failure actually occurred &mdash; the badge only tells you it
+    happened, the log tells you when, where, and (for writer / saturation events) which file.
+  </div>
 </section>
 
 <!-- ── 12. Mouse & Keyboard ── -->
