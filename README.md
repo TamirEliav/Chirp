@@ -57,6 +57,14 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - Persistent `D` badge latches for the session; click to clear
 - In View Mode a per-tile `DROP×N` overlay shows the running session total
 
+### Error Logging
+- Every pipeline failure surfaced by the sidebar `S` / `D` / `!` indicators is also written to a plain-text log file (`chirp_errors.log`) in the folder Chirp is launched from
+- Each line carries an ISO timestamp, the category, the stream name, and (where applicable) the WAV file path involved — so any indicator can be traced back to a precise event
+- Categories: `queue_full` (queue overflow), `os_drop` (PortAudio overflow), `ingest` (DSP-thread exceptions, with a short traceback), `open` (capture / WAV open failure), `wav_writer` (writer-pool failure, with target folder), `saturation` (one line per finished WAV that contained clipping, with the full path)
+- High-frequency categories (`queue_full`, `os_drop`) are throttled to one entry per stream per second; cumulative counts are stamped on each line
+- Saturation is logged **per file**, not per sample — one line per WAV that clipped — so the log stays compact even on noisy inputs
+- The log is append-only (survives across runs) and the logger never raises — it cannot crash the audio pipeline
+
 ### Bandpass Filter
 - Optional Butterworth bandpass filter per stream
 - Configurable low and high frequency cutoffs
