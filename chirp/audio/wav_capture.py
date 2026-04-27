@@ -20,6 +20,7 @@ import numpy as np
 import scipy.io.wavfile
 
 from chirp.constants import CHUNK_FRAMES
+from chirp.error_log import log as _err_log
 
 
 def _load_wav(path: str) -> tuple[int, np.ndarray]:
@@ -53,10 +54,12 @@ class WavFileCapture:
     """
 
     def __init__(self, audio_queue: queue.Queue, wav_path: str,
-                 channels: int = 1, loop: bool = True):
+                 channels: int = 1, loop: bool = True, name: str = ''):
         self._queue    = audio_queue
         self._channels = channels
         self._loop     = loop
+        # Stream label included in error-log entries.
+        self._name     = name
         self._stop_evt  = threading.Event()
         self._pause_evt = threading.Event()
         self._pause_evt.set()  # start paused; resume() starts playback
@@ -112,6 +115,9 @@ class WavFileCapture:
         except Exception as exc:
             self.open_error = f'{type(exc).__name__}: {exc}'[:200]
             print(f"[WavFileCapture] Failed to open {wav_path}: {exc}")
+            _err_log('open', self._name,
+                     f'failed to open WAV: {type(exc).__name__}: {exc}',
+                     wav_path=wav_path)
 
     @property
     def valid(self) -> bool:
@@ -285,6 +291,10 @@ class WavFileCapture:
                     self.drop_count += 1
                     self.drop_count_total += 1
                     self.has_ever_dropped = True
+                    _err_log('queue_full', self._name,
+                             f'audio queue full — chunk dropped '
+                             f'(cumulative={self.drop_count_total})',
+                             wav_path=self.wav_path)
 
                 if not self._loop and next_pos >= total:
                     self._pos = total

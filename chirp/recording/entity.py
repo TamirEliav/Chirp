@@ -24,6 +24,7 @@ import sounddevice as sd
 
 from chirp.audio import AudioCapture, WavFileCapture
 from chirp.audio.devices import find_device_by_name, host_api_name
+from chirp.error_log import log as _err_log
 from chirp.constants import (
     CHUNK_FRAMES,
     DEFAULT_FREQ_HI,
@@ -472,10 +473,12 @@ class RecordingEntity:
         """
         if self.input_source == 'wav_file' and self.wav_file_path:
             cap = WavFileCapture(self.queue, self.wav_file_path,
-                                 channels=channels, loop=self.wav_loop)
+                                 channels=channels, loop=self.wav_loop,
+                                 name=self.name)
         else:
             cap = AudioCapture(self.queue, device=self.device_id,
-                               channels=channels, samplerate=self.sample_rate)
+                               channels=channels, samplerate=self.sample_rate,
+                               name=self.name)
         # Re-wire the monitor on every new capture so a device / SR /
         # WAV-file switch doesn't silently drop the loopback (#7).
         if self._monitor is not None:
@@ -778,6 +781,9 @@ class RecordingEntity:
                 self.last_ingest_error = f'{type(exc).__name__}: {exc}'[:200]
                 import traceback
                 traceback.print_exc()
+                _err_log('ingest', self.name,
+                         f'{type(exc).__name__}: {exc} | '
+                         f'{traceback.format_exc(limit=3)}')
 
     def start_rec(self):
         if not self.acq_running:
