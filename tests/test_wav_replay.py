@@ -181,9 +181,10 @@ def test_wav_file_capture_latches_truncation_at_open(tmp_path):
     the latching at __init__ time, not only when use_wav_file is the
     entry point."""
     from chirp.audio import WavFileCapture
-    import queue as _q
+    from chirp.audio.ringbuffer import AudioRing
+    from chirp.constants import CHUNK_FRAMES
     wav = _write_test_wav(str(tmp_path / 'four.wav'), channels=4)
-    cap = WavFileCapture(_q.Queue(), wav, channels=2, loop=False)
+    cap = WavFileCapture(AudioRing(CHUNK_FRAMES, channels=2), wav, channels=2, loop=False)
     try:
         assert cap.valid is True
         assert cap.channels_truncated is True

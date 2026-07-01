@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Chirp v2.2.1 — User Manual</title>
+<title>Chirp v3.0.0 — User Manual</title>
 <style>
   :root {
     --base: #1e1e2e;
@@ -304,7 +304,7 @@
 <nav class="sidebar">
   <div class="logo">
     <h1>Chirp</h1>
-    <span>User Manual &mdash; v2.2.1</span>
+    <span>User Manual &mdash; v3.0.0</span>
   </div>
   <ul>
     <li><a href="#overview">Overview</a></li>
@@ -364,14 +364,14 @@
 <header class="hero">
   <h1>Chirp</h1>
   <p class="subtitle">Real-Time Audio Monitoring, Visualization &amp; Triggered Recording</p>
-  <span class="version">v2.2.1</span>
+  <span class="version">v3.0.0</span>
 </header>
 
 <!-- ── 1. Overview ── -->
 <section id="overview">
   <h2>Overview</h2>
   <p>
-    Chirp is a desktop application built with Python, PyQt5, and matplotlib for real-time audio
+    Chirp is a desktop application built with Python, PyQt5, and pyqtgraph for real-time audio
     monitoring, spectral visualization, and threshold-triggered recording. It was designed for
     bioacoustics research but is suitable for any scenario requiring continuous audio surveillance
     with automatic capture of events of interest.
@@ -402,9 +402,11 @@
     <li>Python 3.11 or later</li>
     <li><code>sounddevice</code> &mdash; audio I/O via PortAudio</li>
     <li><code>numpy</code> &mdash; numerical computation</li>
-    <li><code>scipy</code> &mdash; signal processing (bandpass filter)</li>
-    <li><code>matplotlib</code> &mdash; plotting engine</li>
+    <li><code>scipy</code> &mdash; signal processing (FFT, bandpass filter)</li>
+    <li><code>soundfile</code> &mdash; streaming WAV output (libsndfile)</li>
     <li><code>PyQt5</code> &mdash; GUI framework</li>
+    <li><code>pyqtgraph</code> + <code>PyOpenGL</code> &mdash; GPU-accelerated real-time plotting</li>
+    <li><code>matplotlib</code> &mdash; colormap source (+ a small legacy helper layer)</li>
   </ul>
   <h3>Quick Start</h3>
   <pre><code># Create and activate a conda environment (recommended)
@@ -412,7 +414,7 @@ conda create -n chirp python=3.11 -y
 conda activate chirp
 
 # Install dependencies
-pip install sounddevice numpy scipy matplotlib PyQt5
+pip install sounddevice numpy scipy soundfile PyQt5 pyqtgraph PyOpenGL matplotlib
 
 # Launch
 python chirp.py</code></pre>
@@ -460,8 +462,8 @@ python chirp.py</code></pre>
 
   <h3 id="canvas">Canvas (Center)</h3>
   <p>
-    The central area hosts the matplotlib figure showing the spectrogram, waveform, and amplitude
-    plots for the currently selected stream. A vertical green cursor line indicates the current
+    The central area hosts the pyqtgraph/OpenGL plots showing the spectrogram, waveform, and
+    amplitude plots for the currently selected stream. A vertical cursor line indicates the current
     write position in the circular buffer.
   </p>
   <p>
@@ -553,9 +555,10 @@ python chirp.py</code></pre>
 
   <h3 id="view-spectrogram">Spectrogram</h3>
   <p>
-    The default mode. The upper subplot shows a scrolling spectrogram rendered with matplotlib's
-    <code>imshow</code> using the <em>inferno</em> colormap. The lower subplot shows the amplitude
-    envelope (absolute sample values) as a blue line. A yellow dashed threshold line is drawn when
+    The default mode. The upper plot shows a scrolling spectrogram rendered by a pyqtgraph
+    <code>ImageItem</code> (GPU colormap lookup) using the <em>inferno</em> colormap. The lower plot
+    shows the amplitude envelope (absolute sample values) as a blue line. A dashed threshold line is
+    drawn when
     recording is armed.
   </p>
 
@@ -587,10 +590,12 @@ python chirp.py</code></pre>
         clean chunk arrives; the <strong>sticky
         <span style="color:var(--red); font-weight:bold">S</span> badge</strong> (v2.1) on the
         sidebar entry latches until you click it, so a brief clip is never missed.</li>
-    <li><strong>Drop warning</strong> (v2.1) &mdash; the sticky
-        <span style="color:var(--red); font-weight:bold">D</span> badge on the sidebar entry latches
-        as soon as the audio capture callback drops any chunk (queue full, slow consumer, etc.), with
-        a running session total in its tooltip. Click to clear.</li>
+    <li><strong>Drop warning</strong> &mdash; raw audio lands in a preallocated per-stream ring
+        buffer straight from the realtime callback, so capture cannot be stalled by DSP or the
+        display. The sticky <span style="color:var(--red); font-weight:bold">D</span> badge on the
+        sidebar entry latches only if that ring ever <em>overruns</em> (the DSP consumer fell seconds
+        behind &mdash; it should never happen in normal use), with a running session total in its
+        tooltip. Click to clear.</li>
   </ul>
 
   <div class="callout warning">
@@ -833,7 +838,9 @@ python chirp.py</code></pre>
     configuration view to a multi-stream monitoring grid.
   </p>
   <ul>
-    <li>All active streams are displayed simultaneously in a configurable grid (1 to 6 columns).</li>
+    <li>All active streams are displayed simultaneously in a configurable grid. Use the
+        <strong>Columns</strong> control in the view toolbar to set the number of columns (e.g. 2
+        columns &times; 4 rows for 8 streams).</li>
     <li>Each cell shows a compact spectrogram or waveform, amplitude plot, threshold line,
         detect / record events strip (v2.1), and status text.</li>
     <li>The sidebar and configuration panels are hidden to maximize display area.</li>
@@ -845,7 +852,11 @@ python chirp.py</code></pre>
       done from config mode by clicking the sidebar
       <span style="color:var(--red); font-weight:bold">S</span> /
       <span style="color:var(--red); font-weight:bold">D</span> badges.</li>
-    <li>Panel height is adjustable for each stream.</li>
+    <li>Per-tile <strong>Height</strong> is adjustable, or click <strong>Fit to screen</strong> to
+        size every tile so all streams are visible at once without scrolling (based on the current
+        column count).</li>
+    <li>Rendering is GPU-accelerated (pyqtgraph/OpenGL): off-screen tiles are skipped and the frame
+        rate adapts under load, so audio capture is never starved by the display.</li>
     <li>Click <strong>Config Mode</strong> to return to the single-stream editing view.</li>
   </ul>
   <div class="callout tip">
@@ -909,18 +920,19 @@ python chirp.py</code></pre>
     <thead><tr><th>Category</th><th>What it means</th><th>File path</th></tr></thead>
     <tbody>
       <tr>
-        <td><code>queue_full</code></td>
-        <td>Python audio queue overflowed &mdash; the ingestion thread fell behind and a chunk was
-            dropped (the sidebar <span style="color:var(--red); font-weight:bold">D</span> badge).
-            Throttled to one line per stream per second; the cumulative count is stamped on each
-            line so you can see how many drops were suppressed between two log entries.</td>
+        <td><code>ring_overrun</code></td>
+        <td>The capture ring buffer overran &mdash; the DSP consumer fell more than the ring's
+            capacity behind and unread audio was overwritten (the sidebar
+            <span style="color:var(--red); font-weight:bold">D</span> badge). Throttled to one line
+            per stream per second; the cumulative count is stamped on each line so you can see how
+            many were suppressed between two log entries.</td>
         <td>&mdash;</td>
       </tr>
       <tr>
         <td><code>os_drop</code></td>
         <td>PortAudio reported <code>input_overflow</code> &mdash; the driver / OS lost samples
-            upstream of our queue (the <code>OS</code> tag on the <span style="color:var(--peach); font-weight:bold">!</span> badge).
-            Same throttling as <code>queue_full</code>.</td>
+            upstream of our ring (the <code>OS</code> tag on the <span style="color:var(--peach); font-weight:bold">!</span> badge).
+            Same throttling as <code>ring_overrun</code>.</td>
         <td>&mdash;</td>
       </tr>
       <tr>
@@ -955,7 +967,7 @@ python chirp.py</code></pre>
 
   <h3>Throttling</h3>
   <p>
-    <code>queue_full</code> and <code>os_drop</code> can fire on every audio chunk
+    <code>ring_overrun</code> and <code>os_drop</code> can fire on every audio chunk
     (50+/second at the default sample rate / chunk size). To keep the log bounded and useful,
     those two categories are limited to one entry per (stream, category) per second. The first
     event in any burst always logs immediately; subsequent events within the window are
@@ -1083,8 +1095,8 @@ python chirp.py</code></pre>
 
 <!-- Footer -->
 <footer style="margin-top:3rem; padding-top:1.5rem; border-top:1px solid var(--surface0); text-align:center; color:var(--overlay0); font-size:0.82rem;">
-  <p>Chirp v2.2.1 &mdash; User Manual</p>
-  <p>Designed for bioacoustics research. Built with Python, PyQt5, and matplotlib.</p>
+  <p>Chirp v3.0.0 &mdash; User Manual</p>
+  <p>Designed for bioacoustics research. Built with Python, PyQt5, and pyqtgraph.</p>
 </footer>
 
 </main>

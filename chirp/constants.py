@@ -17,6 +17,14 @@ SAMPLE_RATE         = 44100
 CHANNELS            = 1
 CHUNK_FRAMES        = 1024
 DTYPE               = 'float32'
+# Capacity (seconds) of the per-stream raw-capture ring buffer that sits
+# between the realtime audio callback (producer) and the DSP ingest
+# thread (consumer). Sized for generous slack: the consumer runs far
+# faster than realtime, so this many seconds of head-start means a
+# transient stall (GC pause, OS hiccup) is absorbed without ever
+# overwriting unread audio. An overrun here would mean the consumer
+# stalled for this long — it should never happen in practice.
+RING_SECONDS        = 10.0
 
 # ── Display ────────────────────────────────────────────────────────────────────
 DISPLAY_SECONDS     = 10.0
@@ -167,7 +175,7 @@ QScrollArea {{ border: none; }}
 
 __all__ = [
     # Audio
-    "SAMPLE_RATE", "CHANNELS", "CHUNK_FRAMES", "DTYPE",
+    "SAMPLE_RATE", "CHANNELS", "CHUNK_FRAMES", "DTYPE", "RING_SECONDS",
     # Display
     "DISPLAY_SECONDS", "SPECTROGRAM_NPERSEG", "COLORMAP",
     "ANIMATION_INTERVAL", "SPEC_DB_MIN", "SPEC_DB_MAX", "N_DISPLAY_ROWS",

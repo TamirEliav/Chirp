@@ -14,8 +14,10 @@ import collections
 import datetime
 import json
 import os
+import math
 import queue
 import sys
+import time
 import threading
 
 import matplotlib
@@ -148,6 +150,21 @@ class ChirpWindow(QMainWindow):
         self._vm_axes: list[dict] = []
         self._vm_n_cols = 1
         self._vm_panel_height = 300
+        # Phase 4: view-mode grid is rendered by pyqtgraph/OpenGL. Built
+        # lazily on first entry; swapped into the central scroll area in
+        # place of the matplotlib canvas (config mode keeps matplotlib
+        # during the migration). Set to use software rendering in headless
+        # tests via ``_pg_use_opengl``.
+        self._pg_grid = None
+        self._pg_use_opengl = True
+        # Phase 4 audio-priority: adaptively skip view-mode render frames
+        # when a render costs more than ~half a tick, so DSP / capture
+        # threads keep the GIL and audio never drops. EMA of view render
+        # time (ms) drives a frame-skip count (0 = full rate, up to 3 =
+        # ~1/4 rate). Off-screen culling handles the rest.
+        self._view_render_ema = 0.0
+        self._view_skip = 0
+        self._view_skip_left = 0
 
         # #7: shared audio-monitor loopback. One output stream; each
         # RecordingEntity is wired into it in `_add_recording` and the
@@ -231,6 +248,16 @@ class ChirpWindow(QMainWindow):
         self._canvas.mpl_connect('resize_event', self._recapture_bg)
         self._is_stereo_layout = False
         self._setup_axes(stereo=False)
+        # Phase 4b: the config-mode central view is now pyqtgraph too. The
+        # matplotlib figure above is kept (hidden, never drawn) so legacy
+        # helper methods that reference its axes stay harmless; the
+        # ConfigPlotPanel is what actually sits in the scroll area.
+        from chirp.ui.config_panel import ConfigPlotPanel
+        self._config_panel = ConfigPlotPanel(use_opengl=self._pg_use_opengl)
+        self._config_panel.thresholdChanged.connect(self._on_threshold_dragged)
+        self._config_panel.spectralThresholdChanged.connect(
+            self._on_spectral_threshold_dragged)
+        self._config_panel.ampScaleChanged.connect(self._on_amp_scale_menu)
 
     def _setup_axes(self, stereo=False):
         self._fig.clf()
@@ -683,10 +710,12 @@ class ChirpWindow(QMainWindow):
         self._monitor_bar = self._build_monitor_bar()
         vbox.addWidget(self._monitor_bar)
 
-        # Canvas inside a scroll area (scrollable in view mode)
+        # Plot area inside a scroll area (scrollable in view mode). Phase 4b:
+        # config mode shows the pyqtgraph ConfigPlotPanel; view mode swaps in
+        # the MultiStreamGrid. The matplotlib canvas is no longer mounted.
         self._canvas_scroll = QScrollArea()
         self._canvas_scroll.setWidgetResizable(True)
-        self._canvas_scroll.setWidget(self._canvas)
+        self._canvas_scroll.setWidget(self._config_panel)
         self._canvas_scroll.setFrameShape(QFrame.NoFrame)
         vbox.addWidget(self._canvas_scroll, stretch=1)
 
@@ -765,12 +794,27 @@ class ChirpWindow(QMainWindow):
         h.addWidget(lbl_h)
         self._vm_height_spin = QSpinBox()
         self._vm_height_spin.setToolTip('Row height for each recording tile in View mode')
-        self._vm_height_spin.setRange(120, 700)
+        self._vm_height_spin.setRange(80, 700)
         self._vm_height_spin.setValue(self._vm_panel_height)
         self._vm_height_spin.setSuffix(' px')
         self._vm_height_spin.setFixedWidth(90)
         self._vm_height_spin.valueChanged.connect(self._on_vm_height_changed)
         h.addWidget(self._vm_height_spin)
+
+        h.addSpacing(10)
+
+        self._btn_vm_fit = QPushButton('Fit to screen')
+        self._btn_vm_fit.setToolTip(
+            'Set the tile height so every stream fits the window without '
+            'scrolling (uses the current column count)')
+        self._btn_vm_fit.setStyleSheet(
+            f'QPushButton {{ background-color: {C["surface0"]}; color: {C["blue"]}; '
+            f'border: 1px solid {C["blue"]}; border-radius: 5px; '
+            f'padding: 5px 12px; font-weight: bold; min-width: 0px; }}'
+            f'QPushButton:hover {{ background-color: {C["surface1"]}; }}'
+        )
+        self._btn_vm_fit.clicked.connect(self._on_vm_fit_to_screen)
+        h.addWidget(self._btn_vm_fit)
 
         return w
 
@@ -1665,11 +1709,9 @@ class ChirpWindow(QMainWindow):
         self._chk_shared_trigger.toggled.connect(self._on_shared_trigger_toggled)
         self._btn_apply_all.clicked.connect(self._on_apply_all_settings)
 
-        # Matplotlib events
-        self._canvas.mpl_connect('button_press_event',   self._on_mpl_press)
-        self._canvas.mpl_connect('motion_notify_event',  self._on_mpl_motion)
-        self._canvas.mpl_connect('button_release_event', self._on_mpl_release)
-        self._canvas.mpl_connect('scroll_event',         self._on_scroll)
+        # Plot interaction (threshold drag, scroll-zoom, amp-scale menu) is
+        # handled by the pyqtgraph ConfigPlotPanel signals wired in
+        # _build_figure — no matplotlib canvas events to connect.
 
         # Sidebar
         self._sidebar.selection_changed.connect(self._switch_selection)
@@ -1950,6 +1992,14 @@ class ChirpWindow(QMainWindow):
         # all (linear placeholder). Without this the amp plot stays
         # blank in log mode until the user toggles scale.
         self._apply_amp_scale_to_axes(e)
+        # Phase 4b: rebuild the pyqtgraph config panel for the newly
+        # selected entity so its layout + threshold lines reflect this
+        # stream (layout auto-corrects on the next tick too, but the
+        # threshold lines are only set here / on drag).
+        if getattr(self, '_config_panel', None) is not None and e is not None:
+            self._config_panel.rebuild(e)
+            self._config_panel.set_threshold(e.threshold)
+            self._config_panel.set_spectral_threshold(e.spectral_threshold)
 
     # ──────────────────────────────────────────────────────────────────────
     # Selection switching
@@ -2207,6 +2257,7 @@ class ChirpWindow(QMainWindow):
             view_mode={
                 'columns':      self._vm_n_cols,
                 'panel_height': self._vm_panel_height,
+                'use_opengl':   self._pg_use_opengl,
             },
         )
 
@@ -2314,6 +2365,10 @@ class ChirpWindow(QMainWindow):
         # even if the on-disk file had garbage).
         self._vm_n_cols = view_mode['columns']
         self._vm_panel_height = view_mode['panel_height']
+        self._pg_use_opengl = bool(view_mode.get('use_opengl', True))
+        # Drop any grid built with the previous OpenGL setting so it is
+        # recreated with the new one on next view-mode entry.
+        self._pg_grid = None
         self._vm_cols_spin.blockSignals(True)
         self._vm_cols_spin.setValue(self._vm_n_cols)
         self._vm_cols_spin.blockSignals(False)
@@ -2356,9 +2411,9 @@ class ChirpWindow(QMainWindow):
             self._update_spec_yticks(e)
             self._refresh_transport_ui()
 
-        # If in view mode, rebuild view axes
+        # If in view mode, rebuild the pyqtgraph view grid.
         if self._view_mode:
-            self._setup_view_mode_axes()
+            self._rebuild_view()
 
         self._current_config_path = path
         self._mark_clean()  # #11 / c22
@@ -2412,20 +2467,13 @@ class ChirpWindow(QMainWindow):
         self._sync_thr_line(val)
 
     def _sync_thr_line(self, val: float):
-        e = self._sel
-        scale = getattr(e, 'amp_scale', 'linear') if e else 'linear'
-        thr_disp = _thr_to_display(val, scale)
-        self._threshold_line.set_ydata([thr_disp, thr_disp])
-        self._threshold_label.set_y(thr_disp + _thr_label_y_offset(scale))
-        self._threshold_label.set_text(_thr_label_text(val, scale))
-        self._canvas.draw_idle()
+        # Phase 4b: drive the pyqtgraph config panel's threshold line.
+        if getattr(self, '_config_panel', None) is not None:
+            self._config_panel.set_threshold(val)
 
     def _sync_entropy_thr_line(self, val: float):
-        if self._entropy_thr_line is not None:
-            self._entropy_thr_line.set_ydata([val, val])
-            self._entropy_thr_label.set_y(val + 0.03)
-            self._entropy_thr_label.set_text(f'ent = {val:.3f}')
-            self._canvas.draw_idle()
+        if getattr(self, '_config_panel', None) is not None:
+            self._config_panel.set_spectral_threshold(val)
 
     def _set_thr_silent(self, val: float):
         self._sb_thr.blockSignals(True)
@@ -2523,159 +2571,35 @@ class ChirpWindow(QMainWindow):
             self._lbl_calib_status.setStyleSheet(''),
         ))
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Matplotlib mouse events
-    # ──────────────────────────────────────────────────────────────────────
+    # Phase 4b: matplotlib mouse handlers (threshold drag, scroll-zoom,
+    # amp-scale right-click) were removed. Threshold drag is now a
+    # movable pyqtgraph InfiniteLine (ConfigPlotPanel.thresholdChanged /
+    # spectralThresholdChanged), scroll-zoom is the pyqtgraph ViewBox's
+    # built-in wheel zoom, and the amp-scale toggle is the panel's
+    # context menu (ampScaleChanged).
 
-    def _on_mpl_press(self, event):
-        # Right-click on an amp axis pops the scale-selection menu.
-        # Resolves the target entity from the clicked axis so the same
-        # gesture works in both config mode (single amp axis) and view
-        # mode (per-tile amp axis).
-        if event.button == 3:
-            target = self._resolve_amp_axis_click(event.inaxes)
-            if target is not None:
-                self._show_amp_scale_menu(target)
-            return
-        if self._view_mode:
-            return
+    def _on_amp_scale_menu(self, value: str) -> None:
+        """Phase 4b: the config panel's amplitude-scale context menu was
+        used. Apply to the selected entity."""
         e = self._sel
-        if not e or event.button != 1:
-            return
-        if event.inaxes is self._ax_amp:
-            thr_disp = _thr_to_display(e.threshold, getattr(e, 'amp_scale', 'linear'))
-            _, y_disp = self._ax_amp.transData.transform((0.0, thr_disp))
-            if abs(event.y - y_disp) <= 12:
-                self._dragging = True
-                self._timer.stop()
-        elif self._ax_entropy is not None and event.inaxes is self._ax_entropy:
-            _, y_disp = self._ax_entropy.transData.transform((0.0, e.spectral_threshold))
-            if abs(event.y - y_disp) <= 12:
-                self._dragging_entropy = True
-                self._timer.stop()
-
-    def _on_mpl_motion(self, event):
-        if self._dragging:
-            if event.inaxes is not self._ax_amp:
-                return
-            e = self._sel
-            scale = getattr(e, 'amp_scale', 'linear') if e else 'linear'
-            val = _display_to_thr(event.ydata, scale)
-            if e:
-                e.threshold = val
-            self._set_thr_silent(val)
-            self._sync_thr_line(val)
-        elif self._dragging_entropy:
-            if self._ax_entropy is None or event.inaxes is not self._ax_entropy:
-                return
-            val = float(np.clip(event.ydata, 0.0, 1.0))
-            e = self._sel
-            if e:
-                e.spectral_threshold = val
-            self._sb_entropy_thr.blockSignals(True)
-            self._sb_entropy_thr.setValue(val)
-            self._sb_entropy_thr.blockSignals(False)
-            self._sync_entropy_thr_line(val)
-
-    def _on_mpl_release(self, event):
-        if self._dragging or self._dragging_entropy:
-            self._dragging = False
-            self._dragging_entropy = False
-            self._timer.start()
-
-    # ──────────────────────────────────────────────────────────────────────
-    # Amp-axis right-click menu (linear / log scale toggle)
-    # ──────────────────────────────────────────────────────────────────────
-
-    def _resolve_amp_axis_click(self, ax) -> "RecordingEntity | None":
-        """Return the entity whose amp axis was clicked, or None.
-        Works in both config mode (single ``self._ax_amp`` belongs to
-        ``self._sel``) and view mode (each tile's ``vm['ax_amp']``
-        maps to ``self._entities[i]``)."""
-        if ax is None:
-            return None
-        if not self._view_mode:
-            if ax is getattr(self, '_ax_amp', None):
-                return self._sel
-            return None
-        for i, vm in enumerate(self._vm_axes):
-            if ax is vm.get('ax_amp'):
-                if i < len(self._entities):
-                    return self._entities[i]
-                return None
-        return None
-
-    def _show_amp_scale_menu(self, e) -> None:
-        """Pop a context menu at the cursor with Linear / Log radio
-        choices for the amp-axis scale on entity ``e``."""
-        menu = QMenu(self._canvas)
-        header = QAction(f'Y axis — {e.name}', menu)
-        header.setEnabled(False)
-        menu.addAction(header)
-        menu.addSeparator()
-        group = QActionGroup(menu)
-        group.setExclusive(True)
-        current = getattr(e, 'amp_scale', 'linear')
-        for label, value in (('Linear', 'linear'), ('Log (dB)', 'log')):
-            act = QAction(label, menu, checkable=True)
-            act.setChecked(current == value)
-            act.triggered.connect(
-                lambda _checked=False, v=value, ent=e: self._set_amp_scale(ent, v))
-            group.addAction(act)
-            menu.addAction(act)
-        menu.exec_(QCursor.pos())
+        if e is not None:
+            self._set_amp_scale(e, value)
 
     def _apply_amp_scale_to_axes(self, e) -> None:
-        """Sync the config-mode amp axis state to ``e.amp_scale``.
-
-        Idempotent — used by both the right-click toggle (``_set_amp_scale``)
-        and ``_load_params_from_entity`` so the axis ylim / ylabel /
-        line ydata / threshold position can never drift away from
-        ``e.amp_scale``. The latter callsite is load-bearing on first
-        run: ``_setup_axes`` is invoked once during ``_build_figure``
-        before any entity exists (``_selected_idx == -1`` → ``e=None``
-        → linear placeholder), and ``_load_params_from_entity`` only
-        rebuilds the figure on layout changes (stereo / display_mode /
-        entropy). Without this sync the amp axis stays linear even
-        though the entity defaults to log, leaving the plot blank
-        until the user toggles the scale.
-        """
-        if e is None or self._view_mode or self._ax_amp is None:
+        """Shim (Phase 4b): the pyqtgraph config panel owns the amp-axis
+        scale now. Rebuild it so the Y range / label / threshold line
+        reflect ``e.amp_scale``. Kept under its old name because several
+        handlers still call it (e.g. ``_load_params_from_entity``)."""
+        if e is None or getattr(self, '_config_panel', None) is None:
             return
-        scale = getattr(e, 'amp_scale', 'linear')
-        ax = self._ax_amp
-        lo, hi = _amp_axis_limits(e)
-        ax.set_ylim(lo, hi)
-        ax.set_ylabel(_amp_axis_label(e))
-        if self._amp_line is not None:
-            self._amp_line.set_ydata(_amp_to_display(e.abs_amp_buffer, scale))
-        if self._amp_line_r is not None:
-            self._amp_line_r.set_ydata(
-                _amp_to_display(e.abs_amp_buffer_r, scale))
-        if self._threshold_line is not None:
-            self._sync_thr_line(e.threshold)
-        self._recapture_bg()
-
-    def _apply_amp_scale_to_vm_tile(self, e, vm) -> None:
-        """View-mode counterpart of ``_apply_amp_scale_to_axes`` —
-        updates a single tile in place."""
-        scale = getattr(e, 'amp_scale', 'linear')
-        ax = vm.get('ax_amp')
-        if ax is None:
-            return
-        lo, hi = _amp_axis_limits(e)
-        ax.set_ylim(lo, hi)
-        ax.set_ylabel('Amp (dB)' if scale == 'log' else 'Amp', fontsize=7)
-        vm['amp_line'].set_ydata(_amp_to_display(e.abs_amp_buffer, scale))
-        if vm.get('amp_line_r') is not None:
-            vm['amp_line_r'].set_ydata(
-                _amp_to_display(e.abs_amp_buffer_r, scale))
-        thr_disp = _thr_to_display(e.threshold, scale)
-        vm['thr_line'].set_ydata([thr_disp, thr_disp])
-        self._recapture_bg()
+        if not self._view_mode and e is self._sel:
+            self._config_panel.rebuild(e)
+            self._config_panel.set_threshold(e.threshold)
 
     def _set_amp_scale(self, e, scale: str) -> None:
-        """Right-click handler: pick Linear or Log (dB) for ``e``."""
+        """Pick Linear or Log (dB) for ``e``. Config mode rebuilds the
+        panel; view mode needs nothing (each tile reads ``amp_scale`` on
+        every render tick)."""
         if scale not in ('linear', 'log'):
             return
         if scale == getattr(e, 'amp_scale', 'linear'):
@@ -2684,103 +2608,6 @@ class ChirpWindow(QMainWindow):
         self._mark_dirty()
         if not self._view_mode and e is self._sel:
             self._apply_amp_scale_to_axes(e)
-            return
-        if self._view_mode:
-            for i, vm in enumerate(self._vm_axes):
-                if i < len(self._entities) and self._entities[i] is e:
-                    self._apply_amp_scale_to_vm_tile(e, vm)
-                    return
-
-    @staticmethod
-    def _zoom_axis_centered(ax, event_ydata, step, anchor_zero=False):
-        """Zoom an axis centered on the mouse Y position. Returns (new_lo, new_hi).
-        If anchor_zero, the lower limit is pinned at 0."""
-        scale = 0.85 if step > 0 else 1.0 / 0.85
-        ylo, yhi = ax.get_ylim()
-        if anchor_zero:
-            new_hi = max(0.01, yhi * scale)
-            ax.set_ylim(0.0, new_hi)
-            return 0.0, new_hi
-        # Zoom centered on mouse position
-        y = event_ydata if event_ydata is not None else (ylo + yhi) / 2
-        new_lo = y - (y - ylo) * scale
-        new_hi = y + (yhi - y) * scale
-        if new_hi - new_lo < 0.01:
-            new_hi = new_lo + 0.01
-        ax.set_ylim(new_lo, new_hi)
-        return new_lo, new_hi
-
-    def _on_scroll(self, event):
-        if self._view_mode:
-            for i, vm in enumerate(self._vm_axes):
-                if event.inaxes is vm['ax_amp'] or (vm.get('ax_wave') and event.inaxes is vm['ax_wave']):
-                    if i >= len(self._entities):
-                        return
-                    e = self._entities[i]
-                    # Log-scale amp axis is fixed at AMP_DB_MIN..MAX —
-                    # scroll-zoom is only meaningful on the linear axis.
-                    # If the user scrolled on the wave axis we still
-                    # rescale the wave (always linear, signed) but skip
-                    # the amp side.
-                    if getattr(e, 'amp_scale', 'linear') == 'log':
-                        if vm.get('ax_wave') is not None and event.inaxes is vm['ax_wave']:
-                            scale = 0.85 if event.step > 0 else 1.0 / 0.85
-                            new_ylim = max(0.01, e.amp_ylim * scale)
-                            e.amp_ylim = new_ylim
-                            vm['ax_wave'].set_ylim(-new_ylim, new_ylim)
-                            self._recapture_bg()
-                        return
-                    _, new_ymax = self._zoom_axis_centered(
-                        vm['ax_amp'], event.ydata, event.step, anchor_zero=True)
-                    if vm.get('ax_wave') is not None:
-                        vm['ax_wave'].set_ylim(-new_ymax, new_ymax)
-                    e.amp_ylim = new_ymax
-                    self._recapture_bg()
-                    return
-                if vm.get('ax_entropy') is not None and event.inaxes is vm['ax_entropy']:
-                    self._zoom_axis_centered(vm['ax_entropy'], event.ydata, event.step)
-                    self._recapture_bg()
-                    return
-            return
-
-        # Config mode — entropy axis (centered zoom)
-        if self._ax_entropy is not None and event.inaxes is self._ax_entropy:
-            self._zoom_axis_centered(self._ax_entropy, event.ydata, event.step)
-            self._recapture_bg()
-            return
-
-        # Config mode — waveform axes (symmetric around zero)
-        wave_axes = [ax for ax in [getattr(self, '_ax_wave', None),
-                                    getattr(self, '_ax_wave_r', None)] if ax is not None]
-        if event.inaxes in wave_axes:
-            e = self._sel
-            if e:
-                scale = 0.85 if event.step > 0 else 1.0 / 0.85
-                new_ylim = max(0.01, e.amp_ylim * scale)
-                e.amp_ylim = new_ylim
-                for wax in wave_axes:
-                    wax.set_ylim(-new_ylim, new_ylim)
-                # Mirror the change onto the amp axis only when the
-                # amp plot is in linear mode — log mode owns its own
-                # fixed dB range.
-                if getattr(e, 'amp_scale', 'linear') != 'log':
-                    self._ax_amp.set_ylim(0.0, new_ylim)
-                self._recapture_bg()
-            return
-
-        # Config mode — amplitude axis (anchored at zero)
-        if event.inaxes is not self._ax_amp:
-            return
-        e = self._sel
-        if e and getattr(e, 'amp_scale', 'linear') == 'log':
-            # Fixed dB range — ignore zoom on the log amp axis.
-            return
-        _, new_ymax = self._zoom_axis_centered(self._ax_amp, event.ydata, event.step, anchor_zero=True)
-        if e:
-            e.amp_ylim = new_ymax
-            for wax in wave_axes:
-                wax.set_ylim(-new_ymax, new_ymax)
-        self._recapture_bg()
 
     # ──────────────────────────────────────────────────────────────────────
     # Spectrogram display callbacks
@@ -3423,8 +3250,8 @@ class ChirpWindow(QMainWindow):
                 w.hide()
             # Show view toolbar
             self._view_toolbar.show()
-            # Rebuild figure for all streams
-            self._setup_view_mode_axes()
+            # Phase 4: render all streams via the pyqtgraph/OpenGL grid.
+            self._rebuild_view()
         else:
             # Save view-mode zoom levels back to entities
             for i, vm in enumerate(self._vm_axes):
@@ -3437,6 +3264,8 @@ class ChirpWindow(QMainWindow):
             self._sidebar.show()
             for w in self._config_widgets:
                 w.show()
+            # Phase 4: swap the matplotlib canvas back in for config mode.
+            self._restore_config_canvas()
             # Rebuild single-entity figure
             self._canvas.setMinimumHeight(0)
             e = self._sel
@@ -3445,6 +3274,63 @@ class ChirpWindow(QMainWindow):
             if e:
                 self._load_params_from_entity(self._selected_idx)
                 self._update_spec_yticks(e)
+
+    def _rebuild_view(self) -> None:
+        """Phase 4: build/populate the pyqtgraph view-mode grid and swap it
+        into the central scroll area (detaching the matplotlib canvas
+        without deleting it)."""
+        if self._pg_grid is None:
+            from chirp.ui.central_plots import MultiStreamGrid
+            self._pg_grid = MultiStreamGrid(use_opengl=self._pg_use_opengl)
+        self._pg_grid.set_tile_height(self._vm_panel_height)
+        self._pg_grid.rebuild(self._entities, cols=self._vm_n_cols)
+        if self._canvas_scroll.widget() is not self._pg_grid:
+            # takeWidget detaches the current widget (the matplotlib canvas,
+            # which we still hold via self._canvas) without deleting it.
+            self._canvas_scroll.takeWidget()
+            self._canvas_scroll.setWidget(self._pg_grid)
+
+    def _refresh_view(self) -> None:
+        """Phase 4: per-tick update of the pyqtgraph view-mode grid."""
+        if self._pg_grid is not None:
+            self._pg_grid.update_all(self._entities)
+
+    def _restore_config_canvas(self) -> None:
+        """Swap the pyqtgraph config panel back into the scroll area when
+        leaving view mode (detaching the grid without deleting it)."""
+        if self._canvas_scroll.widget() is not self._config_panel:
+            self._canvas_scroll.takeWidget()
+            self._canvas_scroll.setWidget(self._config_panel)
+        e = self._sel
+        if e is not None:
+            self._config_panel.rebuild(e)
+            self._config_panel.set_threshold(e.threshold)
+            self._config_panel.set_spectral_threshold(e.spectral_threshold)
+
+    def _on_threshold_dragged(self, thr_linear: float) -> None:
+        """Phase 4b: the amplitude threshold line was dragged in the config
+        panel — push it into the selected entity + spinbox (routing through
+        the spinbox handler so shared-trigger broadcast still applies)."""
+        e = self._sel
+        if e is None:
+            return
+        # Update the spinbox; its valueChanged handler writes the entity,
+        # broadcasts to all if shared-trigger is on, and marks dirty. The
+        # line is already where the user left it, so re-sync is cheap.
+        self._sb_thr.setValue(thr_linear)
+
+    def _on_spectral_threshold_dragged(self, val: float) -> None:
+        """Phase 4b: the spectral (entropy) threshold line was dragged."""
+        e = self._sel
+        if e is None:
+            return
+        e.spectral_threshold = float(val)
+        sb = getattr(self, '_sb_entropy_thr', None)
+        if sb is not None:
+            sb.blockSignals(True)
+            sb.setValue(float(val))
+            sb.blockSignals(False)
+        self._mark_dirty()
 
     def _setup_view_mode_axes(self):
         """Rebuild matplotlib figure with all entities in a grid layout."""
@@ -3721,12 +3607,36 @@ class ChirpWindow(QMainWindow):
     def _on_vm_cols_changed(self, val):
         self._vm_n_cols = val
         if self._view_mode:
-            self._setup_view_mode_axes()
+            self._rebuild_view()
 
     def _on_vm_height_changed(self, val):
         self._vm_panel_height = val
-        if self._view_mode:
-            self._setup_view_mode_axes()
+        if self._view_mode and self._pg_grid is not None:
+            self._pg_grid.set_tile_height(val)
+
+    def _on_vm_fit_to_screen(self):
+        """Pick a tile height so all streams fit the viewport without
+        scrolling, given the current column count."""
+        if not self._view_mode or self._pg_grid is None:
+            return
+        n = len(self._entities)
+        if n == 0:
+            return
+        cols = max(1, min(self._vm_n_cols, n))
+        rows = math.ceil(n / cols)
+        # Viewport height minus the grid's top/bottom margins (4+4) and the
+        # inter-row spacing (4 px between rows) — matches MultiStreamGrid.
+        vp = self._canvas_scroll.viewport().height()
+        avail = vp - 8 - 4 * (rows - 1)
+        tile = int(avail / rows) if rows else vp
+        lo, hi = self._vm_height_spin.minimum(), self._vm_height_spin.maximum()
+        tile = max(lo, min(hi, tile))
+        if tile == self._vm_height_spin.value():
+            # Value unchanged (already clamped there) — apply directly since
+            # valueChanged won't fire.
+            self._pg_grid.set_tile_height(tile)
+        else:
+            self._vm_height_spin.setValue(tile)  # → _on_vm_height_changed
 
     def _update_plot_view_mode(self):
         """Update all entity displays in view mode (blitting)."""
@@ -3975,7 +3885,25 @@ class ChirpWindow(QMainWindow):
         without indenting the whole body."""
         # 2. Branch on mode
         if self._view_mode:
-            self._update_plot_view_mode()
+            # Phase 4: pyqtgraph/OpenGL grid renders the multi-stream view,
+            # at an adaptive rate. If recent renders are expensive we skip
+            # ticks so DSP/capture threads keep the GIL (audio-priority).
+            if self._view_skip_left > 0:
+                self._view_skip_left -= 1
+                self._update_plot_err_count = 0
+                return
+            t0 = time.perf_counter()
+            self._refresh_view()
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            self._view_render_ema = (0.7 * self._view_render_ema + 0.3 * dt_ms
+                                     if self._view_render_ema else dt_ms)
+            target = ANIMATION_INTERVAL * 0.5  # keep render duty <= ~50%
+            if self._view_render_ema > target:
+                self._view_skip = min(
+                    3, int(math.ceil(self._view_render_ema / target)) - 1)
+            else:
+                self._view_skip = 0
+            self._view_skip_left = self._view_skip
             self._update_plot_err_count = 0
             return
 
@@ -3983,68 +3911,13 @@ class ChirpWindow(QMainWindow):
         # on every plot tick (50 ms) so "passed / total" stays live.
         self._update_wav_time_label()
 
-        # 3. Update main display for selected entity (blitting)
+        # 3. Update main display for the selected entity via the
+        # pyqtgraph config panel (Phase 4b — replaces the matplotlib
+        # blit path; the panel rebuilds its layout automatically when
+        # display_mode / stereo / spectral / amp_scale change).
         e = self._sel
-        if e and self._bg is not None:
-            cursor_x = (e.write_head / e.sample_rate) % e.display_seconds
-            amp_color_l = '#ff5555' if e.saturated else C['blue']
-            amp_color_r = '#ff5555' if e.saturated else C['pink']
-
-            # Spectrogram
-            if self._spec_im is not None:
-                self._spec_im.set_data(e.resample_spec(e.spec_buffer))
-                clim_lo = min(e.db_floor, e.db_ceil - 0.1)
-                self._spec_im.set_clim(clim_lo, e.db_ceil)
-                self._cursor_spec.set_xdata([cursor_x, cursor_x])
-            if self._is_stereo_layout and self._spec_im_r is not None:
-                self._spec_im_r.set_data(e.resample_spec(e.spec_buffer_r))
-                clim_lo = min(e.db_floor, e.db_ceil - 0.1)
-                self._spec_im_r.set_clim(clim_lo, e.db_ceil)
-                self._cursor_spec_r.set_xdata([cursor_x, cursor_x])
-
-            # Waveform
-            if self._wave_line is not None:
-                wave_color_l = '#ff5555' if e.saturated else C['teal']
-                self._wave_line.set_color(wave_color_l)
-                self._wave_line.set_ydata(e.amp_buffer)
-                self._cursor_wave.set_xdata([cursor_x, cursor_x])
-            if self._wave_line_r is not None:
-                wave_color_r = '#ff5555' if e.saturated else C['pink']
-                self._wave_line_r.set_color(wave_color_r)
-                self._wave_line_r.set_ydata(e.amp_buffer_r)
-                if self._cursor_wave_r is not None:
-                    self._cursor_wave_r.set_xdata([cursor_x, cursor_x])
-
-            # Amplitude envelope (converted to display scale per
-            # `e.amp_scale` — linear identity, or 20*log10 for dB).
-            scale = getattr(e, 'amp_scale', 'linear')
-            self._amp_line.set_color(amp_color_l)
-            self._amp_line.set_ydata(_amp_to_display(e.abs_amp_buffer, scale))
-            if self._is_stereo_layout and self._amp_line_r is not None:
-                self._amp_line_r.set_color(amp_color_r)
-                self._amp_line_r.set_ydata(_amp_to_display(e.abs_amp_buffer_r, scale))
-            self._cursor_amp .set_xdata([cursor_x, cursor_x])
-
-            # Entropy trace
-            if self._entropy_line is not None:
-                col_cursor_x = (e.col_head / e._n_cols) * e.display_seconds
-                self._entropy_line.set_ydata(e.entropy_buffer)
-                self._cursor_entropy.set_xdata([col_cursor_x, col_cursor_x])
-                self._entropy_thr_line.set_ydata([e.spectral_threshold, e.spectral_threshold])
-                self._entropy_thr_label.set_y(e.spectral_threshold + 0.03)
-                self._entropy_thr_label.set_text(f'ent = {e.spectral_threshold:.3f}')
-
-            # #32: detect / record events strip
-            if self._events_im is not None:
-                rgba = self._build_events_rgba(e)
-                if rgba is not None:
-                    self._events_im.set_data(rgba)
-                self._cursor_events.set_xdata([cursor_x, cursor_x])
-
-            self._canvas.restore_region(self._bg)
-            for a in self._get_config_artists():
-                a.axes.draw_artist(a)
-            self._canvas.blit(self._fig.bbox)
+        if e is not None:
+            self._config_panel.update_from_entity(e)
 
         # 4. Update sidebar for ALL entities
         for i, ent in enumerate(self._entities):
@@ -4196,6 +4069,14 @@ class ChirpWindow(QMainWindow):
             except Exception as exc:
                 teardown_errors.append(f'close({e.name}): {exc}')
                 print(f'[Chirp] close failed for {e.name}: {exc}')
+
+        # Flush + stop the async error logger so the tail of
+        # chirp_errors.log isn't lost when the interpreter exits.
+        try:
+            from chirp import error_log as _errlog
+            _errlog.shutdown(timeout=2.0)
+        except Exception as exc:
+            teardown_errors.append(f'error_log.shutdown: {exc}')
 
         # #56: if anything went wrong, show a modal so the user knows
         # the session did not exit cleanly before the window dies.

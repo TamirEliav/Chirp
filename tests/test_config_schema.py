@@ -29,10 +29,26 @@ def _fresh_entity(name="RoundTrip"):
     return RecordingEntity(name=name, device_id=None)
 
 
+def test_use_opengl_roundtrip_and_default():
+    from chirp.config.schema import load_settings_dict
+    # Explicit False survives a round-trip.
+    data = build_settings_dict([], view_mode={"columns": 1, "panel_height": 300,
+                                              "use_opengl": False})
+    assert data["view_mode"]["use_opengl"] is False
+    _, vm, _ = load_settings_dict(json.loads(json.dumps(data)))
+    assert vm["use_opengl"] is False
+    # Legacy file without the key loads with the default (True).
+    _, vm2, _ = load_settings_dict({"version": 1, "recordings": [],
+                                    "view_mode": {"columns": 2, "panel_height": 200}})
+    assert vm2["use_opengl"] is True
+
+
 def test_empty_config_roundtrip():
     data = build_settings_dict([], view_mode={"columns": 3, "panel_height": 250})
     assert data["version"] == CONFIG_SCHEMA_VERSION
-    assert data["view_mode"] == {"columns": 3, "panel_height": 250}
+    # use_opengl (Phase 4) defaults True when the caller doesn't set it.
+    assert data["view_mode"] == {"columns": 3, "panel_height": 250,
+                                 "use_opengl": True}
     assert data["recordings"] == []
 
     # JSON round-trip should be lossless
@@ -41,7 +57,7 @@ def test_empty_config_roundtrip():
 
     entities, vm, warnings = load_settings_dict(decoded)
     assert entities == []
-    assert vm == {"columns": 3, "panel_height": 250}
+    assert vm == {"columns": 3, "panel_height": 250, "use_opengl": True}
     assert warnings == []
 
 

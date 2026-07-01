@@ -10,13 +10,13 @@ from __future__ import annotations
 
 import json
 import os
-import queue
 import time
 
 import numpy as np
 import pytest
 import scipy.io.wavfile
 
+from chirp.audio.ringbuffer import AudioRing
 from chirp.audio.wav_capture import WavFileCapture
 from chirp.config.schema import build_settings_dict, load_settings_dict
 from chirp.constants import CHUNK_FRAMES
@@ -35,13 +35,31 @@ def _make_wav(path: str, sample_rate: int = 44100,
     scipy.io.wavfile.write(path, sample_rate, pcm16)
 
 
+# WavFileCapture now writes into an AudioRing rather than a queue.Queue.
+# These helpers mirror the queue inspection the tests used to do: the
+# ring is the producer→consumer channel and the test plays the consumer.
+def _ring(channels: int = 1, seconds: float = 3.0, sr: int = 44100) -> AudioRing:
+    # Sized generously so the un-consumed producer never overruns during
+    # the short test windows.
+    return AudioRing(int(sr * seconds), channels=channels)
+
+
+def _navail(ring: AudioRing) -> int:
+    """Number of whole CHUNK_FRAMES blocks currently available."""
+    return ring.available // CHUNK_FRAMES
+
+
+def _get_chunk(ring: AudioRing) -> np.ndarray:
+    _, block = ring.read(CHUNK_FRAMES)
+    return block
+
+
 # ── WavFileCapture -------------------------------------------------------
 
 def test_wav_capture_opens_and_reports_metadata(tmp_path):
     wav = tmp_path / 'tone.wav'
     _make_wav(str(wav), sample_rate=22050, duration=0.05)
-    q: queue.Queue = queue.Queue(maxsize=10)
-    cap = WavFileCapture(q, str(wav))
+    cap = WavFileCapture(_ring(sr=22050), str(wav))
     try:
         assert cap.valid
         assert cap.file_sample_rate == 22050
@@ -51,8 +69,7 @@ def test_wav_capture_opens_and_reports_metadata(tmp_path):
 
 
 def test_wav_capture_invalid_path_not_valid(tmp_path):
-    q: queue.Queue = queue.Queue()
-    cap = WavFileCapture(q, str(tmp_path / 'does-not-exist.wav'))
+    cap = WavFileCapture(_ring(), str(tmp_path / 'does-not-exist.wav'))
     try:
         assert not cap.valid
     finally:
@@ -61,19 +78,19 @@ def test_wav_capture_invalid_path_not_valid(tmp_path):
 
 def test_wav_capture_emits_mono_chunks_of_fixed_size(tmp_path):
     wav = tmp_path / 'tone.wav'
-    # ~2 s of audio so the queue has room to fill at real-time pace.
+    # ~2 s of audio so the ring has room to fill at real-time pace.
     _make_wav(str(wav), sample_rate=44100, duration=2.0)
-    q: queue.Queue = queue.Queue(maxsize=500)
-    cap = WavFileCapture(q, str(wav))
+    ring = _ring()
+    cap = WavFileCapture(ring, str(wav))
     try:
         cap.resume()
         # Wait for a handful of chunks to arrive.
         deadline = time.monotonic() + 1.0
-        while q.qsize() < 5 and time.monotonic() < deadline:
+        while _navail(ring) < 5 and time.monotonic() < deadline:
             time.sleep(0.01)
         cap.pause()
-        assert q.qsize() >= 5
-        first = q.get_nowait()
+        assert _navail(ring) >= 5
+        first = _get_chunk(ring)
         assert first.dtype == np.float32
         assert first.shape == (CHUNK_FRAMES,)
     finally:
@@ -83,15 +100,15 @@ def test_wav_capture_emits_mono_chunks_of_fixed_size(tmp_path):
 def test_wav_capture_stereo_duplicates_mono(tmp_path):
     wav = tmp_path / 'tone.wav'
     _make_wav(str(wav), sample_rate=44100, duration=0.5, channels=1)
-    q: queue.Queue = queue.Queue(maxsize=100)
-    cap = WavFileCapture(q, str(wav), channels=2)
+    ring = _ring(channels=2)
+    cap = WavFileCapture(ring, str(wav), channels=2)
     try:
         cap.resume()
         deadline = time.monotonic() + 1.0
-        while q.empty() and time.monotonic() < deadline:
+        while _navail(ring) < 1 and time.monotonic() < deadline:
             time.sleep(0.01)
         cap.pause()
-        chunk = q.get_nowait()
+        chunk = _get_chunk(ring)
         assert chunk.shape == (CHUNK_FRAMES, 2)
         # Left and right should match (mono duplicated).
         np.testing.assert_array_equal(chunk[:, 0], chunk[:, 1])
@@ -102,19 +119,20 @@ def test_wav_capture_stereo_duplicates_mono(tmp_path):
 def test_wav_capture_one_shot_stops_at_eof(tmp_path):
     wav = tmp_path / 'tone.wav'
     _make_wav(str(wav), sample_rate=44100, duration=0.05)  # ~2 chunks worth
-    q: queue.Queue = queue.Queue(maxsize=500)
-    cap = WavFileCapture(q, str(wav), loop=False)
+    ring = _ring()
+    cap = WavFileCapture(ring, str(wav), loop=False)
     try:
         cap.resume()
         # The file is ~2200 samples = 3 chunks. Give the producer a
-        # generous window, then confirm no more chunks arrive.
+        # generous window, then confirm no more chunks arrive. Nothing
+        # consumes the ring, so write_total stops growing after EOF.
         time.sleep(0.4)
-        size_before = q.qsize()
+        before = ring.write_total
         time.sleep(0.2)
-        size_after = q.qsize()
-        assert size_after == size_before, (
-            f'queue grew after EOF: {size_before} -> {size_after}')
-        assert size_before >= 1
+        after = ring.write_total
+        assert after == before, (
+            f'ring grew after EOF: {before} -> {after}')
+        assert before >= CHUNK_FRAMES
     finally:
         cap.close()
 
@@ -122,15 +140,15 @@ def test_wav_capture_one_shot_stops_at_eof(tmp_path):
 def test_wav_capture_reports_duration_and_position(tmp_path):
     wav = tmp_path / 'tone.wav'
     _make_wav(str(wav), sample_rate=44100, duration=0.5)
-    q: queue.Queue = queue.Queue(maxsize=500)
-    cap = WavFileCapture(q, str(wav))
+    ring = _ring()
+    cap = WavFileCapture(ring, str(wav))
     try:
         assert cap.duration_sec == pytest.approx(0.5, abs=1e-3)
         assert cap.position_sec == 0.0
         cap.resume()
         # Let a few chunks produce, then check position advanced.
         deadline = time.monotonic() + 1.0
-        while q.qsize() < 3 and time.monotonic() < deadline:
+        while _navail(ring) < 3 and time.monotonic() < deadline:
             time.sleep(0.01)
         cap.pause()
         assert cap.position_sec > 0.0
@@ -141,12 +159,12 @@ def test_wav_capture_reports_duration_and_position(tmp_path):
 def test_wav_capture_reset_rewinds_to_start(tmp_path):
     wav = tmp_path / 'tone.wav'
     _make_wav(str(wav), sample_rate=44100, duration=1.0)
-    q: queue.Queue = queue.Queue(maxsize=500)
-    cap = WavFileCapture(q, str(wav))
+    ring = _ring()
+    cap = WavFileCapture(ring, str(wav))
     try:
         cap.resume()
         deadline = time.monotonic() + 1.0
-        while q.qsize() < 3 and time.monotonic() < deadline:
+        while _navail(ring) < 3 and time.monotonic() < deadline:
             time.sleep(0.01)
         assert cap.position_sec > 0.0
         cap.reset_position()
@@ -162,8 +180,7 @@ def test_wav_capture_reset_rewinds_to_start(tmp_path):
 def test_wav_capture_set_loop_toggles(tmp_path):
     wav = tmp_path / 'tone.wav'
     _make_wav(str(wav), sample_rate=44100, duration=0.05)
-    q: queue.Queue = queue.Queue(maxsize=500)
-    cap = WavFileCapture(q, str(wav), loop=True)
+    cap = WavFileCapture(_ring(), str(wav), loop=True)
     try:
         cap.set_loop(False)
         assert cap._loop is False
