@@ -16,7 +16,7 @@ off the realtime path, when the UI polls ``consume_drop_count`` /
 import sounddevice as sd
 
 from chirp.audio.ringbuffer import AudioRing
-from chirp.constants import CHUNK_FRAMES, DTYPE, SAMPLE_RATE
+from chirp.constants import CAPTURE_LATENCY, CHUNK_FRAMES, DTYPE, SAMPLE_RATE
 from chirp.error_log import log as _err_log
 
 
@@ -66,6 +66,11 @@ class AudioCapture:
                 samplerate=samplerate, channels=channels,
                 dtype=DTYPE, blocksize=CHUNK_FRAMES,
                 device=device,
+                # #43: request a generous input buffer so the OS/driver
+                # doesn't overrun it before our callback runs (the
+                # ``input_overflow`` / ``!`` badge). Decoupled from the
+                # downstream chunk size by the capture ring.
+                latency=CAPTURE_LATENCY,
                 callback=self._callback,
             )
         except Exception as exc:

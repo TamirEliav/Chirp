@@ -25,6 +25,14 @@ DTYPE               = 'float32'
 # overwriting unread audio. An overrun here would mean the consumer
 # stalled for this long — it should never happen in practice.
 RING_SECONDS        = 10.0
+# PortAudio input latency for the capture stream. ``'high'`` asks the
+# driver for its larger default input buffer, which is the standard cure
+# for ``input_overflow`` (the OS losing samples upstream of our callback,
+# surfaced as the ``os_drop`` / sidebar ``!`` badge) on machines whose
+# default low-latency buffer is too small. A float (seconds) can be used
+# for finer control. Display latency rises modestly in exchange for a
+# driver buffer generous enough that the OS never overruns it.
+CAPTURE_LATENCY     = 'high'
 
 # ── Display ────────────────────────────────────────────────────────────────────
 DISPLAY_SECONDS     = 10.0
@@ -176,6 +184,7 @@ QScrollArea {{ border: none; }}
 __all__ = [
     # Audio
     "SAMPLE_RATE", "CHANNELS", "CHUNK_FRAMES", "DTYPE", "RING_SECONDS",
+    "CAPTURE_LATENCY",
     # Display
     "DISPLAY_SECONDS", "SPECTROGRAM_NPERSEG", "COLORMAP",
     "ANIMATION_INTERVAL", "SPEC_DB_MIN", "SPEC_DB_MAX", "N_DISPLAY_ROWS",
