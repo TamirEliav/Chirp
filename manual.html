@@ -556,7 +556,8 @@ python chirp.py</code></pre>
   <h3 id="view-spectrogram">Spectrogram</h3>
   <p>
     The default mode. The upper plot shows a scrolling spectrogram rendered by a pyqtgraph
-    <code>ImageItem</code> (GPU colormap lookup) using the <em>inferno</em> colormap. The lower plot
+    <code>ImageItem</code> using the <em>inferno</em> colormap (colormap mapping on the CPU, blitted
+    through the OpenGL-composited viewport). The lower plot
     shows the amplitude envelope (absolute sample values) as a blue line. A dashed threshold line is
     drawn when
     recording is armed.
@@ -855,7 +856,7 @@ python chirp.py</code></pre>
     <li>Per-tile <strong>Height</strong> is adjustable, or click <strong>Fit to screen</strong> to
         size every tile so all streams are visible at once without scrolling (based on the current
         column count).</li>
-    <li>Rendering is GPU-accelerated (pyqtgraph/OpenGL): off-screen tiles are skipped and the frame
+    <li>Rendering uses pyqtgraph with an OpenGL-composited viewport: off-screen tiles are skipped and the frame
         rate adapts under load, so audio capture is never starved by the display.</li>
     <li>Click <strong>Config Mode</strong> to return to the single-stream editing view.</li>
   </ul>

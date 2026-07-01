@@ -4102,10 +4102,45 @@ class ChirpWindow(QMainWindow):
 # ──────────────────────────────────────────────────────────────────────────────
 # main
 # ──────────────────────────────────────────────────────────────────────────────
+def _log_opengl_status():
+    """Print whether OpenGL is enabled and which renderer the driver
+    provides, so the user can tell hardware GPU (e.g. 'NVIDIA ...') from a
+    software fallback ('GDI Generic', 'llvmpipe', or an ANGLE/Direct3D
+    string). Best-effort — never raises. Requires a live QApplication."""
+    try:
+        import pyqtgraph as pg
+        enabled = bool(pg.getConfigOption('useOpenGL'))
+    except Exception:
+        enabled = None
+    renderer = None
+    try:
+        from PyQt5.QtGui import QOffscreenSurface, QOpenGLContext
+        from OpenGL import GL
+        ctx = QOpenGLContext()
+        if ctx.create():
+            surf = QOffscreenSurface()
+            surf.create()
+            if ctx.makeCurrent(surf):
+                try:
+                    raw = GL.glGetString(GL.GL_RENDERER)
+                    renderer = raw.decode() if isinstance(raw, bytes) else str(raw)
+                finally:
+                    ctx.doneCurrent()
+    except Exception:
+        renderer = None
+    state = {True: 'enabled', False: 'disabled'}.get(enabled, 'unknown')
+    if renderer:
+        print(f'[Chirp] OpenGL: {state} | renderer: {renderer}')
+    else:
+        print(f'[Chirp] OpenGL: {state} | renderer: <unavailable — '
+              f'software raster likely>')
+
+
 def main():
     app = QApplication(sys.argv)
     app.setStyleSheet(QSS)
     win = ChirpWindow()
+    _log_opengl_status()
     win.showMaximized()
     sys.exit(app.exec_())
 

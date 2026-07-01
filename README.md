@@ -17,7 +17,7 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - Sidebar with live status indicators and mini-amplitude previews
 
 ### Real-Time Visualization
-- **GPU-accelerated rendering** via pyqtgraph/OpenGL (both Config and View modes) — the colormap is applied by a GPU lookup table and curves are auto-downsampled, so many streams render cheaply
+- **Efficient real-time rendering** via pyqtgraph with an OpenGL-composited viewport (both Config and View modes) — cheap per-frame image blits (no full-figure re-raster), auto-downsampled curves, off-screen tile culling, and an adaptive frame rate keep many streams cheap
 - **Spectrogram** display with configurable FFT size, window function, and frequency scale (Linear / Log / Mel)
 - **Amplitude envelope** with mouse-wheel Y-axis zoom and per-stream **linear / log (dB) Y scale** (right-click the plot to switch; defaults to log)
 - **Raw waveform** display showing signed audio samples (teal color)
@@ -113,7 +113,7 @@ A major re-architecture of the entire data path and rendering engine, focused on
 - **Lossless, realtime-safe capture** — the PortAudio callback no longer allocates, logs, or does any disk I/O; it does a single lock-free memcpy into a preallocated per-stream ring buffer. The old 200-chunk queue that silently dropped audio is gone. Logging moved entirely off the realtime and DSP threads onto a background writer thread — removing the in-callback disk write that was the root cause of cascading overflows.
 - **Vectorized trigger + GIL-releasing FFT** — the threshold state machine's per-sample Python loops were replaced with vectorized NumPy run-length logic (~3,400× realtime per stream, behavior-identical), and the spectrogram FFT now uses `scipy.fft` (pocketfft), which releases the GIL so per-stream DSP genuinely parallelizes across cores.
 - **Streaming WAV writes** — recordings are written incrementally to disk via `soundfile`/libsndfile instead of buffering the whole event in RAM, and remain byte-identical and atomically published (`.tmp` → fsync → rename).
-- **GPU visualization (pyqtgraph/OpenGL)** — both Config and View modes were ported off matplotlib to pyqtgraph with an OpenGL viewport: GPU colormap lookup, auto-downsampled curves, off-screen tile culling, and an **audio-priority adaptive frame rate** that drops render frequency under load so audio capture is never starved.
+- **pyqtgraph/OpenGL visualization** — both Config and View modes were ported off matplotlib to pyqtgraph with an OpenGL-composited viewport: cheap per-frame image blits (vs matplotlib's full-figure re-raster), auto-downsampled curves, off-screen tile culling, and an **audio-priority adaptive frame rate** that drops render frequency under load so audio capture is never starved. (Colormap mapping is done on the CPU; OpenGL handles the scene compositing.)
 - **View Mode "Fit to screen"** — size the monitoring grid tiles to fit the window for the current column count, in addition to the existing column and per-tile height controls.
 - **Software-render fallback** — a `use_opengl` toggle is persisted in the settings file for machines with problematic GPU drivers.
 
