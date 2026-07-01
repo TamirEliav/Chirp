@@ -33,6 +33,7 @@ import threading
 
 import numpy as np
 import scipy.io.wavfile
+import soundfile as sf
 
 from chirp.constants import SAMPLE_RATE
 from chirp.error_log import log as _err_log
@@ -89,6 +90,42 @@ def _sanitize_token(s: str) -> str:
     return cleaned
 
 
+def _compose_filename(prefix: str, suffix: str, onset, filename_stream: str) -> str:
+    """Compose the WAV filename from sanitized tokens (#51 / #23).
+
+    Layout: ``<prefix>_<epoch_ms>_<localts>_<stream>_<suffix>.wav`` with
+    blank tokens dropped (no stray ``__``). ``epoch_ms`` + the
+    ms-precision local timestamp come from ``onset``; the
+    ``filename_stream`` token disambiguates two streams that trigger on
+    the same physical event at the same millisecond. Shared by
+    ``write_wav_sync`` and ``StreamingWavWriter`` so the naming contract
+    can't drift between the two write paths.
+    """
+    epoch_ms = int(onset.timestamp() * 1000)
+    local_ts = onset.strftime('%Y%m%d_%H%M%S_%f')[:-3]
+    parts = [p for p in [_sanitize_token(prefix), str(epoch_ms), local_ts,
+                         _sanitize_token(filename_stream),
+                         _sanitize_token(suffix)] if p]
+    return '_'.join(parts) + '.wav'
+
+
+def _resolve_safe_path(output_dir: str, fname: str) -> str:
+    """Join ``fname`` onto ``output_dir`` and verify the result stays
+    inside it (#50 / #51). Rejects a blank/non-str ``output_dir`` and any
+    composed path that escapes the directory (sanitizer-bug belt)."""
+    if not isinstance(output_dir, str) or not output_dir.strip():
+        raise ValueError(f'output_dir must be a non-empty string, '
+                         f'got {output_dir!r}')
+    path = os.path.join(output_dir, fname)
+    real_out = os.path.realpath(output_dir)
+    real_path = os.path.realpath(path)
+    if os.path.commonpath([real_out, real_path]) != real_out:
+        raise ValueError(
+            f'refusing to write outside output_dir '
+            f'(target={real_path!r}, output_dir={real_out!r})')
+    return path
+
+
 def write_wav_sync(buf_snapshot: list, output_dir: str,
                    prefix: str = '', suffix: str = '',
                    sample_rate: int = SAMPLE_RATE,
@@ -132,30 +169,11 @@ def write_wav_sync(buf_snapshot: list, output_dir: str,
         onset = onset_time
     else:
         onset = datetime.datetime.now() - datetime.timedelta(seconds=audio_dur)
-    epoch_ms = int(onset.timestamp() * 1000)
-    local_ts = onset.strftime('%Y%m%d_%H%M%S_%f')[:-3]
-    # #51: every user-controlled token that lands in the filename MUST
-    # be sanitized — a ``filename_prefix`` of ``../../escape`` would
-    # otherwise let a WAV land outside ``output_dir``. The
-    # ``filename_stream`` token is now ALSO included in ``parts`` so
-    # two streams that trigger on the same physical event (same
-    # ms-precision timestamp) do not clobber each other's files.
-    prefix_s = _sanitize_token(prefix)
-    suffix_s = _sanitize_token(suffix)
-    stream_s = _sanitize_token(filename_stream)
-    parts = [p for p in [prefix_s, str(epoch_ms), local_ts,
-                         stream_s, suffix_s] if p]
-    fname = '_'.join(parts) + '.wav'
-    path  = os.path.join(output_dir, fname)
-    # #51 belt: verify the final path is still inside output_dir. A
-    # sanitizer bug or a future refactor must not allow ``os.path.join``
-    # to escape the directory.
-    real_out = os.path.realpath(output_dir)
-    real_path = os.path.realpath(path)
-    if os.path.commonpath([real_out, real_path]) != real_out:
-        raise ValueError(
-            f'write_wav_sync: refusing to write outside output_dir '
-            f'(target={real_path!r}, output_dir={real_out!r})')
+    # #51: every user-controlled token that lands in the filename is
+    # sanitized; the final path is verified to stay inside output_dir.
+    # Shared with StreamingWavWriter via the module helpers.
+    fname = _compose_filename(prefix, suffix, onset, filename_stream)
+    path  = _resolve_safe_path(output_dir, fname)
     # #52: write to a sibling tmp file then rename atomically. Keep the
     # tmp file on the SAME directory as the target so ``os.replace``
     # stays an in-filesystem atomic rename (cross-filesystem would
@@ -182,6 +200,108 @@ def write_wav_sync(buf_snapshot: list, output_dir: str,
                  f'recording contains clipped samples (peak={peak:.4f})',
                  wav_path=path)
     return path
+
+
+# ── Streaming WAV writer ───────────────────────────────────────────────────────
+
+class StreamingWavWriter:
+    """Incremental, atomic WAV writer backed by soundfile / libsndfile.
+
+    Replaces the buffer-the-whole-event-then-write model: the file is
+    opened at event onset and audio is appended as it is produced, so a
+    long event never holds its whole self in RAM. One instance per active
+    recording event, owned by the per-stream DSP thread — writes are
+    therefore naturally parallel and isolated across streams (a failure
+    on one stream's file cannot corrupt another's).
+
+    Atomicity is preserved from the previous design: data lands in
+    ``<path>.tmp`` and is published with fsync + ``os.replace`` only on
+    :meth:`close`. A crash mid-event leaves an orphan ``.tmp`` (cleanable)
+    and never a truncated canonical WAV. :meth:`abort` discards the tmp.
+
+    Frames are float32 in [-1, 1]; they are converted to 16-bit PCM with
+    the same ``* 32767`` scaling ``write_wav_sync`` uses, so a streamed
+    file is byte-identical to a whole-buffer write of the same audio.
+    """
+
+    def __init__(self, output_dir: str, *, prefix: str = '', suffix: str = '',
+                 sample_rate: int = SAMPLE_RATE, onset_time=None,
+                 channels: int = 1, filename_stream: str = ''):
+        if onset_time is None:
+            onset_time = datetime.datetime.now()
+        os.makedirs(output_dir, exist_ok=True)
+        fname = _compose_filename(prefix, suffix, onset_time, filename_stream)
+        self.path = _resolve_safe_path(output_dir, fname)
+        self._tmp = self.path + '.tmp'
+        self.sample_rate = int(sample_rate)
+        self.channels = int(channels)
+        self.filename_stream = filename_stream
+        self.frames_written = 0
+        self.peak = 0.0
+        self._closed = False
+        self._sf = sf.SoundFile(self._tmp, mode='w',
+                                samplerate=self.sample_rate,
+                                channels=self.channels,
+                                format='WAV', subtype='PCM_16')
+
+    @property
+    def saturated(self) -> bool:
+        return self.peak >= 0.99
+
+    def append(self, frames: np.ndarray) -> None:
+        """Append float32 frames (mono ``(n,)`` or ``(n, channels)``)."""
+        if self._closed or frames is None:
+            return
+        if frames.shape[0] == 0:
+            return
+        local_peak = float(np.abs(frames).max())
+        if local_peak > self.peak:
+            self.peak = local_peak
+        pcm16 = (frames * 32767.0).clip(-32768, 32767).astype(np.int16)
+        self._sf.write(pcm16)
+        self.frames_written += int(frames.shape[0])
+
+    def close(self) -> str:
+        """Finalize: fsync the tmp then atomically publish the canonical
+        path. Idempotent — returns the published path."""
+        if self._closed:
+            return self.path
+        self._closed = True
+        try:
+            self._sf.close()
+        except Exception:
+            pass
+        try:
+            fd = os.open(self._tmp, os.O_RDWR)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+        os.replace(self._tmp, self.path)
+        dur = self.frames_written / self.sample_rate if self.sample_rate else 0.0
+        ch_str = 'stereo' if self.channels == 2 else 'mono'
+        print(f'[REC] saved {self.path}  ({dur:.2f} s, {ch_str}, streamed)')
+        if self.saturated:
+            _err_log('saturation', self.filename_stream or 'global',
+                     f'recording contains clipped samples (peak={self.peak:.4f})',
+                     wav_path=self.path)
+        return self.path
+
+    def abort(self) -> None:
+        """Discard the in-progress file without publishing it."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._sf.close()
+        except Exception:
+            pass
+        try:
+            os.remove(self._tmp)
+        except OSError:
+            pass
 
 
 # ── Writer pool ──────────────────────────────────────────────────────────────
