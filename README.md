@@ -4,7 +4,7 @@
 
 Chirp is a desktop application for multi-stream audio monitoring, visualization, and threshold-triggered recording. It was designed with bioacoustics research in mind but works for any audio analysis task.
 
-![Version](https://img.shields.io/badge/Version-v2.2.1-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
+![Version](https://img.shields.io/badge/Version-v3.0.0-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5%20%2B%20pyqtgraph-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 ---
 
@@ -17,13 +17,14 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - Sidebar with live status indicators and mini-amplitude previews
 
 ### Real-Time Visualization
+- **GPU-accelerated rendering** via pyqtgraph/OpenGL (both Config and View modes) — the colormap is applied by a GPU lookup table and curves are auto-downsampled, so many streams render cheaply
 - **Spectrogram** display with configurable FFT size, window function, and frequency scale (Linear / Log / Mel)
-- **Amplitude envelope** with scrollable Y-axis zoom and per-stream **linear / log (dB) Y scale** (right-click the amp plot to switch; defaults to log)
+- **Amplitude envelope** with mouse-wheel Y-axis zoom and per-stream **linear / log (dB) Y scale** (right-click the plot to switch; defaults to log)
 - **Raw waveform** display showing signed audio samples (teal color)
 - Adjustable display buffer duration (5s – 60s)
 - Gain, dB floor, and dB ceiling controls for spectrogram contrast
 - Configurable frequency display range
-- Scroll-wheel zoom on waveform and spectrogram axes (centered on mouse position)
+- Mouse-wheel Y-zoom on the amplitude, waveform, and entropy plots
 
 ### Threshold-Triggered Recording
 - Automatic recording triggered when amplitude crosses a configurable threshold
@@ -52,16 +53,18 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - **Sticky `S` badge** in the sidebar latches on the first clip and stays lit until clicked — brief clips are never missed
 - In View Mode the per-tile `SAT` overlay surfaces the same state across the monitoring grid
 
-### Dropped-Callback Tracking
-- `D` badge in the sidebar flashes on each dropped audio callback (queue full)
+### Lossless Capture & Drop Tracking
+- Raw audio lands in a preallocated per-stream **ring buffer** straight from the realtime callback (a lock-free memcpy — no allocation, no disk I/O, no logging on the audio thread), so capture cannot be stalled by DSP or rendering
+- `D` badge in the sidebar flashes if the ring ever overruns (the DSP consumer fell seconds behind — should never happen in normal use)
 - Persistent `D` badge latches for the session; click to clear
 - In View Mode a per-tile `DROP×N` overlay shows the running session total
 
 ### Error Logging
 - Every pipeline failure surfaced by the sidebar `S` / `D` / `!` indicators is also written to a plain-text log file (`chirp_errors.log`) in the folder Chirp is launched from
 - Each line carries an ISO timestamp, the category, the stream name, and (where applicable) the WAV file path involved — so any indicator can be traced back to a precise event
-- Categories: `queue_full` (queue overflow), `os_drop` (PortAudio overflow), `ingest` (DSP-thread exceptions, with a short traceback), `open` (capture / WAV open failure), `wav_writer` (writer-pool failure, with target folder), `saturation` (one line per finished WAV that contained clipping, with the full path)
-- High-frequency categories (`queue_full`, `os_drop`) are throttled to one entry per stream per second; cumulative counts are stamped on each line
+- Categories: `ring_overrun` (capture ring overrun), `os_drop` (PortAudio overflow), `ingest` (DSP-thread exceptions, with a short traceback), `open` (capture / WAV open failure), `wav_writer` (writer-pool failure, with target folder), `saturation` (one line per finished WAV that contained clipping, with the full path)
+- All disk logging happens on a dedicated background thread — realtime and DSP threads only enqueue a record, so logging can never stall the audio pipeline
+- High-frequency categories (`ring_overrun`, `os_drop`) are throttled to one entry per stream per second; cumulative counts are stamped on each line
 - Saturation is logged **per file**, not per sample — one line per WAV that clipped — so the log stays compact even on noisy inputs
 - The log is append-only (survives across runs) and the logger never raises — it cannot crash the audio pipeline
 
@@ -82,7 +85,7 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 
 ### Two Display Modes
 - **Config Mode** — full control panel for adjusting all parameters
-- **View Mode** — distraction-free monitoring of all streams with adjustable grid columns and panel height
+- **View Mode** — distraction-free monitoring of all streams in a grid, with adjustable **columns**, per-tile **height**, and a **Fit to screen** button that sizes the tiles so every stream is visible without scrolling. Off-screen tiles are skipped while rendering, and the frame rate adapts under load so audio capture always takes priority.
 
 ### Theme
 - **Catppuccin Mocha** dark theme with teal and peach accent colors
@@ -102,6 +105,17 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - Swap the live capture for a WAV file (`WavFileCapture`) to feed a reproducible signal through the full pipeline — trigger, writer, spectrogram, entropy — for regression testing and offline analysis
 
 ---
+
+## What's New in v3.0.0
+
+A major re-architecture of the entire data path and rendering engine, focused on **zero dropped data** during multi-stream recording and on running the whole pipeline as cheaply as possible on common multi-core + GPU hardware. Verified by an automated soak test driving **8 concurrent streams** at real time with zero ring overruns, zero OS overflows, zero ingest errors, and gapless WAVs.
+
+- **Lossless, realtime-safe capture** — the PortAudio callback no longer allocates, logs, or does any disk I/O; it does a single lock-free memcpy into a preallocated per-stream ring buffer. The old 200-chunk queue that silently dropped audio is gone. Logging moved entirely off the realtime and DSP threads onto a background writer thread — removing the in-callback disk write that was the root cause of cascading overflows.
+- **Vectorized trigger + GIL-releasing FFT** — the threshold state machine's per-sample Python loops were replaced with vectorized NumPy run-length logic (~3,400× realtime per stream, behavior-identical), and the spectrogram FFT now uses `scipy.fft` (pocketfft), which releases the GIL so per-stream DSP genuinely parallelizes across cores.
+- **Streaming WAV writes** — recordings are written incrementally to disk via `soundfile`/libsndfile instead of buffering the whole event in RAM, and remain byte-identical and atomically published (`.tmp` → fsync → rename).
+- **GPU visualization (pyqtgraph/OpenGL)** — both Config and View modes were ported off matplotlib to pyqtgraph with an OpenGL viewport: GPU colormap lookup, auto-downsampled curves, off-screen tile culling, and an **audio-priority adaptive frame rate** that drops render frequency under load so audio capture is never starved.
+- **View Mode "Fit to screen"** — size the monitoring grid tiles to fit the window for the current column count, in addition to the existing column and per-tile height controls.
+- **Software-render fallback** — a `use_opengl` toggle is persisted in the settings file for machines with problematic GPU drivers.
 
 ## What's New in v2.2.1
 
@@ -162,9 +176,11 @@ pip install -r requirements.txt
 ### Dependencies
 - `sounddevice` — audio capture
 - `numpy` — numerical processing
-- `scipy` — signal processing and WAV output
-- `matplotlib` — spectrogram rendering
+- `scipy` — signal processing (`scipy.fft`, filtering)
+- `soundfile` — streaming WAV output (libsndfile)
 - `PyQt5` — GUI framework
+- `pyqtgraph` + `PyOpenGL` — GPU-accelerated real-time plotting
+- `matplotlib` — colormap source (and a small legacy helper layer)
 
 ---
 
