@@ -16,7 +16,6 @@ Post Phase 2/3 status:
 
 import datetime
 import os
-import queue
 import threading
 
 import numpy as np
@@ -24,9 +23,11 @@ import sounddevice as sd
 
 from chirp.audio import AudioCapture, WavFileCapture
 from chirp.audio.devices import find_device_by_name, host_api_name
+from chirp.audio.ringbuffer import AudioRing
 from chirp.error_log import log as _err_log
 from chirp.constants import (
     CHUNK_FRAMES,
+    RING_SECONDS,
     DEFAULT_FREQ_HI,
     DEFAULT_FREQ_LO,
     DEFAULT_HOLD,
@@ -80,8 +81,11 @@ class RecordingEntity:
         # sample-rate change, WAV switch) gets re-wired automatically.
         self._monitor = None
 
-        # Audio pipeline
-        self.queue      = queue.Queue(maxsize=200)
+        # Audio pipeline. ``_make_capture`` (re)creates ``self.ring``
+        # sized to the current sample rate + channel count, then wires a
+        # capture that writes into it. The DSP ingest thread is the ring's
+        # sole consumer.
+        self.ring       = None
         self.capture    = self._make_capture(channels=1)
         self.spec_acc   = SpectrogramAccumulator()
         self.spec_acc_r = SpectrogramAccumulator()
@@ -317,14 +321,9 @@ class RecordingEntity:
                 # will still kill it.
             else:
                 self._ingest_thread = None
-        # Drain queue stragglers. The ingest thread may have exited
-        # between a ``put_nowait`` on the capture side and the next
-        # ``get`` — in which case the last chunk sits untouched.
-        while not self.queue.empty():
-            try:
-                self.queue.get_nowait()
-            except queue.Empty:
-                break
+        # Discard ring stragglers the stopped ingest thread didn't consume
+        # so a later restart doesn't replay stale audio.
+        self.ring.drain_unread()
         self._flush_active_events(reason=reason)
 
     # ── #28 / #29: sticky session flags ───────────────────────────────────
@@ -477,12 +476,18 @@ class RecordingEntity:
         pipeline doesn't care whether samples come from a live device
         or a WAV file.
         """
+        # (Re)create the capture ring sized to the current sample rate and
+        # channel count. A fresh ring per capture rebuild guarantees no
+        # stale audio or mismatched channel width survives a device / SR /
+        # source switch.
+        cap_frames = max(CHUNK_FRAMES * 8, int(RING_SECONDS * self.sample_rate))
+        self.ring = AudioRing(cap_frames, channels=channels)
         if self.input_source == 'wav_file' and self.wav_file_path:
-            cap = WavFileCapture(self.queue, self.wav_file_path,
+            cap = WavFileCapture(self.ring, self.wav_file_path,
                                  channels=channels, loop=self.wav_loop,
                                  name=self.name)
         else:
-            cap = AudioCapture(self.queue, device=self.device_id,
+            cap = AudioCapture(self.ring, device=self.device_id,
                                channels=channels, samplerate=self.sample_rate,
                                name=self.name)
         # Re-wire the monitor on every new capture so a device / SR /
@@ -521,13 +526,9 @@ class RecordingEntity:
         # survives the swap.
         self._stop_ingest_and_flush(reason='change_device')
         self.capture.close()
-        # Queue was drained by the helper but keep this defensive
-        # drain in case a chunk hit the queue between pause and close.
-        while not self.queue.empty():
-            try:
-                self.queue.get_nowait()
-            except queue.Empty:
-                break
+        # Defensive: discard any frames the callback wrote into the ring
+        # between pause and close (the helper already drained it).
+        self.ring.drain_unread()
         self.device_id = device_id
         self.input_source = 'device'
         self.capture = self._make_capture(channels=channels)
@@ -558,11 +559,7 @@ class RecordingEntity:
         # #45: flush in-flight events before swapping the input source.
         self._stop_ingest_and_flush(reason='use_wav_file')
         self.capture.close()
-        while not self.queue.empty():
-            try:
-                self.queue.get_nowait()
-            except queue.Empty:
-                break
+        self.ring.drain_unread()
 
         self.input_source  = 'wav_file'
         self.wav_file_path = path
@@ -635,11 +632,7 @@ class RecordingEntity:
         # samples appended to an open event and render a garbled file.
         self._stop_ingest_and_flush(reason='change_sample_rate')
         self.capture.close()
-        while not self.queue.empty():
-            try:
-                self.queue.get_nowait()
-            except queue.Empty:
-                break
+        self.ring.drain_unread()
 
         self.sample_rate = new_rate
         self._n_cols        = max(1, int(self.display_seconds * new_rate / CHUNK_FRAMES))
@@ -759,37 +752,49 @@ class RecordingEntity:
                 self._analysis_acc_r.reset()
 
     def _ingest_loop(self):
-        """Background ingestion thread — drains the audio queue and
-        calls `ingest_chunk` continuously until stop is signaled.
+        """Background ingestion thread — drains the capture ring and
+        calls `ingest_chunk` per CHUNK_FRAMES slice until stop is signaled.
 
-        Moved off the Qt main thread in c21 (#19) so the GUI event
-        loop isn't blocked by DSP / FFT / trigger processing.
+        Moved off the Qt main thread in c21 (#19) so the GUI event loop
+        isn't blocked by DSP / FFT / trigger processing. Reads only whole
+        ``CHUNK_FRAMES`` blocks (leaving any partial tail for the next
+        wake) so the spectrogram / trigger pipeline keeps seeing exactly
+        chunk-sized input, as it did with the old queue.
         """
+        ring = self.ring
         while not self._ingest_stop.is_set():
-            try:
-                chunk = self.queue.get(timeout=0.05)
-            except queue.Empty:
+            avail = ring.available
+            if avail < CHUNK_FRAMES:
+                # Nothing whole to process yet — wait briefly, but wake
+                # immediately on stop.
+                if self._ingest_stop.wait(0.005):
+                    break
                 continue
-            try:
-                self.ingest_chunk(chunk)
-            except Exception as exc:
-                # #44: don't let a processing error crash the ingestion
-                # thread — bump counters so the sidebar can surface a
-                # sticky `!` badge, preserve the message for the
-                # tooltip, and log a traceback for post-mortem. The
-                # display will stall briefly but recover on the next
-                # chunk.
-                self.ingest_error_count       += 1
-                self.ingest_error_count_total += 1
-                self.has_ever_ingest_errored   = True
-                # Keep the message short — tooltips truncate and
-                # the full traceback is on stderr anyway.
-                self.last_ingest_error = f'{type(exc).__name__}: {exc}'[:200]
-                import traceback
-                traceback.print_exc()
-                _err_log('ingest', self.name,
-                         f'{type(exc).__name__}: {exc} | '
-                         f'{traceback.format_exc(limit=3)}')
+            n_whole = (avail // CHUNK_FRAMES) * CHUNK_FRAMES
+            _start, block = ring.read(n_whole)
+            for off in range(0, n_whole, CHUNK_FRAMES):
+                if self._ingest_stop.is_set():
+                    break
+                chunk = block[off:off + CHUNK_FRAMES]
+                try:
+                    self.ingest_chunk(chunk)
+                except Exception as exc:
+                    # #44: don't let a processing error crash the ingest
+                    # thread — bump counters so the sidebar can surface a
+                    # sticky `!` badge, preserve the message for the
+                    # tooltip, and log a traceback for post-mortem. The
+                    # display stalls briefly but recovers on the next chunk.
+                    self.ingest_error_count       += 1
+                    self.ingest_error_count_total += 1
+                    self.has_ever_ingest_errored   = True
+                    # Keep the message short — tooltips truncate and the
+                    # full traceback is on stderr anyway.
+                    self.last_ingest_error = f'{type(exc).__name__}: {exc}'[:200]
+                    import traceback
+                    traceback.print_exc()
+                    _err_log('ingest', self.name,
+                             f'{type(exc).__name__}: {exc} | '
+                             f'{traceback.format_exc(limit=3)}')
 
     def start_rec(self):
         if not self.acq_running:

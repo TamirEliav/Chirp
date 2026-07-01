@@ -18,13 +18,13 @@ def _entity():
 # ── #13 / c15: AudioCapture drop counter ───────────────────────────────────
 
 def test_capture_drop_counter_increments_and_consumes():
-    """Simulating queue-full drops should increment `drop_count`, and
+    """Simulating ring-overrun drops should increment `drop_count`, and
     `consume_drop_count` should return-and-reset atomically."""
-    import queue as _q
     from chirp.audio.capture import AudioCapture
-    q = _q.Queue(maxsize=1)
-    cap = AudioCapture(q, device=None)  # opens nothing in headless test
-    # Manually emulate three full-queue drops in the callback path.
+    from chirp.audio.ringbuffer import AudioRing
+    from chirp.constants import CHUNK_FRAMES
+    cap = AudioCapture(AudioRing(CHUNK_FRAMES, channels=1), device=None)  # opens nothing
+    # Manually emulate three overrun drops in the callback path.
     cap.drop_count = 3
     assert cap.consume_drop_count() == 3
     assert cap.drop_count == 0

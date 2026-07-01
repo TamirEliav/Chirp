@@ -21,10 +21,11 @@ sidebar's `!` error badge and the view-mode ``ERR`` overlay.
 
 from __future__ import annotations
 
-import queue as _q
-
 import numpy as np
 import pytest
+
+from chirp.audio.ringbuffer import AudioRing
+from chirp.constants import CHUNK_FRAMES
 
 
 # ── #44: ingest-loop error surfacing on RecordingEntity ──────────────
@@ -56,10 +57,9 @@ def test_entity_ingest_loop_latches_on_exception(monkeypatch):
         raise RuntimeError('synthetic DSP failure')
     monkeypatch.setattr(e, 'ingest_chunk', boom)
 
-    # Put a chunk on the queue then run one loop iteration.
-    e.queue.put_nowait(np.zeros(1024, dtype=np.float32))
-    # Drain one pass using the same timeout/except pattern as the loop.
-    chunk = e.queue.get(timeout=0.1)
+    # Run one ingest call directly (boom raises) using the same
+    # except pattern as the loop body.
+    chunk = np.zeros(CHUNK_FRAMES, dtype=np.float32)
     try:
         e.ingest_chunk(chunk)
     except Exception as exc:
@@ -130,7 +130,7 @@ class _FakeStatus:
 
 def test_capture_has_os_drop_fields_initial_zero():
     from chirp.audio.capture import AudioCapture
-    q = _q.Queue(maxsize=1)
+    q = AudioRing(CHUNK_FRAMES * 8, channels=1)
     cap = AudioCapture(q, device=None)
     assert cap.os_drop_count       == 0
     assert cap.os_drop_count_total == 0
@@ -142,7 +142,7 @@ def test_callback_latches_os_drop_on_input_overflow():
     """When PortAudio flags ``input_overflow`` the callback bumps the
     OS-level counters — independent of the queue.Full path."""
     from chirp.audio.capture import AudioCapture
-    q = _q.Queue(maxsize=10)  # plenty of room — not a queue.Full case
+    q = AudioRing(CHUNK_FRAMES * 8, channels=1)  # room for several writes — no overrun
     cap = AudioCapture(q, device=None)
     indata = np.zeros((1024, 1), dtype=np.float32)
 
@@ -162,7 +162,7 @@ def test_callback_ignores_status_without_overflow():
     """``input_overflow=False`` (or a status object without the
     attribute) must not spuriously bump OS-drop stats."""
     from chirp.audio.capture import AudioCapture
-    q = _q.Queue(maxsize=10)
+    q = AudioRing(CHUNK_FRAMES * 8, channels=1)
     cap = AudioCapture(q, device=None)
     indata = np.zeros((1024, 1), dtype=np.float32)
 
@@ -175,7 +175,7 @@ def test_callback_ignores_status_without_overflow():
 
 def test_consume_os_drop_count_clears_transient_only():
     from chirp.audio.capture import AudioCapture
-    q = _q.Queue(maxsize=10)
+    q = AudioRing(CHUNK_FRAMES * 8, channels=1)
     cap = AudioCapture(q, device=None)
     indata = np.zeros((1024, 1), dtype=np.float32)
     for _ in range(3):
@@ -190,7 +190,7 @@ def test_consume_os_drop_count_clears_transient_only():
 
 def test_reset_error_stats_clears_everything():
     from chirp.audio.capture import AudioCapture
-    q = _q.Queue(maxsize=10)
+    q = AudioRing(CHUNK_FRAMES * 8, channels=1)
     cap = AudioCapture(q, device=None)
     indata = np.zeros((1024, 1), dtype=np.float32)
     cap._callback(indata, 1024, None, _FakeStatus(input_overflow=True))
@@ -205,19 +205,19 @@ def test_reset_error_stats_clears_everything():
 
 
 def test_reset_error_stats_independent_of_reset_drop_stats():
-    """#29 (queue.Full drops) and #43 (OS overflow) are separate
+    """#29 (ring-overrun drops) and #43 (OS overflow) are separate
     failure modes wired to separate badges. Clearing one must not
     clobber the other."""
     from chirp.audio.capture import AudioCapture
-    q = _q.Queue(maxsize=1)
-    cap = AudioCapture(q, device=None)
-    # Fill the queue then synthesize a queue-full drop via the
-    # callback (mirrors the pattern in test_drop_flag.py).
-    q.put_nowait(np.zeros(1024, dtype=np.float32))
-    indata = np.zeros((1024, 1), dtype=np.float32)
-    cap._callback(indata, 1024, None, _FakeStatus(input_overflow=True))
+    # One-chunk ring, pre-filled so the next callback write overruns —
+    # synthesizes a drop. The same callback also flags input_overflow.
+    ring = AudioRing(CHUNK_FRAMES, channels=1)
+    cap = AudioCapture(ring, device=None)
+    ring.write(np.zeros(CHUNK_FRAMES, dtype=np.float32))  # ring now full
+    indata = np.zeros((CHUNK_FRAMES, 1), dtype=np.float32)
+    cap._callback(indata, CHUNK_FRAMES, None, _FakeStatus(input_overflow=True))
 
-    assert cap.has_ever_dropped    is True  # queue.Full path
+    assert cap.has_ever_dropped    is True  # ring-overrun path
     assert cap.has_ever_os_dropped is True  # input_overflow path
 
     cap.reset_error_stats()
@@ -241,7 +241,7 @@ def test_open_error_captured_when_inputstream_raises(monkeypatch):
             raise OSError('Error opening InputStream: no such device [PaError -9996]')
 
     monkeypatch.setattr(mod.sd, 'InputStream', _BadStream)
-    q = _q.Queue(maxsize=1)
+    q = AudioRing(CHUNK_FRAMES * 8, channels=1)
     cap = mod.AudioCapture(q, device=99)
 
     assert cap.valid is False
@@ -257,7 +257,7 @@ def test_wav_capture_mirrors_error_fields():
     sidebar's uniform polling path works regardless of capture type.
     All four new fields must exist with matching semantics."""
     from chirp.audio.wav_capture import WavFileCapture
-    q = _q.Queue(maxsize=1)
+    q = AudioRing(CHUNK_FRAMES * 8, channels=1)
     # Non-existent path — triggers the open_error path.
     cap = WavFileCapture(q, wav_path='__does_not_exist__.wav')
     assert cap.valid         is False

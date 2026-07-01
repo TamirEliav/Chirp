@@ -32,6 +32,7 @@ import scipy.io.wavfile
 
 from chirp.audio.capture import AudioCapture
 from chirp.audio.monitor import AudioMonitor, _RingBuffer
+from chirp.audio.ringbuffer import AudioRing
 from chirp.audio.wav_capture import WavFileCapture
 from chirp.constants import CHUNK_FRAMES
 from chirp.recording.entity import RecordingEntity
@@ -175,15 +176,15 @@ def test_audio_capture_forwards_to_monitor_via_set_monitor():
     m = AudioMonitor()
     m._stream = object()
     m.set_source('cap-a')
-    q: queue.Queue = queue.Queue(maxsize=10)
-    cap = AudioCapture(q, device=None, channels=1, samplerate=44100)
+    ring = AudioRing(CHUNK_FRAMES * 8, channels=1)
+    cap = AudioCapture(ring, device=None, channels=1, samplerate=44100)
     cap.set_monitor(m, 'cap-a')
     # Drive the callback manually with a synthetic indata matrix.
     frames = 1024
     indata = np.full((frames, 1), 0.25, dtype=np.float32)
     cap._callback(indata, frames, None, None)
-    # Queue receives a copy, monitor ring receives the samples.
-    assert q.qsize() == 1
+    # Capture ring receives the frames, monitor ring receives the samples.
+    assert ring.available == frames
     assert m._ring.size() == frames
 
 
@@ -191,8 +192,8 @@ def test_audio_capture_monitor_ignored_when_source_mismatch():
     m = AudioMonitor()
     m._stream = object()
     m.set_source('other')
-    q: queue.Queue = queue.Queue(maxsize=10)
-    cap = AudioCapture(q, device=None, channels=1, samplerate=44100)
+    ring = AudioRing(CHUNK_FRAMES * 8, channels=1)
+    cap = AudioCapture(ring, device=None, channels=1, samplerate=44100)
     cap.set_monitor(m, 'me')
     cap._callback(np.zeros((CHUNK_FRAMES, 1), dtype=np.float32),
                   CHUNK_FRAMES, None, None)
@@ -212,17 +213,17 @@ def test_wav_capture_forwards_to_monitor(tmp_path):
     m._stream = object()  # pretend stream is open
     m.set_source('wav-a')
 
-    q: queue.Queue = queue.Queue(maxsize=500)
-    cap = WavFileCapture(q, str(wav))
+    ring = AudioRing(int(44100 * 3), channels=1)
+    cap = WavFileCapture(ring, str(wav))
     cap.set_monitor(m, 'wav-a')
     try:
         cap.resume()
         # Let a few chunks play out.
         deadline = time.monotonic() + 1.0
-        while q.qsize() < 3 and time.monotonic() < deadline:
+        while ring.available < 3 * CHUNK_FRAMES and time.monotonic() < deadline:
             time.sleep(0.01)
         cap.pause()
-        assert q.qsize() >= 3
+        assert ring.available >= 3 * CHUNK_FRAMES
         assert m._ring.size() > 0
     finally:
         cap.close()

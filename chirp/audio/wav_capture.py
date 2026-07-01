@@ -1,24 +1,24 @@
-"""WavFileCapture — feed a WAV file through the same queue as AudioCapture.
+"""WavFileCapture — feed a WAV file through the same ring as AudioCapture.
 
-Used for reproducible testing and offline analysis (#<new issue>). Reads
-the chosen WAV into memory once, then emits ``CHUNK_FRAMES``-sized
-chunks onto the shared audio queue at real-time pace so the rest of the
-pipeline (FFT, entropy, trigger, writer) behaves exactly as it would
-with live input. Mirrors the ``AudioCapture`` contract — ``valid``,
-``drop_count``, ``consume_drop_count``, ``resume``, ``pause``, ``close``
-— so ``RecordingEntity`` can swap one for the other without any
-further plumbing.
+Used for reproducible testing and offline analysis. Reads the chosen WAV
+into memory once, then emits ``CHUNK_FRAMES``-sized chunks into the
+shared capture ring at real-time pace so the rest of the pipeline (FFT,
+entropy, trigger, writer) behaves exactly as it would with live input.
+Mirrors the ``AudioCapture`` contract — ``valid``, ``drop_count``,
+``consume_drop_count``, ``resume``, ``pause``, ``close`` — so
+``RecordingEntity`` can swap one for the other without any further
+plumbing.
 """
 
 from __future__ import annotations
 
-import queue
 import threading
 import time
 
 import numpy as np
 import scipy.io.wavfile
 
+from chirp.audio.ringbuffer import AudioRing
 from chirp.constants import CHUNK_FRAMES
 from chirp.error_log import log as _err_log
 
@@ -53,9 +53,9 @@ class WavFileCapture:
     session, it loops by default (pass ``loop=False`` for one-shot).
     """
 
-    def __init__(self, audio_queue: queue.Queue, wav_path: str,
+    def __init__(self, audio_ring: AudioRing, wav_path: str,
                  channels: int = 1, loop: bool = True, name: str = ''):
-        self._queue    = audio_queue
+        self._ring     = audio_ring
         self._channels = channels
         self._loop     = loop
         # Stream label included in error-log entries.
@@ -234,7 +234,7 @@ class WavFileCapture:
         return np.concatenate([head, pad]), total
 
     def _format_for_queue(self, chunk: np.ndarray) -> np.ndarray:
-        """Shape the chunk to match ``AudioCapture``'s queue contract."""
+        """Shape the chunk to match ``AudioCapture``'s ring contract."""
         if self._channels == 1:
             if chunk.ndim == 2:
                 return chunk[:, 0].astype(np.float32, copy=False)
@@ -285,15 +285,15 @@ class WavFileCapture:
                         mon.feed(self._monitor_source_id, emit)
                     except Exception:
                         pass
-                try:
-                    self._queue.put_nowait(emit.copy())
-                except queue.Full:
+                before = self._ring.overrun_count_total
+                self._ring.write(emit)
+                if self._ring.overrun_count_total > before:
                     self.drop_count += 1
                     self.drop_count_total += 1
                     self.has_ever_dropped = True
-                    _err_log('queue_full', self._name,
-                             f'audio queue full — chunk dropped '
-                             f'(cumulative={self.drop_count_total})',
+                    _err_log('ring_overrun', self._name,
+                             f'capture ring overrun — block overwrote unread '
+                             f'audio (cumulative={self.drop_count_total})',
                              wav_path=self.wav_path)
 
                 if not self._loop and next_pos >= total:

@@ -1,24 +1,29 @@
 """AudioCapture — sounddevice.InputStream wrapper.
 
-Extracted from the monolith in the Phase 1 refactor (plan: c05).
-Behavior unchanged: opens an InputStream on construction, routes the
-PortAudio callback into a thread-safe queue, and silently drops on
-`queue.Full`. The silent-drop behavior is flagged by #13; c15 will
-add a drop counter here and a visible badge in the sidebar.
+Redesign: the PortAudio callback now writes raw frames into a
+preallocated single-producer/single-consumer ring buffer
+(:class:`chirp.audio.ringbuffer.AudioRing`) instead of allocating a
+fresh numpy array per chunk and pushing it onto a ``queue.Queue``. The
+callback does only a memcpy into preallocated memory plus integer
+arithmetic — no allocation, no locks, no disk I/O — so it can never
+stall the realtime thread. Drop accounting maps to ring *overruns*
+(consumer fell behind by more than the ring's capacity), which with a
+multi-second ring should never happen in practice. Logging is emitted
+off the realtime path, when the UI polls ``consume_drop_count`` /
+``consume_os_drop_count``.
 """
-
-import queue
 
 import sounddevice as sd
 
+from chirp.audio.ringbuffer import AudioRing
 from chirp.constants import CHUNK_FRAMES, DTYPE, SAMPLE_RATE
 from chirp.error_log import log as _err_log
 
 
 class AudioCapture:
-    def __init__(self, audio_queue: queue.Queue, device=None, channels=1,
+    def __init__(self, audio_ring: AudioRing, device=None, channels=1,
                  samplerate=SAMPLE_RATE, name: str = ''):
-        self._queue    = audio_queue
+        self._ring     = audio_ring
         self._channels = channels
         self._stream   = None
         # Stream label included in error-log entries so the user can
@@ -80,11 +85,15 @@ class AudioCapture:
         return self._stream is not None
 
     def _callback(self, indata, frames, time_info, status):
-        # #43: inspect the PortAudio status flags. ``input_overflow``
-        # means the driver's input ring buffer wrapped before we
-        # serviced it — samples were lost upstream of our queue. This
-        # is a separate failure mode from our own queue.Full and must
-        # surface independently.
+        # Realtime-safety: this runs on the PortAudio thread and must not
+        # block. It does *only* counter increments and an array copy into
+        # the queue — no disk I/O and no logging. Drop / overflow events
+        # are turned into log lines off the realtime path, when the UI
+        # polls ``consume_drop_count`` / ``consume_os_drop_count``.
+        #
+        # #43: ``input_overflow`` means the driver's input ring buffer
+        # wrapped before we serviced it — samples were lost upstream of
+        # our queue. A separate failure mode from our own queue.Full.
         if status is not None:
             try:
                 overflow = bool(getattr(status, 'input_overflow', False))
@@ -94,11 +103,8 @@ class AudioCapture:
                 self.os_drop_count       += 1
                 self.os_drop_count_total += 1
                 self.has_ever_os_dropped  = True
-                _err_log('os_drop', self._name,
-                         f'PortAudio input_overflow '
-                         f'(cumulative={self.os_drop_count_total})')
         # Feed the monitor first — it's the lowest-latency path and
-        # doesn't care whether the DSP queue is full.
+        # doesn't care whether the DSP ring is full.
         mon = self._monitor
         if mon is not None:
             try:
@@ -109,18 +115,19 @@ class AudioCapture:
             except Exception:
                 # Monitor must never break acquisition.
                 pass
-        try:
-            if self._channels == 1:
-                self._queue.put_nowait(indata[:, 0].copy())
-            else:
-                self._queue.put_nowait(indata[:, :2].copy())
-        except queue.Full:
+        # Write into the ring (memcpy into preallocated memory — no
+        # allocation, no lock). An overrun (consumer fell more than the
+        # ring's capacity behind) overwrites the oldest unread frames;
+        # mirror that into the capture's drop stats for the sidebar.
+        before = self._ring.overrun_count_total
+        if self._channels == 1:
+            self._ring.write(indata[:, 0])
+        else:
+            self._ring.write(indata[:, :2])
+        if self._ring.overrun_count_total > before:
             self.drop_count += 1
             self.drop_count_total += 1
             self.has_ever_dropped = True
-            _err_log('queue_full', self._name,
-                     f'audio queue full — chunk dropped '
-                     f'(cumulative={self.drop_count_total})')
 
     def consume_drop_count(self) -> int:
         """Return the drop count and reset it to zero. Intended to be
@@ -130,9 +137,17 @@ class AudioCapture:
         Does NOT touch ``drop_count_total`` / ``has_ever_dropped`` —
         those are the sticky session stats, cleared only by
         ``reset_drop_stats()``.
+
+        Logging happens here (off the realtime callback) rather than in
+        ``_callback``: when this poll observes new drops it emits one
+        throttled log line so the realtime thread never touches disk.
         """
         n = self.drop_count
         self.drop_count = 0
+        if n:
+            _err_log('ring_overrun', self._name,
+                     f'capture ring overrun — {n} block(s) overwrote unread '
+                     f'audio (cumulative={self.drop_count_total})')
         return n
 
     def reset_drop_stats(self) -> None:
@@ -146,10 +161,15 @@ class AudioCapture:
     def consume_os_drop_count(self) -> int:
         """#43: return and clear the transient OS-level drop counter.
         Polled once per UI tick so the sidebar error badge can flash.
-        Does NOT touch the sticky session stats.
+        Does NOT touch the sticky session stats. Emits a throttled log
+        line here (off the realtime callback) when new overflows appear.
         """
         n = self.os_drop_count
         self.os_drop_count = 0
+        if n:
+            _err_log('os_drop', self._name,
+                     f'PortAudio input_overflow x{n} '
+                     f'(cumulative={self.os_drop_count_total})')
         return n
 
     def reset_error_stats(self) -> None:
