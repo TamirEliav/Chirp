@@ -48,6 +48,25 @@ def test_config_panel_renders_all_display_modes():
         e.close()
 
 
+def test_config_panel_images_render_without_levels_error():
+    """Regression: float ImageItems without a ``levels`` set raise
+    'levels argument is required for float input types' on every paint.
+    The events strip must be uint8 RGBA and the spectrogram must carry
+    levels. Force the render() path (what paint() calls) to assert."""
+    _app()
+    panel = ConfigPlotPanel(use_opengl=False)
+    e = RecordingEntity(name='cfg3', device_id=None)
+    try:
+        e.spectral_trigger_mode = 'Amp AND Spectral'  # adds entropy + keeps events
+        _feed(e)
+        panel.update_from_entity(e)
+        # These are the calls pyqtgraph makes inside paint().
+        panel._img.render()
+        panel._events_img.render()
+    finally:
+        e.close()
+
+
 def test_config_panel_threshold_signals():
     _app()
     panel = ConfigPlotPanel(use_opengl=False)

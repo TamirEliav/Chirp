@@ -135,6 +135,10 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
         def add_image(p):
             img = pg.ImageItem()
             img.setLookupTable(_INFERNO_LUT)
+            # Float images require levels at paint time; set a sane default
+            # (the entity's dB range) so a paint that lands before the first
+            # update_from_entity — or on an empty buffer — doesn't raise.
+            img.setLevels([min(e.db_floor, e.db_ceil - 0.1), e.db_ceil])
             p.addItem(img)
             return img
 
@@ -308,13 +312,15 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
             return None
         det = e.detect_mask_buffer[:need].reshape(nc, CHUNK_FRAMES).any(axis=1)
         rec = e.record_mask_buffer[:need].reshape(nc, CHUNK_FRAMES).any(axis=1)
-        rgba = np.zeros((2, nc, 4), dtype=np.float32)
-        # Background (surface0-ish) so empty cells aren't pure black.
-        rgba[..., 3] = 1.0
-        rgba[..., 0] = 0.19
-        rgba[..., 1] = 0.20
-        rgba[..., 2] = 0.27
+        # uint8 RGBA — direct colour, so pyqtgraph needs no levels (a float
+        # image without levels raises in ImageItem.render).
+        rgba = np.zeros((2, nc, 4), dtype=np.ubyte)
+        # Background (Catppuccin surface0) so empty cells aren't pure black.
+        rgba[..., 0] = 49
+        rgba[..., 1] = 50
+        rgba[..., 2] = 68
+        rgba[..., 3] = 255
         # Row 0 = detect (yellow), row 1 = record (green).
-        rgba[0, det] = (0.976, 0.886, 0.686, 1.0)
-        rgba[1, rec] = (0.651, 0.890, 0.631, 1.0)
+        rgba[0, det] = (249, 226, 175, 255)
+        rgba[1, rec] = (166, 227, 161, 255)
         return rgba
