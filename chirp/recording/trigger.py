@@ -59,6 +59,31 @@ class ThresholdRecorder:
         self._mono_anchor: float | None = None
         self._wall_anchor: datetime.datetime | None = None
 
+    # ── Vectorized run-length helper ──────────────────────────────────────
+
+    @staticmethod
+    def _consecutive_counts(flags: np.ndarray, carry: int) -> np.ndarray:
+        """Running count of consecutive ``True`` values ending at each
+        position, resetting to 0 on ``False``.
+
+        ``carry`` is added to the *leading* run only (positions before the
+        first ``False``), so this reproduces a sample-by-sample counter
+        that already stood at ``carry`` when this block began. Used to
+        vectorize the above-threshold streak and the silent-hold counter
+        that the state machine previously walked one sample at a time.
+        """
+        n = flags.shape[0]
+        if n == 0:
+            return np.empty(0, dtype=np.int64)
+        idx = np.arange(n)
+        # Index of the most recent reset (False) at or before each i, or
+        # -1 if no False has been seen yet on this block.
+        last_reset = np.maximum.accumulate(np.where(flags, -1, idx))
+        counts = idx - last_reset
+        if carry:
+            counts = counts + np.where(last_reset == -1, carry, 0)
+        return counts
+
     # ── Mask construction ────────────────────────────────────────────────
 
     @staticmethod
@@ -167,18 +192,19 @@ class ThresholdRecorder:
                                 trigger_mask=trigger_mask)
 
         # ── Pre-walk: detect event opening (sample-accurate) ─────────────
+        # Vectorized equivalent of a per-sample above-threshold streak
+        # counter carrying ``self._above_streak`` across chunk
+        # boundaries. ``trigger_pos`` is the first sample at which the
+        # streak reaches ``need`` (only when no event is currently open).
         has_open = any(not ev['ended'] for ev in self._active_events)
         need = max(1, min_cross_samps)
-        streak = self._above_streak
+        streak_counts = self._consecutive_counts(mask, self._above_streak)
+        self._above_streak = int(streak_counts[-1]) if n else self._above_streak
         trigger_pos: int | None = None
-        for i in range(n):
-            if mask[i]:
-                streak += 1
-                if (not has_open) and trigger_pos is None and streak >= need:
-                    trigger_pos = i
-            else:
-                streak = 0
-        self._above_streak = streak
+        if not has_open:
+            qual = np.nonzero(streak_counts >= need)[0]
+            if qual.size:
+                trigger_pos = int(qual[0])
 
         # ── Open new event if triggered ──────────────────────────────────
         just_created = None
@@ -211,25 +237,33 @@ class ThresholdRecorder:
                 walk_start = 0
 
             if not ev['ended']:
-                sil = ev['silent_samps']
+                # Vectorized hold walk over mask[walk_start:n]: a silent
+                # counter carrying ``ev['silent_samps']`` ends the event
+                # at the first sample where it reaches ``threshold_silent``;
+                # ``last_above_kept`` tracks the most recent above sample.
+                sil0 = ev['silent_samps']
                 chunk_kept_start = ev['samples_kept'] - n  # event-coord index of sample 0 of this chunk
-                local_last_above: int | None = None
-                end_i: int | None = None
-                for i in range(walk_start, n):
-                    if mask[i]:
-                        sil = 0
-                        local_last_above = i
+                sub = mask[walk_start:]
+                nb = sub.shape[0]
+                if nb:
+                    idxb = np.arange(nb)
+                    last_above_acc = np.maximum.accumulate(
+                        np.where(sub, idxb, -1))
+                    sil_run = self._consecutive_counts(~sub, sil0)
+                    ends = np.nonzero(sil_run >= threshold_silent)[0]
+                    if ends.size:
+                        end_b = int(ends[0])
+                        ev['silent_samps'] = int(sil_run[end_b])
+                        lt = int(last_above_acc[end_b])
+                        if lt != -1:
+                            ev['last_above_kept'] = chunk_kept_start + walk_start + lt
+                        ev['ended'] = True
+                        ev['target_kept'] = ev['last_above_kept'] + 1 + post_trig_samps
                     else:
-                        sil += 1
-                        if sil >= threshold_silent:
-                            end_i = i
-                            break
-                ev['silent_samps'] = sil
-                if local_last_above is not None:
-                    ev['last_above_kept'] = chunk_kept_start + local_last_above
-                if end_i is not None:
-                    ev['ended'] = True
-                    ev['target_kept'] = ev['last_above_kept'] + 1 + post_trig_samps
+                        ev['silent_samps'] = int(sil_run[-1])
+                        lt = int(last_above_acc[-1])
+                        if lt != -1:
+                            ev['last_above_kept'] = chunk_kept_start + walk_start + lt
 
             # Flush when the post-trigger tail is fully captured.
             if ev['ended'] and ev['samples_kept'] >= ev['target_kept']:
@@ -416,20 +450,33 @@ class ThresholdRecorder:
         # When the boundary lands exactly at chunk end (overshoot == 0)
         # we initialise to -1 — the next chunk's walk will set it
         # correctly the first time it sees an above sample.
+        # Vectorized leftover walk (carry-in silent counter = 0). Mirrors
+        # the per-event hold walk; ``last_above_kept`` is in the
+        # continuation's buffer coordinates (offset by cont_chunk_pos).
         sil = 0
         last_above_kept = samples_kept - 1 if samples_kept > 0 else -1
         ended = False
         target_kept: int | None = None
-        for i in range(cont_chunk_pos, n):
-            if mask[i]:
-                sil = 0
-                last_above_kept = i - cont_chunk_pos
+        sub = mask[cont_chunk_pos:]
+        nb = sub.shape[0]
+        if nb:
+            idxb = np.arange(nb)
+            last_above_acc = np.maximum.accumulate(np.where(sub, idxb, -1))
+            sil_run = self._consecutive_counts(~sub, 0)
+            ends = np.nonzero(sil_run >= threshold_silent)[0]
+            if ends.size:
+                end_b = int(ends[0])
+                lt = int(last_above_acc[end_b])
+                if lt != -1:
+                    last_above_kept = lt
+                ended = True
+                target_kept = last_above_kept + 1 + post_trig_samps
+                sil = int(sil_run[end_b])
             else:
-                sil += 1
-                if sil >= threshold_silent:
-                    ended = True
-                    target_kept = last_above_kept + 1 + post_trig_samps
-                    break
+                lt = int(last_above_acc[-1])
+                if lt != -1:
+                    last_above_kept = lt
+                sil = int(sil_run[-1])
 
         # Continuation's onset is parent's onset + parent's duration so
         # the timestamps reflect the actual capture time of the

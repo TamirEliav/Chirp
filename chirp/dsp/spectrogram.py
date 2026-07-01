@@ -22,6 +22,7 @@ use independent FFT sizes / windows.
 """
 
 import numpy as np
+import scipy.fft
 import scipy.signal
 
 from chirp.constants import SPECTROGRAM_NPERSEG
@@ -67,6 +68,9 @@ class SpectrogramAccumulator:
         window_data = combined[-self._n:]
         self._overlap = window_data.copy()
         self._live_samples += int(len(chunk))
-        fft_mag = np.abs(np.fft.rfft(window_data * self._window))
+        # scipy.fft (pocketfft) releases the GIL during the transform, so
+        # per-stream DSP threads run their FFTs genuinely in parallel
+        # across cores rather than serializing on the interpreter lock.
+        fft_mag = np.abs(scipy.fft.rfft(window_data * self._window))
         db_col  = (20.0 * np.log10(fft_mag + 1e-10)).astype(np.float32)
         return db_col, fft_mag
