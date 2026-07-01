@@ -794,12 +794,27 @@ class ChirpWindow(QMainWindow):
         h.addWidget(lbl_h)
         self._vm_height_spin = QSpinBox()
         self._vm_height_spin.setToolTip('Row height for each recording tile in View mode')
-        self._vm_height_spin.setRange(120, 700)
+        self._vm_height_spin.setRange(80, 700)
         self._vm_height_spin.setValue(self._vm_panel_height)
         self._vm_height_spin.setSuffix(' px')
         self._vm_height_spin.setFixedWidth(90)
         self._vm_height_spin.valueChanged.connect(self._on_vm_height_changed)
         h.addWidget(self._vm_height_spin)
+
+        h.addSpacing(10)
+
+        self._btn_vm_fit = QPushButton('Fit to screen')
+        self._btn_vm_fit.setToolTip(
+            'Set the tile height so every stream fits the window without '
+            'scrolling (uses the current column count)')
+        self._btn_vm_fit.setStyleSheet(
+            f'QPushButton {{ background-color: {C["surface0"]}; color: {C["blue"]}; '
+            f'border: 1px solid {C["blue"]}; border-radius: 5px; '
+            f'padding: 5px 12px; font-weight: bold; min-width: 0px; }}'
+            f'QPushButton:hover {{ background-color: {C["surface1"]}; }}'
+        )
+        self._btn_vm_fit.clicked.connect(self._on_vm_fit_to_screen)
+        h.addWidget(self._btn_vm_fit)
 
         return w
 
@@ -3598,6 +3613,30 @@ class ChirpWindow(QMainWindow):
         self._vm_panel_height = val
         if self._view_mode and self._pg_grid is not None:
             self._pg_grid.set_tile_height(val)
+
+    def _on_vm_fit_to_screen(self):
+        """Pick a tile height so all streams fit the viewport without
+        scrolling, given the current column count."""
+        if not self._view_mode or self._pg_grid is None:
+            return
+        n = len(self._entities)
+        if n == 0:
+            return
+        cols = max(1, min(self._vm_n_cols, n))
+        rows = math.ceil(n / cols)
+        # Viewport height minus the grid's top/bottom margins (4+4) and the
+        # inter-row spacing (4 px between rows) — matches MultiStreamGrid.
+        vp = self._canvas_scroll.viewport().height()
+        avail = vp - 8 - 4 * (rows - 1)
+        tile = int(avail / rows) if rows else vp
+        lo, hi = self._vm_height_spin.minimum(), self._vm_height_spin.maximum()
+        tile = max(lo, min(hi, tile))
+        if tile == self._vm_height_spin.value():
+            # Value unchanged (already clamped there) — apply directly since
+            # valueChanged won't fire.
+            self._pg_grid.set_tile_height(tile)
+        else:
+            self._vm_height_spin.setValue(tile)  # → _on_vm_height_changed
 
     def _update_plot_view_mode(self):
         """Update all entity displays in view mode (blitting)."""
