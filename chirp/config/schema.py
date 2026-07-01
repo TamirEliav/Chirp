@@ -30,7 +30,10 @@ from chirp.recording.entity import RecordingEntity
 
 
 CONFIG_SCHEMA_VERSION = 1
-DEFAULT_VIEW_MODE = {"columns": 1, "panel_height": 300}
+# ``use_opengl`` (Phase 4) toggles GPU-accelerated view-mode rendering.
+# Added as an optional view_mode key; older files simply omit it and get
+# the default, so no schema version bump is needed.
+DEFAULT_VIEW_MODE = {"columns": 1, "panel_height": 300, "use_opengl": True}
 
 
 # Set of top-level keys recognized by the loader. Anything else triggers
@@ -60,7 +63,7 @@ _KNOWN_RECORDING_KEYS: frozenset[str] = frozenset({
 })
 
 _KNOWN_VIEW_MODE_KEYS: frozenset[str] = frozenset({
-    "columns", "panel_height",
+    "columns", "panel_height", "use_opengl",
 })
 
 
@@ -109,6 +112,7 @@ def build_settings_dict(entities: Iterable[RecordingEntity],
         "view_mode": {
             "columns":      vm.get("columns", DEFAULT_VIEW_MODE["columns"]),
             "panel_height": vm.get("panel_height", DEFAULT_VIEW_MODE["panel_height"]),
+            "use_opengl":   bool(vm.get("use_opengl", DEFAULT_VIEW_MODE["use_opengl"])),
         },
         "recordings": [e.to_dict() for e in entities],
     }
@@ -144,6 +148,7 @@ def load_settings_dict(data: dict) -> tuple[list[RecordingEntity], dict, list[st
     view_mode = {
         "columns":      vm_raw.get("columns", DEFAULT_VIEW_MODE["columns"]),
         "panel_height": vm_raw.get("panel_height", DEFAULT_VIEW_MODE["panel_height"]),
+        "use_opengl":   bool(vm_raw.get("use_opengl", DEFAULT_VIEW_MODE["use_opengl"])),
     }
 
     entities: list[RecordingEntity] = []
