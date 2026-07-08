@@ -253,6 +253,12 @@ class RecordingSidebarItem(QWidget):
         elif self._drop_ttl > 0:
             self._drop_ttl -= 1
         active = self._drop_ttl > 0
+        # Only touch the stylesheet on an actual state change — a
+        # per-tick setStyleSheet forces a Qt style re-polish for every
+        # stream even when nothing is visible (H3 hygiene).
+        if active == getattr(self, '_drop_lit', None):
+            return
+        self._drop_lit = active
         color = C['peach'] if active else C['surface2']
         self._lbl_drop.setStyleSheet(
             f'color: {color}; font-weight: bold; font-size: 9pt;')

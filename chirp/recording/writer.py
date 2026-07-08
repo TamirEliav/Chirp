@@ -27,6 +27,7 @@ API:
 """
 
 import datetime
+import itertools
 import os
 import queue
 import threading
@@ -204,6 +205,14 @@ def write_wav_sync(buf_snapshot: list, output_dir: str,
 
 # ── Streaming WAV writer ───────────────────────────────────────────────────────
 
+# Uniquifier for streaming tmp files: two events on the same stream can
+# be open concurrently (post-trigger tail draining while a new burst
+# opens) and could compose identical target filenames down to the
+# millisecond — the tmp paths must never collide or the two writers
+# would corrupt each other's file.
+_tmp_counter = itertools.count(1)
+
+
 class StreamingWavWriter:
     """Incremental, atomic WAV writer backed by soundfile / libsndfile.
 
@@ -232,7 +241,7 @@ class StreamingWavWriter:
         os.makedirs(output_dir, exist_ok=True)
         fname = _compose_filename(prefix, suffix, onset_time, filename_stream)
         self.path = _resolve_safe_path(output_dir, fname)
-        self._tmp = self.path + '.tmp'
+        self._tmp = f'{self.path}.{next(_tmp_counter)}.tmp'
         self.sample_rate = int(sample_rate)
         self.channels = int(channels)
         self.filename_stream = filename_stream
@@ -247,6 +256,24 @@ class StreamingWavWriter:
     @property
     def saturated(self) -> bool:
         return self.peak >= 0.99
+
+    def retarget(self, output_dir: str, *, prefix: str = '', suffix: str = '',
+                 onset_time=None, filename_stream: str = '') -> None:
+        """Recompute the canonical publish path from fresh tokens.
+
+        Used by the streaming recorder at flush time: the final filename
+        may carry tokens unknown at open time (the ``partNN`` suffix of a
+        force-split event) and the day-subfolder output dir may have
+        rolled over mid-event. Only ``self.path`` changes — the tmp file
+        keeps accumulating where it is and :meth:`close` publishes to the
+        new target via the same fsync + ``os.replace``."""
+        if self._closed:
+            return
+        if onset_time is None:
+            onset_time = datetime.datetime.now()
+        os.makedirs(output_dir, exist_ok=True)
+        fname = _compose_filename(prefix, suffix, onset_time, filename_stream)
+        self.path = _resolve_safe_path(output_dir, fname)
 
     def append(self, frames: np.ndarray) -> None:
         """Append float32 frames (mono ``(n,)`` or ``(n, channels)``)."""
@@ -575,6 +602,23 @@ def queue_stats() -> tuple[int, int, int]:
     if p is None:
         return (0, 0, 0)
     return p.queue_stats()
+
+
+def note_stream_error(exc: BaseException, stream: str = '',
+                      out_dir: str | None = None) -> None:
+    """Record a streaming-write failure (StreamingWavWriter open/append
+    raised on the DSP thread) in the same error stats the pool workers
+    use, so the existing sidebar `!` badge and ``chirp_errors.log``
+    surface it without a parallel accounting path."""
+    p = _get_pool()
+    with p._lock:
+        p._err_count += 1
+        p._err_count_total += 1
+        p._has_ever_errored = True
+        p._last_error = f'{type(exc).__name__}: {exc}'[:200]
+    _err_log('wav_writer', stream or 'global',
+             f'streaming write failed: {type(exc).__name__}: {exc}',
+             wav_path=out_dir or None)
 
 
 def consume_error_count() -> int:

@@ -19,7 +19,6 @@ simply chooses a source and an output device, then hits the toggle.
 
 from __future__ import annotations
 
-import threading
 from typing import Any
 
 import numpy as np
@@ -35,24 +34,45 @@ _DEFAULT_RING_CHUNKS = 8
 
 
 class _RingBuffer:
-    """Thread-safe mono/stereo sample ring buffer.
+    """Lock-free mono/stereo sample ring buffer (SPSC + clear-floor).
 
     Writers push frames with :meth:`write`, the output callback pops
     frames with :meth:`read`. When a write would overflow, the oldest
     samples are discarded so the buffer always holds the most recent
     ``capacity`` frames — this keeps monitor latency bounded when the
     consumer stalls.
+
+    Realtime safety: the previous implementation took a
+    ``threading.Lock`` inside :meth:`write` — i.e. inside the PortAudio
+    *input* callback (via ``AudioMonitor.feed``) — and the same lock was
+    held by the UI thread in ``clear()``, a textbook priority inversion
+    that could block the capture callback and lose samples upstream.
+    This version uses the same monotonic-cursor SPSC scheme as
+    :class:`chirp.audio.ringbuffer.AudioRing`:
+
+    * the producer (input callback) only writes ``_write_total``;
+    * the consumer (output callback) only writes ``_read_total``,
+      clamps itself to the resident window, and re-validates after
+      copying so a producer lapping it mid-copy yields silence for one
+      block instead of torn audio;
+    * ``clear()`` (UI thread, on source switch) only writes
+      ``_clear_floor`` — a single int assignment, atomic under the GIL —
+      which both sides treat as an additional lower bound on the read
+      cursor. No thread ever blocks.
+
+    During a source switch two input callbacks can briefly interleave
+    writes; worst case is one glitched monitor block — audible only,
+    never touching the acquisition/recording path.
     """
 
     def __init__(self, capacity_frames: int, channels: int):
         self._cap = int(capacity_frames)
         self._channels = int(channels)
-        shape = (self._cap, self._channels) if self._channels > 1 else (self._cap,)
-        self._buf = np.zeros(shape, dtype=np.float32)
-        self._read = 0
-        self._write = 0
-        self._size = 0
-        self._lock = threading.Lock()
+        # Always 2-D storage; mono readers index column 0.
+        self._buf = np.zeros((self._cap, self._channels), dtype=np.float32)
+        self._write_total = 0
+        self._read_total = 0
+        self._clear_floor = 0
 
     @property
     def channels(self) -> int:
@@ -62,72 +82,106 @@ class _RingBuffer:
     def capacity(self) -> int:
         return self._cap
 
+    def _floor(self, write_total: int) -> int:
+        """Effective read start: consumer cursor, raised by the UI's
+        clear-floor and by eviction (resident window)."""
+        f = self._read_total
+        cf = self._clear_floor
+        if cf > f:
+            f = cf
+        rs = write_total - self._cap
+        if rs > f:
+            f = rs
+        return f
+
     def size(self) -> int:
-        with self._lock:
-            return self._size
+        wt = self._write_total
+        return max(0, wt - self._floor(wt))
 
     def clear(self) -> None:
-        with self._lock:
-            self._read = 0
-            self._write = 0
-            self._size = 0
+        # UI-thread flush on source switch: raise the floor past all
+        # currently-buffered samples. Single int store — no lock.
+        self._clear_floor = self._write_total
 
     def write(self, data: np.ndarray) -> int:
         """Append ``data`` (shape ``(N,)`` or ``(N, C)``). Returns the
-        number of samples actually kept after any drop-oldest trim."""
-        if data.ndim == 1 and self._channels > 1:
-            # Broadcast mono to all channels.
-            data = np.repeat(data[:, None], self._channels, axis=1)
-        elif data.ndim == 2 and self._channels == 1:
-            # Downmix to mono.
-            data = data.mean(axis=1)
-        elif data.ndim == 2 and data.shape[1] != self._channels:
-            # Channel-count mismatch — best effort: truncate or widen.
-            if data.shape[1] > self._channels:
-                data = data[:, :self._channels]
-            else:
-                pad = np.repeat(data[:, -1:], self._channels - data.shape[1], axis=1)
-                data = np.concatenate([data, pad], axis=1)
-
-        n = int(data.shape[0])
+        number of samples kept. Runs on the PortAudio input callback —
+        no locks; channel adaptation prefers views/broadcasts (the only
+        allocation is the small per-chunk downmix mean)."""
+        ch = self._channels
+        if data.ndim == 1:
+            # (n,) → (n,1) view; numpy broadcasts it across all ring
+            # channels at assignment time (no np.repeat allocation).
+            src = data.reshape(-1, 1)
+        elif data.shape[1] == ch:
+            src = data
+        elif ch == 1:
+            # Downmix to mono (small per-chunk allocation).
+            src = data.mean(axis=1).reshape(-1, 1)
+        elif data.shape[1] > ch:
+            src = data[:, :ch]          # truncate — a view
+        else:
+            src = data[:, :1]           # (n,1) broadcasts to wider rings
+        n = int(src.shape[0])
         if n == 0:
             return 0
-        if n >= self._cap:
-            # Only the most recent `cap` samples fit.
-            data = data[-self._cap:]
-            n = int(data.shape[0])
-        with self._lock:
-            overflow = (self._size + n) - self._cap
-            if overflow > 0:
-                self._read = (self._read + overflow) % self._cap
-                self._size -= overflow
-            end = self._write + n
-            if end <= self._cap:
-                self._buf[self._write:end] = data
-            else:
-                first = self._cap - self._write
-                self._buf[self._write:] = data[:first]
-                self._buf[:end - self._cap] = data[first:]
-            self._write = end % self._cap
-            self._size += n
-            return n
+        cap = self._cap
+        new_write = self._write_total + n
+        if n >= cap:
+            src = src[n - cap:]
+            place_start = new_write - cap
+            m = cap
+        else:
+            place_start = self._write_total
+            m = n
+        head = place_start % cap
+        end = head + m
+        if end <= cap:
+            self._buf[head:end] = src
+        else:
+            first = cap - head
+            self._buf[head:] = src[:first]
+            self._buf[:end - cap] = src[first:]
+        self._write_total = new_write
+        return n
 
     def read(self, n: int, out: np.ndarray) -> int:
-        """Copy up to ``n`` samples into ``out``; return the count."""
-        with self._lock:
-            take = min(self._size, int(n))
-            if take == 0:
+        """Copy up to ``n`` samples into ``out``; return the count.
+        Consumer-side (output callback). Clamps to the resident window
+        and re-validates after the copy, mirroring ``AudioRing.read``."""
+        cap = self._cap
+        for _ in range(3):
+            wt = self._write_total
+            start = self._floor(wt)
+            take = min(int(n), wt - start)
+            if take <= 0:
+                self._read_total = start
                 return 0
-            end = self._read + take
-            if end <= self._cap:
-                out[:take] = self._buf[self._read:end]
+            head = start % cap
+            end = head + take
+            if out.ndim == 1:
+                col = self._buf[:, 0]
+                if end <= cap:
+                    out[:take] = col[head:end]
+                else:
+                    first = cap - head
+                    out[:first] = col[head:]
+                    out[first:take] = col[:end - cap]
             else:
-                first = self._cap - self._read
-                out[:first] = self._buf[self._read:]
-                out[first:take] = self._buf[:end - self._cap]
-            self._read = end % self._cap
-            self._size -= take
-            return take
+                if end <= cap:
+                    out[:take] = self._buf[head:end]
+                else:
+                    first = cap - head
+                    out[:first] = self._buf[head:]
+                    out[first:take] = self._buf[:end - cap]
+            # Tear check: valid iff the producer didn't lap the copied
+            # region while we copied it.
+            if self._write_total - start <= cap:
+                self._read_total = start + take
+                return take
+            self._read_total = self._write_total - cap
+        self._read_total = self._write_total - cap
+        return 0
 
 
 class AudioMonitor:

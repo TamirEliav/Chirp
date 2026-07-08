@@ -89,7 +89,11 @@ class RecordingEntity:
         self.capture    = self._make_capture(channels=1)
         self.spec_acc   = SpectrogramAccumulator()
         self.spec_acc_r = SpectrogramAccumulator()
-        self.recorder   = ThresholdRecorder()
+        # H1: streaming mode — events append to a StreamingWavWriter as
+        # audio arrives instead of buffering up to max_rec in RAM.
+        # (Streaming steps aside automatically in tests that monkeypatch
+        # ThresholdRecorder._start_flush.)
+        self.recorder   = ThresholdRecorder(streaming=True)
         self.bpf        = BandpassFilter(sample_rate=self.sample_rate)
         self.bpf_r      = BandpassFilter(sample_rate=self.sample_rate)
 
@@ -215,6 +219,15 @@ class RecordingEntity:
         # (silent double-spawn was the original bug). Cleared by
         # ``clear_error_flag()``.
         self._ingest_join_failed = False
+        # M3: latched once when check_ingest_alive finds the ingest
+        # thread dead while acq_running claims otherwise.
+        self._ingest_dead_latched = False
+        # M5: wall-clock ↔ sample-counter anchor, stamped at start_acq
+        # (the ring is empty then, so "now" is the capture time of the
+        # next sample). Used to derive the capture-time wall clock of
+        # each ingested chunk for the recorder's onset timestamps.
+        self._wall_anchor_time: datetime.datetime | None = None
+        self._wall_anchor_samples = 0
 
         # Freq mapping
         self.freq_map_idx_floor = None
@@ -360,6 +373,7 @@ class RecordingEntity:
         # #53: also clear the stuck-ingest-thread latch so the user
         # can try acquisition again after restarting the device.
         self._ingest_join_failed      = False
+        self._ingest_dead_latched     = False
         cap = getattr(self, 'capture', None)
         if cap is not None and hasattr(cap, 'reset_error_stats'):
             cap.reset_error_stats()
@@ -370,6 +384,27 @@ class RecordingEntity:
         n = self.ingest_error_count
         self.ingest_error_count = 0
         return n
+
+    def check_ingest_alive(self) -> None:
+        """M3: latch a distinct error if acquisition claims to be
+        running but the ingest thread is dead (a BaseException escaped
+        the per-chunk guard in ``_ingest_loop``). Without this, the
+        capture ring silently overruns and the only symptom is a drop
+        badge with a misleading "reduce streams" tooltip. Polled from
+        the UI tick; latches once per death."""
+        t = self._ingest_thread
+        if (self.acq_running and t is not None and not t.is_alive()
+                and not self._ingest_stop.is_set()
+                and not getattr(self, '_ingest_dead_latched', False)):
+            self._ingest_dead_latched = True
+            self.has_ever_ingest_errored = True
+            self.ingest_error_count_total += 1
+            self.last_ingest_error = (
+                'ingest thread died — audio is NOT being processed; '
+                'stop and restart acquisition')
+            print(f'[Chirp] {self.name}: ingest thread died unexpectedly')
+            _err_log('ingest', self.name, 'ingest thread died unexpectedly '
+                     '(BaseException escaped the per-chunk guard)')
 
     # ── Freq mapping ──────────────────────────────────────────────────────
 
@@ -724,7 +759,13 @@ class RecordingEntity:
                 self._analysis_acc_r.reset()
             self.capture.resume()
             self.acq_running = True
+            # M5: anchor the capture wall clock to the sample counter.
+            # The ring was drained at the last stop, so the next sample
+            # ingested was captured essentially "now".
+            self._wall_anchor_time = datetime.datetime.now()
+            self._wall_anchor_samples = self._samples_total
             # Start ingestion thread (#19 / c21).
+            self._ingest_dead_latched = False
             self._ingest_stop.clear()
             t = threading.Thread(target=self._ingest_loop,
                                  name=f'chirp-ingest-{self.name}',
@@ -1056,6 +1097,15 @@ class RecordingEntity:
         # raw ``dph_folder_prefix``, susceptible to path-traversal.
         out_dir = self._effective_output_dir()
 
+        # M5: capture-time wall clock of this chunk's last sample,
+        # derived from the start_acq anchor + the sample counter (which
+        # was just advanced past this chunk). Immune to ingest backlog.
+        chunk_end_wall = None
+        if self._wall_anchor_time is not None:
+            chunk_end_wall = self._wall_anchor_time + datetime.timedelta(
+                seconds=(self._samples_total - self._wall_anchor_samples)
+                / self.sample_rate)
+
         report = self.recorder.process_chunk(
             record,
             trigger_peak  = trigger_peak,
@@ -1073,6 +1123,7 @@ class RecordingEntity:
             trigger_mask  = trigger_mask,
             filename_stream = self.name,
             global_chunk_end = self._samples_total,
+            chunk_end_wall = chunk_end_wall,
         )
 
         # #32: paint the record_mask indicator buffer from the

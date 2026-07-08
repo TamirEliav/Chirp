@@ -26,8 +26,10 @@ def test_stream_basic_mono(tmp_path):
     w = StreamingWavWriter(str(tmp_path), prefix='bird', sample_rate=44100,
                            onset_time=onset, channels=1,
                            filename_stream='Channel 1')
-    # Mid-write: only the .tmp exists.
-    assert os.path.exists(w.path + '.tmp')
+    # Mid-write: only the tmp file exists. (The tmp name carries a
+    # uniquifier so two concurrent events on one stream can never
+    # collide — assert via the writer's own handle.)
+    assert os.path.exists(w._tmp)
     assert not os.path.exists(w.path)
     rng = np.random.default_rng(1)
     blocks = [rng.uniform(-0.5, 0.5, 1000).astype(np.float32) for _ in range(5)]
@@ -102,7 +104,7 @@ def test_stream_abort_discards(tmp_path):
     onset = datetime.datetime(2024, 1, 1, 0, 0, 0)
     w = StreamingWavWriter(str(tmp_path), sample_rate=44100, onset_time=onset)
     w.append(np.zeros(256, dtype=np.float32))
-    tmp = w.path + '.tmp'
+    tmp = w._tmp
     assert os.path.exists(tmp)
     w.abort()
     assert not os.path.exists(tmp)

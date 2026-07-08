@@ -24,6 +24,13 @@ Design
   absorb consumer jitter. With a multi-second ring an overrun means the
   consumer stalled for seconds — it should never happen in practice, but
   it is counted and surfaced if it does (overwrite-oldest policy).
+* SPSC ownership is strict: the producer only ever writes
+  ``_write_total`` (plus its own overrun-stat fields); the consumer only
+  ever writes ``_read_total``. On overrun the producer does NOT advance
+  the read cursor — instead the consumer clamps its own cursor to the
+  resident window at read time and re-validates after copying, so a
+  producer that laps the consumer mid-copy results in a counted retry,
+  never a torn block silently handed to the DSP/recorder.
 """
 
 import numpy as np
@@ -49,6 +56,12 @@ class AudioRing:
         self.overrun_count_total = 0    # session-wide monotonic
         self.has_ever_overrun = False   # sticky latch
         self.dropped_frames_total = 0   # total frames lost to overrun
+        # Producer-owned high-water mark of the eviction frontier already
+        # accounted in ``dropped_frames_total``. Needed because the
+        # producer no longer advances ``_read_total`` on overrun (SPSC
+        # ownership), so successive overrunning writes must not re-count
+        # the same lost region.
+        self._overrun_high = 0
         self._empty = (np.zeros(0, dtype=dtype) if channels == 1
                        else np.zeros((0, channels), dtype=dtype))
 
@@ -71,8 +84,10 @@ class AudioRing:
 
     @property
     def available(self) -> int:
-        """Frames written but not yet consumed by :meth:`read`."""
-        return self._write_total - self._read_total
+        """Frames written, still resident, and not yet consumed by
+        :meth:`read`. Clamped to ``capacity`` — frames evicted by an
+        overrun are not readable and are not reported here."""
+        return max(0, min(self._write_total - self._read_total, self._cap))
 
     # ── Producer side (audio callback) ───────────────────────────────
     def write(self, data: np.ndarray) -> int:
@@ -90,14 +105,19 @@ class AudioRing:
         cap = self._cap
         new_write = self._write_total + n
 
-        # Overrun: if the new data would overwrite frames the consumer
-        # has not read, advance the read cursor past the lost region and
-        # account for it. The resident window is always the last ``cap``
-        # frames ending at ``new_write``.
+        # Overrun accounting (stats only). The producer never touches
+        # ``_read_total`` — the consumer clamps its own cursor to the
+        # resident window inside read()/read_range(). ``_overrun_high``
+        # (producer-owned) remembers the eviction frontier already
+        # counted so back-to-back overrunning writes don't re-count the
+        # same lost region.
         min_read = new_write - cap
-        if min_read > self._read_total:
-            lost = min_read - self._read_total
-            self._read_total = min_read
+        base = self._read_total
+        if self._overrun_high > base:
+            base = self._overrun_high
+        if min_read > base:
+            lost = min_read - base
+            self._overrun_high = min_read
             self.dropped_frames_total += int(lost)
             self.overrun_count += 1
             self.overrun_count_total += 1
@@ -133,24 +153,46 @@ class AudioRing:
         ``(m, channels)`` for multi-channel; ``start_abs`` is the
         absolute frame index of its first sample. When nothing is
         available, ``frames`` is empty.
+
+        Overrun handling is consumer-side: the cursor is clamped forward
+        to the resident window before copying, and the copy is validated
+        afterwards — if the producer lapped the copied region mid-copy
+        (it wrote more than ``capacity`` frames during our copy), the
+        torn block is discarded and the read retried from the fresh
+        resident window instead of being returned as valid audio.
         """
-        avail = self._write_total - self._read_total
-        if avail <= 0:
-            return self._read_total, self._empty
-        m = avail if max_frames is None else min(avail, int(max_frames))
-        start = self._read_total
         cap = self._cap
-        head = start % cap
-        end = head + m
-        if end <= cap:
-            out = self._buf[head:end].copy()
-        else:
-            first = cap - head
-            out = np.concatenate([self._buf[head:], self._buf[:end - cap]])
-        self._read_total = start + m
-        if self._channels == 1:
-            out = out[:, 0]
-        return start, out
+        for _ in range(3):
+            wt = self._write_total
+            start = self._read_total
+            resident_start = wt - cap
+            if start < resident_start:
+                # Consumer fell behind; skip the evicted region.
+                start = resident_start
+            avail = wt - start
+            if avail <= 0:
+                self._read_total = start
+                return start, self._empty
+            m = avail if max_frames is None else min(avail, int(max_frames))
+            head = start % cap
+            end = head + m
+            if end <= cap:
+                out = self._buf[head:end].copy()
+            else:
+                out = np.concatenate([self._buf[head:], self._buf[:end - cap]])
+            # Tear check: valid iff nothing in [start, start+m) was
+            # overwritten while we copied.
+            if self._write_total - start <= cap:
+                self._read_total = start + m
+                if self._channels == 1:
+                    out = out[:, 0]
+                return start, out
+            # Torn — jump to the fresh resident window and retry.
+            self._read_total = self._write_total - cap
+        # Producer is lapping us faster than we can copy (pathological).
+        # Give up this round; the caller polls again shortly.
+        self._read_total = self._write_total - cap
+        return self._read_total, self._empty
 
     def read_range(self, start_abs: int, end_abs: int) -> np.ndarray:
         """Return a copy of the absolute range ``[start_abs, end_abs)``,
@@ -158,23 +200,28 @@ class AudioRing:
         the read cursor — used to pull pre-trigger lookback at event
         onset. Returns empty if the range is fully evicted.
         """
-        resident_start = max(0, self._write_total - self._cap)
-        s = max(int(start_abs), resident_start)
-        e = min(int(end_abs), self._write_total)
-        if e <= s:
-            return self._empty
         cap = self._cap
-        head = s % cap
-        m = e - s
-        end = head + m
-        if end <= cap:
-            out = self._buf[head:end].copy()
-        else:
-            first = cap - head
-            out = np.concatenate([self._buf[head:], self._buf[:end - cap]])
-        if self._channels == 1:
-            out = out[:, 0]
-        return out
+        for _ in range(3):
+            wt = self._write_total
+            resident_start = max(0, wt - cap)
+            s = max(int(start_abs), resident_start)
+            e = min(int(end_abs), wt)
+            if e <= s:
+                return self._empty
+            head = s % cap
+            m = e - s
+            end = head + m
+            if end <= cap:
+                out = self._buf[head:end].copy()
+            else:
+                out = np.concatenate([self._buf[head:], self._buf[:end - cap]])
+            # Same tear check as read(): retry if the producer lapped
+            # the copied region while we copied it.
+            if self._write_total - cap <= s:
+                if self._channels == 1:
+                    out = out[:, 0]
+                return out
+        return self._empty
 
     def drain_unread(self) -> int:
         """Discard all currently-unread frames (advance the read cursor to

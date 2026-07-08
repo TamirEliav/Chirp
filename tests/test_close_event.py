@@ -70,6 +70,10 @@ def _make_window_with_entities(n: int):
         e.close    = _mk('close',    i)
         e.recorder = MagicMock()
         e.recorder.flush_all = _mk('flush_all', i)
+        # M6: closeEvent now routes the shutdown flush through the
+        # entity helper (so it lands in the ref_date day-subfolder)
+        # instead of calling recorder.flush_all directly.
+        e._flush_active_events = _mk('flush_all', i)
         entities.append(e)
     win._entities = entities
     return win, call_log
@@ -153,7 +157,7 @@ def test_close_event_flush_failure_does_not_skip(qapp):
 
     win, log = _make_window_with_entities(3)
     def _bad_flush(*a, **kw): raise RuntimeError('simulated flush failure')
-    win._entities[1].recorder.flush_all = _bad_flush
+    win._entities[1]._flush_active_events = _bad_flush
 
     with patch('chirp.ui.window.QMessageBox'), _patched_close():
         win.closeEvent(QCloseEvent())

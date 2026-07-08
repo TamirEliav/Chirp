@@ -4,7 +4,7 @@
 
 Chirp is a desktop application for multi-stream audio monitoring, visualization, and threshold-triggered recording. It was designed with bioacoustics research in mind but works for any audio analysis task.
 
-![Version](https://img.shields.io/badge/Version-v3.0.0-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5%20%2B%20pyqtgraph-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
+![Version](https://img.shields.io/badge/Version-v3.1.0-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5%20%2B%20pyqtgraph-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 ---
 
@@ -105,6 +105,19 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - Swap the live capture for a WAV file (`WavFileCapture`) to feed a reproducible signal through the full pipeline — trigger, writer, spectrogram, entropy — for regression testing and offline analysis
 
 ---
+
+## What's New in v3.1.0
+
+A reliability + efficiency release following a full audit of the v3.0.0 data path, focused on "multi-stream recording just works": no sample loss, no hangs, bounded memory.
+
+- **Streaming recording wired into the trigger** — events now append to their WAV incrementally as audio arrives (`StreamingWavWriter`), keeping only a bounded pending tail in RAM (≈ hold + post-trigger) instead of buffering up to `max_rec` seconds per event. Output is byte-identical to the previous buffered path (which remains as fallback), including force-split `partNN` files.
+- **Capture-ring hardening** — the SPSC ring no longer lets the producer touch the consumer's cursor on overrun; reads are re-validated after copying, so a pathological overrun becomes a counted drop instead of silently corrupted audio.
+- **Lock-free monitor loopback** — the audio-monitor ring buffer no longer takes a lock (or allocates) inside the PortAudio input callback, removing a priority-inversion path that could lose input samples while monitoring.
+- **Shutdown correctness** — the writer pool is shut down only after all entities close (a late flush could previously resurrect a worker pool that kept the process alive forever), and shutdown-time flushes land in the correct `ref_date` day-subfolder.
+- **Capture-time-anchored timestamps** — recording onset timestamps (and filenames) are derived from a wall-clock ↔ sample-counter anchor, so a backlogged DSP thread can no longer stamp recordings late.
+- **Audio-priority rendering in Config mode** — the same adaptive frame-skip View mode already had, plus per-pixel peak decimation *before* the dB conversion and data-upload skipping when no new audio arrived; per-tick render cost no longer scales with `display window × sample rate`.
+- **Error telemetry fixes** — OS-level input overflows now reach `chirp_errors.log`; a dead ingest thread is detected and reported distinctly instead of masquerading as generic drops.
+- **Spectrogram frequency axis fixed** — Config- and View-mode spectrograms now label the y-axis with actual frequencies (Mel/Log/Linear aware) instead of raw display-row indices.
 
 ## What's New in v3.0.0
 

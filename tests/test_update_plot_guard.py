@@ -59,6 +59,14 @@ def _make_window():
     win._update_plot_last_err = None
     win._update_plot_freeze_threshold = 5
 
+    # H3: config-mode adaptive frame-skip state (normally set in
+    # __init__) + the panel it drives.
+    win._cfg_render_ema = 0.0
+    win._cfg_skip = 0
+    win._cfg_skip_left = 0
+    win._mini_amp_rr = 0
+    win._config_panel = MagicMock()
+
     # Canvas / fig — the error-recovery path tries to draw().
     win._canvas = MagicMock()
     win._fig = MagicMock()

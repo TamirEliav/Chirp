@@ -165,6 +165,19 @@ class ChirpWindow(QMainWindow):
         self._view_render_ema = 0.0
         self._view_skip = 0
         self._view_skip_left = 0
+        # H3: the same audio-priority frame-skip for CONFIG mode. The
+        # config panel's per-tick cost scales with display_seconds ×
+        # sample_rate (full-buffer log10 + setData) and numpy holds the
+        # GIL — at high SR / long windows an unthrottled 20 Hz render
+        # starves the capture callbacks and ingest threads, which is
+        # exactly the input_overflow / ring-overrun failure mode.
+        self._cfg_render_ema = 0.0
+        self._cfg_skip = 0
+        self._cfg_skip_left = 0
+        # H3: sidebar mini-amp previews update round-robin (one entity
+        # per tick) — get_mini_amplitude is a full-buffer reduction and
+        # N streams × 20 Hz of it is pure GIL burn for a 30px preview.
+        self._mini_amp_rr = 0
 
         # #7: shared audio-monitor loopback. One output stream; each
         # RecordingEntity is wired into it in `_add_recording` and the
@@ -3795,6 +3808,20 @@ class ChirpWindow(QMainWindow):
                         self._sidebar.update_item_drops(idx, n_drops)
                     except Exception:
                         pass
+            # M2: drain the transient error counters. The sticky badge
+            # reads the has_ever_* flags, but the throttled log lines
+            # to chirp_errors.log are emitted inside these consume
+            # calls — before this poll, OS-level input overflows never
+            # reached the log at all.
+            try:
+                if hasattr(e.capture, 'consume_os_drop_count'):
+                    e.capture.consume_os_drop_count()
+                e.consume_ingest_error_count()
+                # M3: detect a dead ingest thread while acq claims to
+                # be running (BaseException escaped the chunk guard).
+                e.check_ingest_alive()
+            except Exception:
+                pass
             if hasattr(self, '_sidebar'):
                 # #28: sticky saturation flag.
                 try:
@@ -3817,6 +3844,14 @@ class ChirpWindow(QMainWindow):
                     self._update_error_sticky(idx, e)
                 except Exception:
                     pass
+
+        # M2: drain the writer pool's transient error counter once per
+        # tick (the sticky stats the badges read are unaffected).
+        try:
+            from chirp.recording import writer as _writer_mod
+            _writer_mod.consume_error_count()
+        except Exception:
+            pass
 
         # #58: top-level guard around the main display body. The
         # individual sidebar updates above are already try/except'd
@@ -3911,19 +3946,43 @@ class ChirpWindow(QMainWindow):
         # on every plot tick (50 ms) so "passed / total" stays live.
         self._update_wav_time_label()
 
-        # 3. Update main display for the selected entity via the
-        # pyqtgraph config panel (Phase 4b — replaces the matplotlib
-        # blit path; the panel rebuilds its layout automatically when
-        # display_mode / stereo / spectral / amp_scale change).
         e = self._sel
-        if e is not None:
-            self._config_panel.update_from_entity(e)
 
-        # 4. Update sidebar for ALL entities
+        # 3+4. Heavy render work (config panel + sidebar mini-amps),
+        # gated by the same adaptive audio-priority frame-skip used in
+        # view mode (H3): if recent renders cost more than ~half a tick,
+        # skip ticks so DSP / capture threads keep the GIL. Status dots
+        # and badges (cheap, change-detected) still update every tick.
         for i, ent in enumerate(self._entities):
             self._sidebar.update_item_status(i, ent.acq_running, ent.rec_enabled,
                                              ent.recorder.is_recording)
-            self._sidebar.update_item_amp(i, ent.get_mini_amplitude())
+        if self._cfg_skip_left > 0:
+            self._cfg_skip_left -= 1
+        else:
+            t0 = time.perf_counter()
+            # Main display for the selected entity via the pyqtgraph
+            # config panel (rebuilds its layout automatically when
+            # display_mode / stereo / spectral / amp_scale change).
+            if e is not None:
+                self._config_panel.update_from_entity(e)
+            # Sidebar mini-amp previews: one entity per tick
+            # (round-robin) — a full-buffer reduction per stream per
+            # tick is pure GIL burn for a 30px preview.
+            if self._entities:
+                i = self._mini_amp_rr % len(self._entities)
+                self._mini_amp_rr = (i + 1) % len(self._entities)
+                self._sidebar.update_item_amp(
+                    i, self._entities[i].get_mini_amplitude())
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            self._cfg_render_ema = (0.7 * self._cfg_render_ema + 0.3 * dt_ms
+                                    if self._cfg_render_ema else dt_ms)
+            target = ANIMATION_INTERVAL * 0.5  # keep render duty <= ~50%
+            if self._cfg_render_ema > target:
+                self._cfg_skip = min(
+                    3, int(math.ceil(self._cfg_render_ema / target)) - 1)
+            else:
+                self._cfg_skip = 0
+            self._cfg_skip_left = self._cfg_skip
 
         # 5. Update day count label if ref date active
         if e and e.ref_date is not None and self._chk_ref_date.isChecked():
@@ -3998,17 +4057,15 @@ class ChirpWindow(QMainWindow):
         # writing before the interpreter exits. Without this, daemon
         # threads from the old launcher would be killed mid-write and
         # the most recent WAV would be left truncated on disk.
+        # Routed through the entity helper so the flush lands in the
+        # same ref_date day-subfolder every other flush path uses
+        # (M6 — the old manual flush_all here passed the bare
+        # ``output_dir`` and stranded shutdown WAVs outside the day
+        # folder their siblings live in).
         from chirp.recording import writer as _writer
         for e in self._entities:
             try:
-                e.recorder.flush_all(
-                    output_dir=e.output_dir,
-                    filename_prefix=e.filename_prefix,
-                    filename_suffix=e.filename_suffix,
-                    sample_rate=e.sample_rate,
-                    filename_stream=e.name,
-                    reason='app shutdown',
-                )
+                e._flush_active_events(reason='app shutdown')
             except Exception as exc:
                 teardown_errors.append(f'flush_all({e.name}): {exc}')
                 print(f'[Chirp] flush_all failed for {e.name}: {exc}')
@@ -4050,11 +4107,6 @@ class ChirpWindow(QMainWindow):
                         msg.close()
                     except Exception:
                         pass
-        try:
-            _writer.shutdown(timeout=5.0)
-        except Exception as exc:
-            teardown_errors.append(f'writer.shutdown: {exc}')
-
         # #7: close the monitor loopback before closing entities — the
         # output stream's callback could otherwise read a buffer that
         # feeders are tearing down.
@@ -4069,6 +4121,16 @@ class ChirpWindow(QMainWindow):
             except Exception as exc:
                 teardown_errors.append(f'close({e.name}): {exc}')
                 print(f'[Chirp] close failed for {e.name}: {exc}')
+
+        # Writer shutdown must come AFTER every entity is closed: an
+        # ``e.close()`` can still flush a straggler event (e.g. when an
+        # earlier stop_acq raised) and a submit() after shutdown would
+        # lazily resurrect a fresh pool whose non-daemon workers park on
+        # queue.get() forever — the interpreter would never exit (H2).
+        try:
+            _writer.shutdown(timeout=30.0)
+        except Exception as exc:
+            teardown_errors.append(f'writer.shutdown: {exc}')
 
         # Flush + stop the async error logger so the tail of
         # chirp_errors.log isn't lost when the interpreter exits.

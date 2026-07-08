@@ -28,6 +28,7 @@ from PyQt5.QtWidgets import QMenu
 
 from chirp.constants import (AMP_DB_EPS, AMP_DB_MAX, AMP_DB_MIN, C,
                              CHUNK_FRAMES)
+from chirp.ui.pg_panel import spec_ytick_key, spec_ytick_list
 
 _INFERNO_LUT = (
     matplotlib.colormaps['inferno'](np.linspace(0.0, 1.0, 256))[:, :3] * 255
@@ -40,6 +41,41 @@ def _amp_to_display(buf, scale):
     if scale == 'log':
         return 20.0 * np.log10(np.maximum(np.abs(buf), AMP_DB_EPS))
     return buf
+
+
+# H3: target column counts for pre-setData peak decimation. Full display
+# buffers reach millions of samples (display_seconds × sample_rate); the
+# screen is a few thousand pixels wide. Reducing on our side — BEFORE
+# the dB conversion and setData — cuts the per-tick numpy work (which
+# holds the GIL, starving the audio threads) from O(buffer) to
+# O(buffer) once for the reduction and O(pixels) for everything after.
+_MAX_ENV_COLS = 4096    # envelope: max-decimated (values are >= 0)
+_MAX_WAVE_COLS = 2048   # waveform: min/max interleaved (2 pts per col)
+
+
+def _decimate_max(y: np.ndarray, max_cols: int) -> np.ndarray:
+    """Peak (max) decimation for non-negative envelope data."""
+    n = y.shape[0]
+    if n <= max_cols * 2:
+        return y
+    k = n // max_cols
+    m = n // k
+    return y[:m * k].reshape(m, k).max(axis=1)
+
+
+def _decimate_minmax(y: np.ndarray, max_cols: int) -> np.ndarray:
+    """Min/max-interleaved decimation for signed waveform data —
+    preserves the visual peak envelope in both directions."""
+    n = y.shape[0]
+    if n <= max_cols * 2:
+        return y
+    k = n // max_cols
+    m = n // k
+    z = y[:m * k].reshape(m, k)
+    out = np.empty(m * 2, dtype=y.dtype)
+    out[0::2] = z.min(axis=1)
+    out[1::2] = z.max(axis=1)
+    return out
 
 
 def _thr_to_display(thr, scale):
@@ -82,6 +118,15 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
         self._thr_line = None
         self._spec_thr_line = None
         self._cursors: list = []
+        # H3: per-tick work gates. ``_t_axes`` caches the time ramps
+        # (rebuilt only when the length/window changes);
+        # ``_last_data_stamp`` skips all data uploads when no new audio
+        # arrived and no display parameter moved — only the cursor is
+        # repositioned.
+        self._t_axes: dict = {}
+        self._last_data_stamp = None
+        self._spec_plots: list = []
+        self._ytick_key: tuple | None = None
 
     # ── Layout ────────────────────────────────────────────────────────
     @staticmethod
@@ -142,14 +187,17 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
             p.addItem(img)
             return img
 
+        self._spec_plots = []
         if show_spec:
             p = add_plot()
             p.setLabel('left', 'Freq')
             self._img = add_image(p)
+            self._spec_plots.append(p)
             if stereo:
                 p = add_plot()
                 p.setLabel('left', 'Freq R')
                 self._img_r = add_image(p)
+                self._spec_plots.append(p)
 
         if show_wave:
             p = add_plot(mouse_y=True)
@@ -207,6 +255,11 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
         ev_p.addItem(self._events_img)
 
         self._sig = self._signature(e)
+        # Fresh curves need a full data upload on the next tick — and
+        # fresh spectrogram axes need their frequency ticks re-applied.
+        self._t_axes.clear()
+        self._last_data_stamp = None
+        self._ytick_key = None
 
     # ── Amplitude-scale context menu (replaces the old right-click on
     #    the matplotlib amp axis) ────────────────────────────────────────
@@ -256,12 +309,45 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
             self._suppress_spec = False
 
     # ── Per-tick update ───────────────────────────────────────────────
+    def _t_axis(self, n: int, disp: float) -> np.ndarray:
+        key = (n, disp)
+        t = self._t_axes.get(key)
+        if t is None:
+            t = np.linspace(0.0, disp, n, dtype=np.float32)
+            # Bounded cache — decimated lengths are few, but a display
+            # window change could otherwise accumulate stale ramps.
+            if len(self._t_axes) > 8:
+                self._t_axes.clear()
+            self._t_axes[key] = t
+        return t
+
     def update_from_entity(self, e) -> None:
         self.rebuild_if_needed(e)
         disp = float(e.display_seconds)
         cursor_x = (e.write_head / e.sample_rate) % disp
         for cur in self._cursors:
             cur.setValue(cursor_x)
+
+        # H3: skip every data upload when no new audio has been ingested
+        # and no display parameter changed — the cursor above is the
+        # only thing moving. This makes an idle (acquisition-stopped)
+        # panel essentially free and de-duplicates ticks that land
+        # between chunks.
+        stamp = (id(e), e._samples_total, e.db_floor, e.db_ceil, e.gain_db,
+                 e.freq_scale, e.display_freq_lo, e.display_freq_hi,
+                 e.amp_ylim, bool(getattr(e, 'saturated', False)))
+        if stamp == self._last_data_stamp:
+            return
+        self._last_data_stamp = stamp
+
+        # Frequency y-tick labels for the spectrogram rows (mel/log/
+        # linear mapped) — recomputed only when the mapping changes.
+        key = spec_ytick_key(e)
+        if key != self._ytick_key and self._spec_plots:
+            self._ytick_key = key
+            ticks = [spec_ytick_list(e)]
+            for p in self._spec_plots:
+                p.getAxis('left').setTicks(ticks)
 
         clim_lo = min(e.db_floor, e.db_ceil - 0.1)
         if self._img is not None:
@@ -277,26 +363,32 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
             self._img_r.setRect(pg.QtCore.QRectF(0.0, 0.0, disp,
                                                  float(spec_r.shape[0])))
 
+        # H3: decimate to screen resolution BEFORE the dB conversion and
+        # setData — the full buffers are millions of samples at high
+        # SR × long windows and the numpy work holds the GIL.
         scale = getattr(e, 'amp_scale', 'log')
-        n = e.abs_amp_buffer.shape[0]
-        t = np.linspace(0.0, disp, n, dtype=np.float32)
         if self._wave is not None:
             color = C['red'] if getattr(e, 'saturated', False) else C['teal']
             self._wave.setPen(pg.mkPen(color, width=1))
-            self._wave.setData(t, e.amp_buffer)
+            w = _decimate_minmax(e.amp_buffer, _MAX_WAVE_COLS)
+            self._wave.setData(self._t_axis(w.shape[0], disp), w)
         if self._wave_r is not None:
-            self._wave_r.setData(t, e.amp_buffer_r)
+            w_r = _decimate_minmax(e.amp_buffer_r, _MAX_WAVE_COLS)
+            self._wave_r.setData(self._t_axis(w_r.shape[0], disp), w_r)
         if self._amp is not None:
             color = C['red'] if getattr(e, 'saturated', False) else C['blue']
             self._amp.setPen(pg.mkPen(color, width=1))
-            self._amp.setData(t, _amp_to_display(e.abs_amp_buffer, scale))
+            a = _amp_to_display(
+                _decimate_max(e.abs_amp_buffer, _MAX_ENV_COLS), scale)
+            self._amp.setData(self._t_axis(a.shape[0], disp), a)
         if self._amp_r is not None:
-            self._amp_r.setData(t, _amp_to_display(e.abs_amp_buffer_r, scale))
+            a_r = _amp_to_display(
+                _decimate_max(e.abs_amp_buffer_r, _MAX_ENV_COLS), scale)
+            self._amp_r.setData(self._t_axis(a_r.shape[0], disp), a_r)
 
         if self._entropy is not None:
             nc = e._n_cols
-            tcol = np.linspace(0.0, disp, nc, dtype=np.float32)
-            self._entropy.setData(tcol, e.entropy_buffer)
+            self._entropy.setData(self._t_axis(nc, disp), e.entropy_buffer)
 
         if self._events_img is not None:
             rgba = self._events_rgba(e)

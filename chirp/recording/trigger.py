@@ -47,7 +47,7 @@ class ThresholdRecorder:
     event is still draining its post-trigger tail, and the two are saved as separate WAVs.
     """
 
-    def __init__(self):
+    def __init__(self, streaming: bool = False):
         self._was_enabled     = False
         self._pre_trig_deque  = collections.deque(maxlen=1)
         self._pre_trig_maxlen = 1
@@ -58,6 +58,26 @@ class ThresholdRecorder:
         # by adding a monotonic delta — immune to NTP/DST jumps.
         self._mono_anchor: float | None = None
         self._wall_anchor: datetime.datetime | None = None
+        # Streaming mode (H1): when True, events append their committed
+        # samples incrementally to a StreamingWavWriter as they arrive,
+        # keeping only a bounded pending tail in RAM (≤ hold + post_trig
+        # + one chunk) instead of buffering up to ``max_rec`` seconds.
+        # Default False so the buffered path — and every test that
+        # monkeypatches ``_start_flush`` to capture full buffers —
+        # behaves exactly as before. RecordingEntity opts in.
+        self._streaming = bool(streaming)
+
+    def _streaming_active(self) -> bool:
+        """True when this recorder should stream events to disk.
+
+        Streaming is bypassed whenever ``_start_flush`` has been
+        replaced on the class (the standard test seam): those tests
+        assert on the full in-memory buffer handed to their capture
+        stub, which only exists on the buffered path.
+        """
+        if not self._streaming:
+            return False
+        return type(self).__dict__.get('_start_flush') is _ORIG_START_FLUSH
 
     # ── Vectorized run-length helper ──────────────────────────────────────
 
@@ -114,7 +134,8 @@ class ThresholdRecorder:
                       should_trigger: bool | None = None,
                       trigger_mask: np.ndarray | None = None,
                       filename_stream: str = '',
-                      global_chunk_end: int | None = None) -> dict:
+                      global_chunk_end: int | None = None,
+                      chunk_end_wall: datetime.datetime | None = None) -> dict:
         """Drive the state machine with one audio chunk.
 
         See module docstring for the mask-input model.
@@ -136,6 +157,12 @@ class ThresholdRecorder:
         n = len(chunk)
         flushed_spans: list[tuple[int, int]] = []
         active_spans: list[tuple[int, int]]  = []
+        # M5: capture-time wall clock of this chunk's last sample,
+        # supplied by the entity from its sample-clock anchor. When
+        # present, event onsets are derived from it instead of "now" —
+        # a backlogged ingest thread no longer shifts every filename
+        # timestamp late by the backlog.
+        self._chunk_end_wall = chunk_end_wall
 
         # ── Resize pre-trigger rolling buffer (in chunks) ─────────────────
         # Holds enough history to cover (pre_trig + min_cross) of lookback.
@@ -317,6 +344,15 @@ class ThresholdRecorder:
         for ev in to_add:
             self._active_events.append(ev)
 
+        # H1: stream each open event's newly-committed region to disk so
+        # RAM holds only the pending tail (samples that may yet be
+        # trimmed by the hold walk or handed to a continuation).
+        for ev in self._active_events:
+            if ev.get('stream'):
+                wm = self._stream_watermark(ev, post_trig_samps, max_samps)
+                self._stream_commit(ev, wm, output_dir, filename_prefix,
+                                    filename_suffix, filename_stream)
+
         # ── Build span report for still-open events ──────────────────────
         if global_chunk_end is not None:
             for ev in self._active_events:
@@ -373,13 +409,22 @@ class ThresholdRecorder:
         # in the current chunk (which is buf_init[-1]).
         last_above_kept = samples_kept - n + trigger_pos
 
-        # Onset = monotonic anchor + (wall - mono delta) - duration of
-        # the kept audio so far (so the timestamp points at the start
-        # of the saved WAV, not at the trigger sample).
-        mono_delta = time.monotonic() - self._mono_anchor
-        onset = (self._wall_anchor
-                 + datetime.timedelta(seconds=mono_delta)
-                 - datetime.timedelta(seconds=samples_kept / sample_rate))
+        # Onset = wall time of the current chunk's END minus the
+        # duration of the kept audio (so the timestamp points at the
+        # start of the saved WAV, not at the trigger sample).
+        #
+        # M5: prefer the entity-supplied capture-time clock — it is
+        # anchored to the sample counter at acquisition start, so an
+        # ingest backlog cannot shift onsets late. Fall back to the
+        # monotonic-anchor "now" for legacy callers that don't pass
+        # ``chunk_end_wall``.
+        chunk_end = getattr(self, '_chunk_end_wall', None)
+        if chunk_end is None:
+            mono_delta = time.monotonic() - self._mono_anchor
+            chunk_end = self._wall_anchor + datetime.timedelta(
+                seconds=mono_delta)
+        onset = chunk_end - datetime.timedelta(
+            seconds=samples_kept / sample_rate)
 
         # #32: absolute start of the event in global-sample coordinates.
         # Kept alongside `samples_kept` so span reporting stays correct
@@ -407,6 +452,13 @@ class ThresholdRecorder:
             # for the case where the per-entity flush on SR change
             # (#45 / PR 2) somehow misses an event.
             'sample_rate':     sample_rate,
+            # H1 streaming state. The decision is pinned at open time so
+            # a mid-event monkeypatch or flag flip can't strand an event
+            # halfway between the two storage models.
+            'stream':          self._streaming_active(),
+            'writer':          None,   # StreamingWavWriter, lazy
+            'written':         0,      # kept-coord samples already on disk
+            'stream_failed':   False,
         }
 
     def _open_continuation(self, parent_ev: dict, chunk: np.ndarray,
@@ -510,7 +562,125 @@ class ThresholdRecorder:
             'global_start':    global_start,
             'sample_rate':     parent_sr,
             'split_index':     (parent_ev.get('split_index') or 1) + 1,
+            # H1: continuations inherit the parent's storage model.
+            'stream':          bool(parent_ev.get('stream')),
+            'writer':          None,
+            'written':         0,
+            'stream_failed':   False,
         }
+
+    # ── H1: streaming storage helpers ────────────────────────────────────
+
+    @staticmethod
+    def _stream_watermark(ev: dict, post_trig_samps: int,
+                          max_samps: int) -> int:
+        """Kept-coord index up to which samples are *guaranteed* to be in
+        this event's WAV, whatever happens next.
+
+        Samples past ``last_above + 1 + post_trig`` may still be trimmed
+        (event ends on hold), samples past ``max_samps`` belong to the
+        force-split continuation, and samples that haven't arrived yet
+        obviously can't be written — the watermark is the min of all
+        three. Monotonic: ``last_above_kept`` only grows and the other
+        two bounds are fixed per chunk."""
+        if ev['ended'] and ev['target_kept'] is not None:
+            t = ev['target_kept']
+        else:
+            t = ev['last_above_kept'] + 1 + post_trig_samps
+        return max(0, min(t, max_samps, ev['samples_kept']))
+
+    def _stream_commit(self, ev: dict, upto: int, output_dir: str,
+                       filename_prefix: str, filename_suffix: str,
+                       filename_stream: str) -> None:
+        """Append kept-coord samples ``[written, upto)`` to the event's
+        StreamingWavWriter (created lazily) and prune them from the
+        pending buffer. Any I/O failure aborts streaming for this event
+        and is surfaced through the writer-pool error stats — it must
+        never propagate into the trigger walk."""
+        if not ev.get('stream') or ev.get('stream_failed'):
+            return
+        need = upto - ev['written']
+        if need <= 0:
+            return
+        buf = ev['buf']
+        try:
+            if ev['writer'] is None:
+                if not buf:
+                    return
+                channels = 2 if buf[0].ndim == 2 else 1
+                ev['writer'] = _writer.StreamingWavWriter(
+                    output_dir,
+                    prefix=filename_prefix, suffix=filename_suffix,
+                    sample_rate=ev.get('sample_rate', SAMPLE_RATE),
+                    onset_time=ev['onset_time'], channels=channels,
+                    filename_stream=filename_stream)
+            w = ev['writer']
+            skip = ev['start_offset']
+            while need > 0 and buf:
+                c = buf[0]
+                avail = len(c) - skip
+                take = min(avail, need)
+                w.append(c[skip:skip + take])
+                ev['written'] += take
+                need -= take
+                if take == avail:
+                    buf.pop(0)
+                    skip = 0
+                else:
+                    skip += take
+            ev['start_offset'] = skip
+        except Exception as exc:
+            ev['stream_failed'] = True
+            wtr = ev.get('writer')
+            ev['writer'] = None
+            if wtr is not None:
+                try:
+                    wtr.abort()
+                except Exception:
+                    pass
+            _writer.note_stream_error(exc, stream=filename_stream,
+                                      out_dir=output_dir)
+
+    def _stream_finalize(self, ev: dict, output_dir: str,
+                         filename_prefix: str, eff_suffix: str,
+                         filename_stream: str) -> bool:
+        """Flush a streamed event: append the remaining committed range,
+        retarget the final filename (it may have grown a ``partNN``
+        token), and publish. Returns True when the event was handled on
+        the streaming path (i.e. the buffered fallback must not run)."""
+        if not ev.get('stream'):
+            return False
+        if ev.get('stream_failed'):
+            # Earlier samples are gone with the aborted tmp — a partial
+            # buffered flush would produce a WAV that silently starts
+            # mid-event, worse than no file. The failure was already
+            # counted + logged at abort time.
+            return True
+        target = (ev['target_kept'] if ev['target_kept'] is not None
+                  else ev['samples_kept'])
+        self._stream_commit(ev, target, output_dir, filename_prefix,
+                            eff_suffix, filename_stream)
+        if ev.get('stream_failed'):
+            return True
+        w = ev.get('writer')
+        if w is None:
+            # Zero-length event (nothing ever committed) — nothing to
+            # publish.
+            return True
+        try:
+            w.retarget(output_dir, prefix=filename_prefix,
+                       suffix=eff_suffix, onset_time=ev['onset_time'],
+                       filename_stream=filename_stream)
+            w.close()
+        except Exception as exc:
+            try:
+                w.abort()
+            except Exception:
+                pass
+            _writer.note_stream_error(exc, stream=filename_stream,
+                                      out_dir=output_dir)
+        ev['writer'] = None
+        return True
 
     @staticmethod
     def _span_for_flush(ev: dict) -> tuple[int, int]:
@@ -555,13 +725,6 @@ class ThresholdRecorder:
     def _flush_event(self, ev: dict, output_dir: str,
                      filename_prefix: str, filename_suffix: str,
                      sample_rate: int, filename_stream: str) -> None:
-        trimmed = self._trim_event(ev)
-        # #46: prefer the SR pinned at event-open time. The caller's
-        # ``sample_rate`` is the *current* session rate — if the user
-        # changed it mid-event the WAV header must still reflect the
-        # rate at which the samples were captured, otherwise the file
-        # plays back at the wrong speed.
-        ev_sr = ev.get('sample_rate', sample_rate)
         # #57: tag halves of a force-split event with a ``partNN`` token
         # in the filename so the researcher sees they belong to one
         # contiguous capture. The token is injected into the suffix so
@@ -575,6 +738,18 @@ class ThresholdRecorder:
             part_tok = f'part{si:02d}'
             eff_suffix = (f'{filename_suffix}_{part_tok}'
                           if filename_suffix else part_tok)
+        # H1: streamed events publish their incrementally-written file;
+        # buffered events go through the writer pool as before.
+        if self._stream_finalize(ev, output_dir, filename_prefix,
+                                 eff_suffix, filename_stream):
+            return
+        trimmed = self._trim_event(ev)
+        # #46: prefer the SR pinned at event-open time. The caller's
+        # ``sample_rate`` is the *current* session rate — if the user
+        # changed it mid-event the WAV header must still reflect the
+        # rate at which the samples were captured, otherwise the file
+        # plays back at the wrong speed.
+        ev_sr = ev.get('sample_rate', sample_rate)
         self._start_flush(trimmed, output_dir, filename_prefix,
                           eff_suffix, sample_rate=ev_sr,
                           onset_time=ev['onset_time'],
@@ -619,3 +794,10 @@ class ThresholdRecorder:
             sample_rate=sample_rate, onset_time=onset_time,
             filename_stream=filename_stream,
         )
+
+
+# H1: sentinel used by ``ThresholdRecorder._streaming_active`` to detect
+# the test seam — when a test monkeypatches ``_start_flush`` on the
+# class, the class-dict entry no longer is this object and streaming
+# steps aside so the stub receives full buffers.
+_ORIG_START_FLUSH = ThresholdRecorder.__dict__['_start_flush']

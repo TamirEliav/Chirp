@@ -44,6 +44,54 @@ def _amp_to_display(buf: np.ndarray, scale: str) -> np.ndarray:
     return buf
 
 
+def spec_ytick_list(e) -> list:
+    """pyqtgraph ``setTicks`` structure for a spectrogram axis.
+
+    The spectrogram image is drawn in display-ROW coordinates (0 ..
+    N_DISPLAY_ROWS) after the mel/log/linear resampling — the axis must
+    therefore label row positions with the frequencies they map to via
+    ``e.display_freqs``, exactly like the retired matplotlib
+    ``_apply_spec_yticks`` did. Returns ``[(row_pos, label), ...]``.
+    """
+    freqs = getattr(e, 'display_freqs', None)
+    if freqs is None or len(freqs) == 0:
+        return []
+    n_dst = len(freqs)
+    f_lo, f_hi = float(freqs[0]), float(freqs[-1])
+    if getattr(e, 'freq_scale', 'Mel') == 'Linear':
+        step = max(500, round((f_hi - f_lo) / 8 / 500) * 500) or 5000
+        tick_freqs = np.arange(np.ceil(f_lo / step) * step, f_hi + 1, step)
+    else:
+        tick_freqs = np.array([50, 100, 200, 500, 1000, 2000, 5000,
+                               10000, 20000, 50000, 100000], dtype=float)
+        tick_freqs = tick_freqs[(tick_freqs >= f_lo) & (tick_freqs <= f_hi)]
+    rows = np.interp(tick_freqs, freqs, np.arange(n_dst))
+    return [(float(r), f'{f/1000:.0f}k' if f >= 1000 else f'{int(f)}')
+            for r, f in zip(rows, tick_freqs)]
+
+
+def spec_ytick_key(e) -> tuple:
+    """Cache key for the tick set — recompute only when the frequency
+    mapping actually changes."""
+    return (getattr(e, 'freq_scale', ''), getattr(e, 'display_freq_lo', 0.0),
+            getattr(e, 'display_freq_hi', 0.0), getattr(e, 'sample_rate', 0))
+
+
+def _decimate_max(y: np.ndarray, max_cols: int) -> np.ndarray:
+    """H3: peak (max) decimation for non-negative envelope data —
+    reduces the per-tick numpy work (GIL-holding) from O(buffer) to a
+    single reduction; everything downstream is O(pixels)."""
+    n = y.shape[0]
+    if n <= max_cols * 2:
+        return y
+    k = n // max_cols
+    m = n // k
+    return y[:m * k].reshape(m, k).max(axis=1)
+
+
+_MAX_ENV_COLS = 2048  # view-mode tiles are small; 2k columns is plenty
+
+
 class StreamPlotPanel(pg.GraphicsLayoutWidget):
     """A vertically-stacked spectrogram + amplitude view for one entity.
 
@@ -108,6 +156,7 @@ class StreamPlotPanel(pg.GraphicsLayoutWidget):
 
         self._t_axis: np.ndarray | None = None
         self._t_len = 0
+        self._ytick_key: tuple | None = None
 
     def set_title(self, text: str) -> None:
         """Set the per-tile title shown above the spectrogram (stream name)."""
@@ -136,14 +185,23 @@ class StreamPlotPanel(pg.GraphicsLayoutWidget):
         self._img.setLevels([clim_lo, e.db_ceil])
         # Map image pixels onto time (x) × freq-row (y) coordinates.
         self._img.setRect(pg.QtCore.QRectF(0.0, 0.0, disp_secs, float(n_rows)))
+        # Frequency y-tick labels — the rows are mel/log/linear-mapped,
+        # so raw row indices are meaningless to the user. Recomputed
+        # only when the mapping changes.
+        key = spec_ytick_key(e)
+        if key != self._ytick_key:
+            self._ytick_key = key
+            self._spec_plot.getAxis('left').setTicks([spec_ytick_list(e)])
 
         cursor_x = (e.write_head / e.sample_rate) % disp_secs
         self._spec_cursor.setValue(cursor_x)
         self._amp_cursor.setValue(cursor_x)
 
-        # Amplitude envelope.
+        # Amplitude envelope — peak-decimated to display resolution
+        # before the dB conversion (H3).
         scale = getattr(e, 'amp_scale', 'log')
-        env = _amp_to_display(e.abs_amp_buffer, scale)
+        env = _amp_to_display(_decimate_max(e.abs_amp_buffer, _MAX_ENV_COLS),
+                              scale)
         t = self._time_axis(env.shape[0], disp_secs)
         self._amp_curve.setData(t, env)
         # Threshold line in display units.
@@ -152,6 +210,10 @@ class StreamPlotPanel(pg.GraphicsLayoutWidget):
             20.0 * np.log10(max(thr, 1e-4)) if scale == 'log' else thr)
 
         if self._wave_curve is not None:
-            self._wave_curve.setData(t, e.amp_buffer)
+            # Separate ramp — the envelope axis above is decimated and
+            # no longer matches the raw buffer length.
+            wave = e.amp_buffer
+            t_w = np.linspace(0.0, disp_secs, wave.shape[0], dtype=np.float32)
+            self._wave_curve.setData(t_w, wave)
             color = C['red'] if getattr(e, 'saturated', False) else C['teal']
             self._wave_curve.setPen(pg.mkPen(color, width=1))
