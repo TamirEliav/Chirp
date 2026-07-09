@@ -127,6 +127,21 @@ def _resolve_safe_path(output_dir: str, fname: str) -> str:
     return path
 
 
+def _dedup_target(path: str) -> str:
+    """L4: if ``path`` already exists, insert a ``_rNN`` token before
+    the extension so a same-millisecond filename collision (two events
+    flushed with identical onset tokens) can't silently overwrite an
+    earlier recording via ``os.replace``."""
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    for i in range(2, 100):
+        cand = f'{base}_r{i:02d}{ext}'
+        if not os.path.exists(cand):
+            return cand
+    return path  # 98 collisions — give up and overwrite
+
+
 def write_wav_sync(buf_snapshot: list, output_dir: str,
                    prefix: str = '', suffix: str = '',
                    sample_rate: int = SAMPLE_RATE,
@@ -192,6 +207,7 @@ def write_wav_sync(buf_snapshot: list, output_dir: str,
             os.close(fd)
     except OSError:
         pass
+    path = _dedup_target(path)
     os.replace(tmp_path, path)
     ch_str = 'stereo' if audio.ndim == 2 else 'mono'
     print(f'[REC] saved {path}  ({n_samples/sample_rate:.2f} s, {ch_str})')
@@ -306,6 +322,7 @@ class StreamingWavWriter:
                 os.close(fd)
         except OSError:
             pass
+        self.path = _dedup_target(self.path)
         os.replace(self._tmp, self.path)
         dur = self.frames_written / self.sample_rate if self.sample_rate else 0.0
         ch_str = 'stereo' if self.channels == 2 else 'mono'

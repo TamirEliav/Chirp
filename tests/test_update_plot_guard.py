@@ -67,9 +67,6 @@ def _make_window():
     win._mini_amp_rr = 0
     win._config_panel = MagicMock()
 
-    # Canvas / fig — the error-recovery path tries to draw().
-    win._canvas = MagicMock()
-    win._fig = MagicMock()
     return win
 
 
@@ -89,19 +86,6 @@ def test_update_plot_does_not_propagate_body_exception():
     assert win._update_plot_err_count == 1
     assert win._update_plot_err_total == 1
     assert 'shape mismatch' in win._update_plot_last_err
-
-
-def test_update_plot_re_baselines_blit_cache_on_error():
-    """On error, ``_canvas.draw()`` runs to re-baseline the blit
-    state — otherwise the next tick restores from a half-built bg
-    bbox and corrupts the display further."""
-    win = _make_window()
-    with patch.object(type(win), '_update_plot_body',
-                      side_effect=RuntimeError('x')):
-        win._update_plot()
-
-    win._canvas.draw.assert_called_once()
-    win._canvas.copy_from_bbox.assert_called_once()
 
 
 def test_update_plot_consecutive_errors_show_sticky_note():
@@ -179,17 +163,6 @@ def test_update_plot_recovery_after_failures():
     assert win._update_plot_err_count == 0
     assert win._update_plot_err_total == 2
 
-
-def test_update_plot_canvas_draw_failure_is_swallowed():
-    """If even ``_canvas.draw()`` raises during recovery, the slot
-    must STILL not propagate — the next tick will simply skip the
-    blit branch (``self._bg is None``) until the user toggles a
-    redraw."""
-    win = _make_window()
-    win._canvas.draw = MagicMock(side_effect=RuntimeError('draw failed too'))
-    with patch.object(type(win), '_update_plot_body',
-                      side_effect=RuntimeError('first')):
-        # MUST NOT raise.
-        win._update_plot()
-
-    assert win._update_plot_err_count == 1
+# (Phase C: the matplotlib blit-cache recovery tests were removed with
+# the blit path itself — pyqtgraph repaints from scratch each frame, so
+# there is no ``_canvas.draw()`` recovery step left to pin.)

@@ -10,24 +10,15 @@ Phase 3 fixes will chip away at it:
   - #11 (c22): save-button tooltip + dirty-state indicator
 """
 
-import collections
 import datetime
 import json
 import os
 import math
-import queue
 import sys
 import time
-import threading
+from contextlib import contextmanager
 
-import matplotlib
-matplotlib.use('Qt5Agg')
-
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 import numpy as np
-import scipy.io.wavfile
-import scipy.signal
 import sounddevice as sd
 
 from PyQt5.QtWidgets import (
@@ -61,74 +52,6 @@ from chirp.ui.sidebar import (
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Amplitude-axis display helpers
-#
-# The envelope buffer (``RecordingEntity.abs_amp_buffer``) is always
-# stored in linear [0, 1] full-scale units. The user can flip the amp
-# plot between linear and log (dB) views via right-click on the axis.
-# These helpers do the data / threshold / axis conversions so the rest
-# of the rendering code can stay scale-agnostic.
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _amp_to_display(buf, scale: str):
-    """Convert a linear envelope buffer into the value range plotted on
-    screen. ``scale='linear'`` is identity; ``scale='log'`` returns
-    ``20*log10(|x|)`` with values below ``AMP_DB_EPS`` clamped at the
-    floor so a zero sample doesn't blow up to ``-inf``."""
-    if scale == 'log':
-        return 20.0 * np.log10(np.maximum(np.abs(buf), AMP_DB_EPS))
-    return buf
-
-
-def _thr_to_display(thr: float, scale: str) -> float:
-    """Convert a linear-scale threshold (0..1) into its on-axis y value
-    for the current scale. Mirror of ``_amp_to_display`` but for a
-    scalar (avoids the array-allocation overhead)."""
-    if scale == 'log':
-        return max(20.0 * np.log10(max(thr, AMP_DB_EPS)), AMP_DB_MIN)
-    return thr
-
-
-def _display_to_thr(yval: float, scale: str) -> float:
-    """Inverse of ``_thr_to_display`` — used during a threshold drag to
-    convert ``event.ydata`` (in axis units) back into the linear
-    threshold the rest of the pipeline operates on. Result is clipped
-    to [0, 1]."""
-    if scale == 'log':
-        return float(np.clip(10.0 ** (yval / 20.0), 0.0, 1.0))
-    return float(np.clip(yval, 0.0, 1.0))
-
-
-def _amp_axis_limits(e) -> tuple[float, float]:
-    """Y-axis limits for the amp plot. Linear: 0..amp_ylim (zoomable
-    via scroll wheel). Log: fixed AMP_DB_MIN..AMP_DB_MAX — the dB
-    range is wide enough that a per-stream zoom isn't worth the
-    complexity, and a fixed range keeps tile-to-tile comparisons in
-    view mode meaningful."""
-    if getattr(e, 'amp_scale', 'linear') == 'log':
-        return (AMP_DB_MIN, AMP_DB_MAX)
-    return (0.0, e.amp_ylim if e is not None else 1.05)
-
-
-def _amp_axis_label(e) -> str:
-    return 'Amplitude (dB)' if getattr(e, 'amp_scale', 'linear') == 'log' else 'Amplitude'
-
-
-def _thr_label_text(thr: float, scale: str) -> str:
-    if scale == 'log':
-        return f'thr = {_thr_to_display(thr, scale):.1f} dB'
-    return f'thr = {thr:.3f}'
-
-
-def _thr_label_y_offset(scale: str) -> float:
-    """Offset (in axis units) used to position the ``thr = ...`` text
-    just above the threshold line. Different scales pick different
-    offsets so the label sits at a sensible visual distance — 3% of a
-    [0,1] axis vs 1.5 dB on a 80 dB axis."""
-    return 1.5 if scale == 'log' else 0.03
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # ChirpWindow
 # ──────────────────────────────────────────────────────────────────────────────
 class ChirpWindow(QMainWindow):
@@ -147,14 +70,12 @@ class ChirpWindow(QMainWindow):
 
         # View mode
         self._view_mode = False
-        self._vm_axes: list[dict] = []
         self._vm_n_cols = 1
         self._vm_panel_height = 300
         # Phase 4: view-mode grid is rendered by pyqtgraph/OpenGL. Built
         # lazily on first entry; swapped into the central scroll area in
-        # place of the matplotlib canvas (config mode keeps matplotlib
-        # during the migration). Set to use software rendering in headless
-        # tests via ``_pg_use_opengl``.
+        # place of the config panel. Set to use software rendering in
+        # headless tests via ``_pg_use_opengl``.
         self._pg_grid = None
         self._pg_use_opengl = True
         # Phase 4 audio-priority: adaptively skip view-mode render frames
@@ -184,10 +105,6 @@ class ChirpWindow(QMainWindow):
         # monitor itself gates on `source_id` so only the chosen stream
         # plays. Created before `_build_ui` so the UI can reference it.
         self._monitor = AudioMonitor()
-
-        # Time axis (regenerated per entity's sample_rate)
-        self._t_axis_key = (0, 0)  # track (sample_rate, display_seconds) for cached t_axis
-        self._t_axis = np.array([], dtype=np.float32)
 
         self._build_figure()
         self._build_ui()
@@ -239,32 +156,33 @@ class ChirpWindow(QMainWindow):
         self._btn_save.setToolTip(f'Save configuration to {path}{dirty}')
 
     # ──────────────────────────────────────────────────────────────────────
-    # matplotlib figure
+    # M4: busy feedback for blocking device operations
+    # ──────────────────────────────────────────────────────────────────────
+
+    @contextmanager
+    def _busy_cursor(self):
+        """Wait cursor around device open/close, sample-rate rebuilds and
+        WAV loads — they block the GUI thread for up to several seconds
+        (PortAudio open, buffer rebuild, 10 s ingest join). Without any
+        feedback the app looks hung and users force-kill it, orphaning
+        the writer pool. Moving these off the GUI thread is a larger
+        refactor; the cursor at least tells the user work is happening."""
+        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+        try:
+            QApplication.processEvents()
+            yield
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Central plot panel (pyqtgraph)
     # ──────────────────────────────────────────────────────────────────────
 
     def _build_figure(self):
-        plt.rcParams.update({
-            'figure.facecolor': C['base'],
-            'axes.facecolor':   C['mantle'],
-            'axes.edgecolor':   C['surface1'],
-            'axes.labelcolor':  C['subtext'],
-            'xtick.color':      C['subtext'],
-            'ytick.color':      C['subtext'],
-            'xtick.labelsize':  8,
-            'ytick.labelsize':  8,
-            'axes.labelsize':   9,
-        })
-        self._fig = plt.figure()
-        self._canvas = FigureCanvasQTAgg(self._fig)
-        self._canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self._bg = None
-        self._canvas.mpl_connect('resize_event', self._recapture_bg)
-        self._is_stereo_layout = False
-        self._setup_axes(stereo=False)
-        # Phase 4b: the config-mode central view is now pyqtgraph too. The
-        # matplotlib figure above is kept (hidden, never drawn) so legacy
-        # helper methods that reference its axes stay harmless; the
-        # ConfigPlotPanel is what actually sits in the scroll area.
+        # Phase C: the hidden matplotlib figure is gone — the pyqtgraph
+        # ConfigPlotPanel is the config-mode central view; it rebuilds
+        # its own layout from the entity signature (display mode /
+        # stereo / spectral / amp scale / display window) on each tick.
         from chirp.ui.config_panel import ConfigPlotPanel
         self._config_panel = ConfigPlotPanel(use_opengl=self._pg_use_opengl)
         self._config_panel.thresholdChanged.connect(self._on_threshold_dragged)
@@ -272,377 +190,12 @@ class ChirpWindow(QMainWindow):
             self._on_spectral_threshold_dragged)
         self._config_panel.ampScaleChanged.connect(self._on_amp_scale_menu)
 
-    def _setup_axes(self, stereo=False):
-        self._fig.clf()
-        self._is_stereo_layout = stereo
-        e = self._sel if self._selected_idx >= 0 else None
 
-        db_floor = e.db_floor if e else SPEC_DB_MIN
-        db_ceil  = e.db_ceil  if e else SPEC_DB_MAX
-        if db_floor >= db_ceil:
-            db_floor = db_ceil - 0.1
-        threshold = e.threshold if e else DEFAULT_THRESHOLD
-        sr = e.sample_rate if e else SAMPLE_RATE
-        disp_secs = e.display_seconds if e else DISPLAY_SECONDS
-        n_cols = e._n_cols if e else int(disp_secs * sr / CHUNK_FRAMES)
-        dmode = e.display_mode if e else 'Spectrogram'
-        self._display_mode = dmode
 
-        show_spec = dmode in ('Spectrogram', 'Both')
-        show_wave = dmode in ('Waveform', 'Both')
-        show_entropy = (e.spectral_trigger_mode != 'Amplitude Only') if e else False
 
-        # Build ordered list of subplot rows
-        rows_list = []
-        ratios = []
-        if show_spec:
-            rows_list.append('spec')
-            ratios.append(2 if dmode == 'Both' else 1)
-            if stereo:
-                rows_list.append('spec_r')
-                ratios.append(2 if dmode == 'Both' else 1)
-        if show_wave:
-            rows_list.append('wave')
-            ratios.append(1)
-            if stereo and dmode == 'Waveform':
-                rows_list.append('wave_r')
-                ratios.append(1)
-        rows_list.append('amp')
-        ratios.append(1)
-        # #32: thin detect/record indicator strip under the amp axis.
-        rows_list.append('events')
-        ratios.append(0.25)
-        if show_entropy:
-            rows_list.append('entropy')
-            ratios.append(1)
 
-        gs = self._fig.add_gridspec(len(rows_list), 1, height_ratios=ratios, hspace=0.10)
-        ax_rows = {key: i for i, key in enumerate(rows_list)}
 
-        # Create the first (topmost) axis as the sharex anchor
-        first_key = list(ax_rows.keys())[0]
-        first_ax = self._fig.add_subplot(gs[ax_rows[first_key]])
-        axes_map = {first_key: first_ax}
-        for key in list(ax_rows.keys())[1:]:
-            axes_map[key] = self._fig.add_subplot(gs[ax_rows[key]], sharex=first_ax)
 
-        # Assign axes references
-        self._ax_spec    = axes_map.get('spec', None)
-        self._ax_spec_r  = axes_map.get('spec_r', None)
-        self._ax_wave    = axes_map.get('wave', None)
-        self._ax_wave_r  = axes_map.get('wave_r', None)
-        self._ax_amp     = axes_map['amp']
-        self._ax_events  = axes_map.get('events', None)
-        self._ax_entropy = axes_map.get('entropy', None)
-
-        self._fig.subplots_adjust(top=0.97, bottom=0.06, left=0.07, right=0.99)
-        n_disp = N_DISPLAY_ROWS
-        dummy  = np.full((n_disp, n_cols), db_floor, dtype=np.float32)
-
-        # -- Spectrogram axes --
-        if self._ax_spec is not None:
-            self._spec_im = self._ax_spec.imshow(
-                dummy, aspect='auto', origin='lower',
-                extent=[0.0, disp_secs, 0, n_disp],
-                vmin=db_floor, vmax=db_ceil,
-                cmap=COLORMAP, interpolation='nearest',
-            )
-            self._ax_spec.set_ylabel('Freq (Hz) \u2014 L' if stereo else 'Frequency (Hz)')
-            self._cursor_spec = self._ax_spec.axvline(x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
-        else:
-            self._spec_im = None
-            self._cursor_spec = None
-
-        if self._ax_spec_r is not None:
-            self._spec_im_r = self._ax_spec_r.imshow(
-                dummy, aspect='auto', origin='lower',
-                extent=[0.0, disp_secs, 0, n_disp],
-                vmin=db_floor, vmax=db_ceil,
-                cmap=COLORMAP, interpolation='nearest',
-            )
-            self._ax_spec_r.set_ylabel('Freq (Hz) \u2014 R')
-            self._cursor_spec_r = self._ax_spec_r.axvline(x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
-        else:
-            self._spec_im_r = None
-            self._cursor_spec_r = None
-
-        # -- Waveform axes --
-        ts = max(1, int(disp_secs * sr / CHUNK_FRAMES)) * CHUNK_FRAMES
-        t_axis = self._get_t_axis(sr, disp_secs)
-
-        if self._ax_wave is not None:
-            amp_ylim = e.amp_ylim if e else 1.05
-            if stereo and dmode == 'Both':
-                # Overlaid L+R waveform
-                (self._wave_line,) = self._ax_wave.plot(
-                    t_axis, np.zeros(ts),
-                    color=C['teal'], linewidth=0.7, antialiased=False, label='L',
-                )
-                (self._wave_line_r,) = self._ax_wave.plot(
-                    t_axis, np.zeros(ts),
-                    color=C['pink'], linewidth=0.7, antialiased=False, label='R',
-                )
-                self._ax_wave.legend(loc='upper right', fontsize=8,
-                                     facecolor=C['mantle'], edgecolor=C['surface1'],
-                                     labelcolor=C['text'])
-            else:
-                wave_label = 'Waveform' if not stereo else 'L'
-                (self._wave_line,) = self._ax_wave.plot(
-                    t_axis, np.zeros(ts),
-                    color=C['teal'], linewidth=0.7, antialiased=False,
-                    label=wave_label if (stereo and dmode != 'Both') else None,
-                )
-                if stereo and dmode != 'Both':
-                    self._wave_line_r = None  # separate axis used
-                elif not stereo:
-                    self._wave_line_r = None
-                else:
-                    self._wave_line_r = None
-            self._ax_wave.set_xlim(0.0, disp_secs)
-            self._ax_wave.set_ylim(-amp_ylim, amp_ylim)
-            self._ax_wave.set_ylabel('Wave \u2014 L' if (stereo and dmode == 'Waveform') else 'Waveform')
-            self._cursor_wave = self._ax_wave.axvline(x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
-        else:
-            self._wave_line = None
-            self._wave_line_r = None
-            self._cursor_wave = None
-
-        if self._ax_wave_r is not None:
-            amp_ylim = e.amp_ylim if e else 1.05
-            (self._wave_line_r,) = self._ax_wave_r.plot(
-                t_axis, np.zeros(ts),
-                color=C['pink'], linewidth=0.7, antialiased=False,
-            )
-            self._ax_wave_r.set_xlim(0.0, disp_secs)
-            self._ax_wave_r.set_ylim(-amp_ylim, amp_ylim)
-            self._ax_wave_r.set_ylabel('Wave \u2014 R')
-            self._cursor_wave_r = self._ax_wave_r.axvline(x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
-        else:
-            if self._ax_wave is None:
-                self._wave_line_r = self._wave_line_r if hasattr(self, '_wave_line_r') else None
-            self._cursor_wave_r = None
-
-        # -- Amplitude envelope axis --
-        # Initial Y data must already be in display units (linear or
-        # dB) so the line lands at the right position the moment the
-        # background snapshot is captured. Plotting linear zeros under
-        # a log axis would otherwise render the seed line at y=0 (the
-        # top edge of the dB range), which sticks until something
-        # forces a full re-render of the figure background.
-        scale = getattr(e, 'amp_scale', 'linear') if e else 'linear'
-        seed = _amp_to_display(np.zeros(ts), scale)
-        (self._amp_line,) = self._ax_amp.plot(
-            t_axis, seed,
-            color=C['blue'], linewidth=0.7, antialiased=False,
-            label='L' if stereo else None,
-        )
-        if stereo:
-            (self._amp_line_r,) = self._ax_amp.plot(
-                t_axis, seed,
-                color=C['pink'], linewidth=0.7, antialiased=False, label='R',
-            )
-            self._ax_amp.legend(loc='upper right', fontsize=8,
-                                facecolor=C['mantle'], edgecolor=C['surface1'],
-                                labelcolor=C['text'])
-        else:
-            self._amp_line_r = None
-
-        amp_lo, amp_hi = _amp_axis_limits(e)
-        self._ax_amp.set_xlim(0.0, disp_secs)
-        self._ax_amp.set_ylim(amp_lo, amp_hi)
-        self._ax_amp.set_xlabel('Time (s)')
-        self._ax_amp.set_ylabel(_amp_axis_label(e))
-
-        thr_disp = _thr_to_display(threshold, scale)
-        self._threshold_line = self._ax_amp.axhline(
-            y=thr_disp, color=C['yellow'], linewidth=1.5, linestyle=(0, (6, 3)),
-        )
-        self._threshold_label = self._ax_amp.text(
-            0.005, thr_disp + _thr_label_y_offset(scale),
-            _thr_label_text(threshold, scale),
-            transform=self._ax_amp.get_yaxis_transform(),
-            color=C['yellow'], fontsize=8,
-        )
-        self._cursor_amp = self._ax_amp.axvline(x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
-
-        # -- #32: detect / record indicator strip --
-        if self._ax_events is not None:
-            # Amp no longer the bottom of its group — hide its x labels.
-            self._ax_amp.tick_params(axis='x', labelbottom=False)
-            # 2-row RGBA image: row 0 = detect (yellow), row 1 = record (green).
-            # Initial image is fully opaque at axis facecolor — see
-            # _build_events_rgba for rationale (opaque avoids blit ghosting).
-            rgba0 = np.empty((2, max(1, n_cols), 4), dtype=np.float32)
-            rgba0[..., 0] = 0x18 / 255.0
-            rgba0[..., 1] = 0x18 / 255.0
-            rgba0[..., 2] = 0x25 / 255.0
-            rgba0[..., 3] = 1.0
-            self._events_im = self._ax_events.imshow(
-                rgba0, aspect='auto', origin='upper',
-                extent=[0.0, disp_secs, 0, 2],
-                interpolation='nearest',
-            )
-            self._ax_events.set_xlim(0.0, disp_secs)
-            self._ax_events.set_ylim(0, 2)
-            self._ax_events.set_yticks([0.5, 1.5])
-            self._ax_events.set_yticklabels(['rec', 'det'], fontsize=7)
-            self._ax_events.tick_params(axis='y', length=0, pad=2)
-            self._cursor_events = self._ax_events.axvline(
-                x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
-            # The events strip takes the x-label when it's the last row
-            # (no entropy axis below it). Otherwise entropy gets it.
-            self._ax_amp.set_xlabel('')
-            if self._ax_entropy is None:
-                self._ax_events.set_xlabel('Time (s)')
-            else:
-                self._ax_events.set_xlabel('')
-                self._ax_events.tick_params(axis='x', labelbottom=False)
-        else:
-            self._events_im = None
-            self._cursor_events = None
-
-        # -- Entropy axes --
-        if self._ax_entropy is not None:
-            ent_n_cols = e._n_cols if e else n_cols
-            ent_t = np.linspace(0.0, disp_secs, ent_n_cols, endpoint=False, dtype=np.float32)
-            ent_thr = e.spectral_threshold if e else 0.5
-            (self._entropy_line,) = self._ax_entropy.plot(
-                ent_t, np.ones(ent_n_cols),
-                color=C['mauve'], linewidth=0.9, antialiased=False,
-            )
-            self._ax_entropy.set_xlim(0.0, disp_secs)
-            self._ax_entropy.set_ylim(0.0, 1.05)
-            self._ax_entropy.set_xlabel('Time (s)')
-            self._ax_entropy.set_ylabel('Entropy')
-            self._ax_amp.set_xlabel('')  # move x-label to entropy axis
-            self._entropy_thr_line = self._ax_entropy.axhline(
-                y=ent_thr, color=C['peach'], linewidth=1.5, linestyle=(0, (6, 3)),
-            )
-            self._entropy_thr_label = self._ax_entropy.text(
-                0.005, ent_thr + 0.03, f'ent = {ent_thr:.3f}',
-                transform=self._ax_entropy.get_yaxis_transform(),
-                color=C['peach'], fontsize=8,
-            )
-            self._cursor_entropy = self._ax_entropy.axvline(
-                x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
-        else:
-            self._entropy_line = None
-            self._entropy_thr_line = None
-            self._entropy_thr_label = None
-            self._cursor_entropy = None
-
-        if e and self._ax_spec is not None:
-            self._update_spec_yticks(e)
-
-        # Mark animated artists for blitting
-        for a in self._get_config_artists():
-            a.set_animated(True)
-        self._canvas.draw()
-        self._bg = self._canvas.copy_from_bbox(self._fig.bbox)
-
-    def _get_config_artists(self):
-        """Return list of all animated artists in config mode."""
-        arts = [self._amp_line,
-                self._cursor_amp,
-                self._threshold_line, self._threshold_label]
-        if self._spec_im is not None:
-            arts.extend([self._spec_im, self._cursor_spec])
-        if self._spec_im_r is not None:
-            arts.extend([self._spec_im_r, self._cursor_spec_r])
-        if self._amp_line_r is not None:
-            arts.append(self._amp_line_r)
-        if self._wave_line is not None:
-            arts.extend([self._wave_line, self._cursor_wave])
-        if self._wave_line_r is not None:
-            arts.append(self._wave_line_r)
-            if self._cursor_wave_r is not None:
-                arts.append(self._cursor_wave_r)
-        if self._entropy_line is not None:
-            arts.extend([self._entropy_line, self._cursor_entropy,
-                         self._entropy_thr_line, self._entropy_thr_label])
-        if getattr(self, '_events_im', None) is not None:
-            arts.extend([self._events_im, self._cursor_events])
-        return arts
-
-    @staticmethod
-    def _get_vm_artists(vm: dict):
-        """Return animated artists for one view-mode cell."""
-        arts = [vm['amp_line'],
-                vm['cursor_amp'],
-                vm['thr_line'], vm['status_text']]
-        if vm.get('spec_im') is not None:
-            arts.extend([vm['spec_im'], vm['cursor_spec']])
-        if vm['amp_line_r'] is not None:
-            arts.append(vm['amp_line_r'])
-        if vm.get('wave_line') is not None:
-            arts.extend([vm['wave_line'], vm['cursor_wave']])
-        if vm.get('wave_line_r') is not None:
-            arts.append(vm['wave_line_r'])
-        if vm.get('entropy_line') is not None:
-            arts.extend([vm['entropy_line'], vm['cursor_entropy'],
-                         vm['entropy_thr_line']])
-        if vm.get('events_im') is not None:
-            arts.extend([vm['events_im'], vm['cursor_events']])
-        # #28 / #29: sticky saturation / drop indicator text — always
-        # present even when empty so the blitter keeps them in sync.
-        if vm.get('sat_text') is not None:
-            arts.append(vm['sat_text'])
-        if vm.get('drop_text') is not None:
-            arts.append(vm['drop_text'])
-        if vm.get('err_text') is not None:
-            arts.append(vm['err_text'])
-        return arts
-
-    def _recapture_bg(self, event=None):
-        """Re-capture background after resize."""
-        if self._view_mode:
-            for vm in self._vm_axes:
-                for a in self._get_vm_artists(vm):
-                    a.set_animated(True)
-            self._canvas.draw()
-            self._bg = self._canvas.copy_from_bbox(self._fig.bbox)
-        else:
-            for a in self._get_config_artists():
-                a.set_animated(True)
-            self._canvas.draw()
-            self._bg = self._canvas.copy_from_bbox(self._fig.bbox)
-
-    @staticmethod
-    def _apply_spec_yticks(ax, e: RecordingEntity):
-        """Apply frequency y-tick labels to a spectrogram axis."""
-        n_dst = N_DISPLAY_ROWS
-        f_lo = e.display_freqs[0] if len(e.display_freqs) else 0.0
-        f_hi = e.display_freqs[-1] if len(e.display_freqs) else e.sample_rate / 2
-        if e.freq_scale == 'Linear':
-            step = max(500, round((f_hi - f_lo) / 8 / 500) * 500) or 5000
-            tick_freqs = np.arange(
-                np.ceil(f_lo / step) * step,
-                f_hi + 1,
-                step)
-        else:
-            tick_freqs = np.array([50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000])
-            tick_freqs = tick_freqs[(tick_freqs >= f_lo) & (tick_freqs <= f_hi)]
-        tick_rows = np.interp(tick_freqs, e.display_freqs, np.arange(n_dst))
-        labels = [f'{f/1000:.0f}k' if f >= 1000 else f'{int(f)}' for f in tick_freqs]
-        ax.set_yticks(tick_rows)
-        ax.set_yticklabels(labels, fontsize=7)
-
-    def _update_spec_yticks(self, e: RecordingEntity):
-        if self._ax_spec is not None:
-            self._apply_spec_yticks(self._ax_spec, e)
-        if self._ax_spec_r is not None:
-            self._apply_spec_yticks(self._ax_spec_r, e)
-
-    def _get_t_axis(self, sr: int, disp_secs: float = DISPLAY_SECONDS) -> np.ndarray:
-        """Return a time axis array for the given sample rate + buffer length, cached."""
-        key = (sr, disp_secs)
-        if key != self._t_axis_key:
-            self._t_axis_key = key
-            ts = max(1, int(disp_secs * sr / CHUNK_FRAMES)) * CHUNK_FRAMES
-            self._t_axis = np.linspace(0.0, disp_secs,
-                                       ts,
-                                       endpoint=False, dtype=np.float32)
-        return self._t_axis
 
     @property
     def _sel(self) -> RecordingEntity:
@@ -650,51 +203,6 @@ class ChirpWindow(QMainWindow):
             return self._entities[self._selected_idx]
         return None
 
-    # ──────────────────────────────────────────────────────────────────────
-    # #32: events strip helpers
-    # ──────────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _build_events_rgba(e: 'RecordingEntity') -> np.ndarray | None:
-        """Build a 2-row RGBA array (det, rec) for the events imshow.
-
-        Downsamples the per-sample mask buffers to one column per
-        CHUNK_FRAMES block so the image width matches ``e._n_cols``
-        (and therefore aligns with the spectrogram/entropy grid).
-
-        "Off" cells are painted with the axis face colour (Catppuccin
-        mantle) at full opacity — NOT transparent — so that matplotlib
-        blitting always fully overwrites previous frame content. A
-        previous implementation used alpha=0 for "off" cells, which
-        left ghost bars on screen after the ring buffer cycled because
-        transparent pixels don't erase what the renderer painted on
-        earlier frames.
-        """
-        n_cols = e._n_cols
-        total = e._total_samples
-        if total <= 0 or n_cols <= 0:
-            return None
-        det = e.detect_mask_buffer[:n_cols * CHUNK_FRAMES].reshape(
-            n_cols, CHUNK_FRAMES).any(axis=1)
-        rec = e.record_mask_buffer[:n_cols * CHUNK_FRAMES].reshape(
-            n_cols, CHUNK_FRAMES).any(axis=1)
-        # Axis face colour = Catppuccin mantle (#181825) — keep in sync
-        # with the rcParam set in __init__.
-        bg_r, bg_g, bg_b = 0x18 / 255.0, 0x18 / 255.0, 0x25 / 255.0
-        rgba = np.empty((2, n_cols, 4), dtype=np.float32)
-        rgba[..., 0] = bg_r
-        rgba[..., 1] = bg_g
-        rgba[..., 2] = bg_b
-        rgba[..., 3] = 1.0  # fully opaque everywhere
-        # Row 0 = detect (top): Catppuccin yellow where True.
-        rgba[0, det, 0] = 0.976  # 0xF9
-        rgba[0, det, 1] = 0.886  # 0xE2
-        rgba[0, det, 2] = 0.686  # 0xAF
-        # Row 1 = record (bottom): Catppuccin green where True.
-        rgba[1, rec, 0] = 0.651  # 0xA6
-        rgba[1, rec, 1] = 0.890  # 0xE3
-        rgba[1, rec, 2] = 0.631  # 0xA1
-        return rgba
 
     # ──────────────────────────────────────────────────────────────────────
     # Qt layout
@@ -1989,26 +1497,10 @@ class ChirpWindow(QMainWindow):
         self._combo_display_mode.setCurrentText(e.display_mode)
         self._combo_display_mode.blockSignals(False)
 
-        # Rebuild axes if stereo layout, sample rate, display buffer, display mode, or entropy visibility differs
-        want_stereo = (e.channel_mode == 'Stereo')
-        axes_changed = (e.sample_rate, e.display_seconds) != self._t_axis_key
-        display_mode_changed = (e.display_mode != getattr(self, '_display_mode', 'Spectrogram'))
-        want_entropy = (e.spectral_trigger_mode != 'Amplitude Only')
-        has_entropy = (self._ax_entropy is not None)
-        if want_stereo != self._is_stereo_layout or axes_changed or display_mode_changed or want_entropy != has_entropy:
-            self._setup_axes(stereo=want_stereo)
-        self._update_spec_yticks(e)
-        # Sync the amp axis to this entity's scale. The above rebuild
-        # condition doesn't include amp_scale (it's a Y-axis change,
-        # not a layout change — full figure rebuild would be overkill),
-        # and on the very first call _setup_axes ran with no entity at
-        # all (linear placeholder). Without this the amp plot stays
-        # blank in log mode until the user toggles scale.
-        self._apply_amp_scale_to_axes(e)
-        # Phase 4b: rebuild the pyqtgraph config panel for the newly
-        # selected entity so its layout + threshold lines reflect this
-        # stream (layout auto-corrects on the next tick too, but the
-        # threshold lines are only set here / on drag).
+        # Rebuild the pyqtgraph config panel for the newly selected
+        # entity so its layout + threshold lines reflect this stream
+        # (layout auto-corrects on the next tick too, but the threshold
+        # lines are only set here / on drag).
         if getattr(self, '_config_panel', None) is not None and e is not None:
             self._config_panel.rebuild(e)
             self._config_panel.set_threshold(e.threshold)
@@ -2418,10 +1910,6 @@ class ChirpWindow(QMainWindow):
             self._selected_idx = 0
             self._sidebar.select(0)
             self._load_params_from_entity(0)
-            e = self._entities[0]
-            stereo = e.channel_mode == 'Stereo'
-            self._setup_axes(stereo=stereo)
-            self._update_spec_yticks(e)
             self._refresh_transport_ui()
 
         # If in view mode, rebuild the pyqtgraph view grid.
@@ -2509,6 +1997,9 @@ class ChirpWindow(QMainWindow):
         duration = self._sb_calib_dur.value()
         self._calib_samples = []
         self._calib_remaining = duration
+        # M8: reset the entity's envelope-peak accumulator so stale
+        # peaks from before the calibration window don't leak in.
+        e.consume_env_peak()
         self._btn_calibrate.setEnabled(False)
         self._lbl_calib_status.setText(f'Calibrating... {duration:.1f}s')
         self._lbl_calib_status.setStyleSheet(f'color: {C["yellow"]};')
@@ -2537,16 +2028,15 @@ class ChirpWindow(QMainWindow):
         remaining = max(0.0, duration - elapsed)
         self._lbl_calib_status.setText(f'Calibrating... {remaining:.1f}s')
 
-        # Collect current amplitude data from the buffer
-        # We sample the most recent chunk's peak from abs_amp_buffer
-        wh = e.write_head
-        n = CHUNK_FRAMES
-        if wh >= n:
-            chunk_data = e.abs_amp_buffer[wh - n:wh]
-        else:
-            chunk_data = e.abs_amp_buffer[:max(1, wh)]
-        if len(chunk_data) > 0:
-            self._calib_samples.append(float(np.max(chunk_data)))
+        # M8: collect the max trigger-ENVELOPE peak since the last tick.
+        # Every ingested chunk contributes (the entity accumulates the
+        # scalar on its DSP thread), and it is the same statistic the
+        # trigger compares against the threshold — the old code sampled
+        # |filtered| from abs_amp_buffer once per 100 ms, missing most
+        # chunks and systematically underestimating the noise floor.
+        peak = e.consume_env_peak()
+        if peak is not None:
+            self._calib_samples.append(peak)
 
         if elapsed >= duration:
             self._calib_timer.stop()
@@ -2633,7 +2123,6 @@ class ChirpWindow(QMainWindow):
         e.display_freq_lo = self._sb_disp_freq_lo.value()
         e.display_freq_hi = self._sb_disp_freq_hi.value()
         e.rebuild_freq_mapping()
-        self._update_spec_yticks(e)
         if self._chk_shared_spec.isChecked():
             for ent in self._entities:
                 if ent is not e:
@@ -2728,26 +2217,17 @@ class ChirpWindow(QMainWindow):
         if not e:
             return
         e.display_mode = mode
-        stereo = e.channel_mode == 'Stereo'
-        self._setup_axes(stereo=stereo)
-        self._update_spec_yticks(e)
         self._mark_dirty()
 
     def _on_detect_mode_changed(self, mode: str):
         self._sb_entropy_thr.setEnabled(mode != 'Amplitude Only')
         self._write_trigger_params()
-        e = self._sel
-        if e:
-            stereo = e.channel_mode == 'Stereo'
-            self._setup_axes(stereo=stereo)
-            self._update_spec_yticks(e)
 
     def _on_freq_scale_changed(self, scale: str):
         e = self._sel
         if e:
             e.freq_scale = scale
             e.rebuild_freq_mapping()
-            self._update_spec_yticks(e)
             if self._chk_shared_spec.isChecked():
                 for ent in self._entities:
                     if ent is not e:
@@ -2763,7 +2243,6 @@ class ChirpWindow(QMainWindow):
         window  = self._combo_win.currentData()
         if nperseg and window:
             e.change_fft_params(nperseg, window)
-            self._update_spec_yticks(e)
             if self._chk_shared_spec.isChecked():
                 for ent in self._entities:
                     if ent is not e:
@@ -3004,11 +2483,10 @@ class ChirpWindow(QMainWindow):
             self._chan_combo.blockSignals(False)
             e.channel_mode = 'Mono'
             self._trig_combo.setEnabled(False)
-            if self._is_stereo_layout:
-                self._setup_axes(stereo=False)
         self._chan_combo.setEnabled(max_ch >= 2)
         need_ch = 2 if e.channel_mode != 'Mono' else 1
-        ok = e.change_device(device_id, need_ch)
+        with self._busy_cursor():
+            ok = e.change_device(device_id, need_ch)
         if not ok:
             QMessageBox.warning(self, 'Device Error',
                                 f'Could not open device:\n{self._device_combo.currentText()}')
@@ -3094,7 +2572,8 @@ class ChirpWindow(QMainWindow):
             self._device_combo.blockSignals(False)
             return
 
-        ok, warning = e.use_wav_file(path, loop=e.wav_loop)
+        with self._busy_cursor():
+            ok, warning = e.use_wav_file(path, loop=e.wav_loop)
         if not ok:
             QMessageBox.warning(self, 'WAV File Error',
                                 f'Could not open WAV file:\n{path}')
@@ -3141,21 +2620,18 @@ class ChirpWindow(QMainWindow):
                     self._chan_combo.blockSignals(False)
                     e.channel_mode = 'Mono'
                     self._trig_combo.setEnabled(False)
-                    if self._is_stereo_layout:
-                        self._setup_axes(stereo=False)
                     return
             except Exception:
                 pass
 
-        if want_stereo != self._is_stereo_layout:
-            self._setup_axes(stereo=want_stereo)
-
         if is_wav_sim:
             # Re-open the WAV with the new channel count.
             if e.wav_file_path:
-                e.use_wav_file(e.wav_file_path, loop=e.wav_loop)
+                with self._busy_cursor():
+                    e.use_wav_file(e.wav_file_path, loop=e.wav_loop)
         else:
-            e.change_device(device_id, need_ch)
+            with self._busy_cursor():
+                e.change_device(device_id, need_ch)
         if not want_stereo:
             e.amp_buffer_r[:] = 0.0
             e.spec_buffer_r[:] = SPEC_DB_MIN
@@ -3190,6 +2666,9 @@ class ChirpWindow(QMainWindow):
             return
         self._sr_change_busy = True
         self._sr_combo.setEnabled(False)
+        # M4: wait cursor for the whole multi-second rebuild.
+        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+        QApplication.processEvents()
         try:
             e.change_sample_rate(new_sr)
             # #46: if sync-settings is on, mirror the SR change to
@@ -3218,12 +2697,9 @@ class ChirpWindow(QMainWindow):
             self._sb_disp_freq_hi.setRange(1.0, nyq)
             if self._sb_disp_freq_hi.value() > nyq:
                 self._sb_disp_freq_hi.setValue(nyq)
-            # Rebuild axes with new buffer sizes
-            stereo = e.channel_mode == 'Stereo'
-            self._setup_axes(stereo=stereo)
-            self._update_spec_yticks(e)
             self._refresh_transport_ui()
         finally:
+            QApplication.restoreOverrideCursor()
             self._sr_change_busy = False
             self._sr_combo.setEnabled(True)
 
@@ -3235,10 +2711,6 @@ class ChirpWindow(QMainWindow):
         if new_secs is None or new_secs == e.display_seconds:
             return
         e.change_display_seconds(new_secs)
-        # Rebuild axes with new buffer sizes
-        stereo = e.channel_mode == 'Stereo'
-        self._setup_axes(stereo=stereo)
-        self._update_spec_yticks(e)
         self._refresh_transport_ui()
 
     # ──────────────────────────────────────────────────────────────────────
@@ -3249,11 +2721,13 @@ class ChirpWindow(QMainWindow):
         self._view_mode = not self._view_mode
 
         if self._view_mode:
-            # Save current amplitude zoom for selected entity
+            # Save current amplitude zoom (linear scale only — the dB
+            # axis is fixed) from the config panel's viewbox.
             e = self._sel
             if e:
-                _, ymax = self._ax_amp.get_ylim()
-                e.amp_ylim = ymax
+                ymax = self._config_panel.current_amp_ylim()
+                if ymax is not None:
+                    e.amp_ylim = ymax
             # Flush params before hiding controls
             if self._selected_idx >= 0:
                 self._flush_params_to_entity(self._selected_idx)
@@ -3266,40 +2740,30 @@ class ChirpWindow(QMainWindow):
             # Phase 4: render all streams via the pyqtgraph/OpenGL grid.
             self._rebuild_view()
         else:
-            # Save view-mode zoom levels back to entities
-            for i, vm in enumerate(self._vm_axes):
-                if i < len(self._entities):
-                    _, ymax = vm['ax_amp'].get_ylim()
-                    self._entities[i].amp_ylim = ymax
             # Hide view toolbar
             self._view_toolbar.hide()
             # Show sidebar + config panels
             self._sidebar.show()
             for w in self._config_widgets:
                 w.show()
-            # Phase 4: swap the matplotlib canvas back in for config mode.
+            # Swap the config panel back into the scroll area.
             self._restore_config_canvas()
-            # Rebuild single-entity figure
-            self._canvas.setMinimumHeight(0)
-            e = self._sel
-            stereo = e.channel_mode == 'Stereo' if e else False
-            self._setup_axes(stereo=stereo)
-            if e:
+            if self._sel:
                 self._load_params_from_entity(self._selected_idx)
-                self._update_spec_yticks(e)
 
     def _rebuild_view(self) -> None:
         """Phase 4: build/populate the pyqtgraph view-mode grid and swap it
-        into the central scroll area (detaching the matplotlib canvas
-        without deleting it)."""
+        into the central scroll area (detaching the config panel without
+        deleting it)."""
         if self._pg_grid is None:
             from chirp.ui.central_plots import MultiStreamGrid
             self._pg_grid = MultiStreamGrid(use_opengl=self._pg_use_opengl)
         self._pg_grid.set_tile_height(self._vm_panel_height)
         self._pg_grid.rebuild(self._entities, cols=self._vm_n_cols)
         if self._canvas_scroll.widget() is not self._pg_grid:
-            # takeWidget detaches the current widget (the matplotlib canvas,
-            # which we still hold via self._canvas) without deleting it.
+            # takeWidget detaches the current widget (the config panel,
+            # which we still hold via self._config_panel) without
+            # deleting it.
             self._canvas_scroll.takeWidget()
             self._canvas_scroll.setWidget(self._pg_grid)
 
@@ -3345,277 +2809,6 @@ class ChirpWindow(QMainWindow):
             sb.blockSignals(False)
         self._mark_dirty()
 
-    def _setup_view_mode_axes(self):
-        """Rebuild matplotlib figure with all entities in a grid layout."""
-        import math
-        self._fig.clf()
-        self._vm_axes = []
-        n = len(self._entities)
-        if n == 0:
-            self._canvas.draw_idle()
-            return
-
-        cols = min(self._vm_n_cols, n)
-        rows = math.ceil(n / cols)
-
-        # Set canvas height based on panel height × rows
-        total_h = max(300, rows * self._vm_panel_height)
-        self._canvas.setMinimumHeight(total_h)
-
-        # Outer grid: rows × cols, each cell has inner subplots
-        outer_gs = self._fig.add_gridspec(
-            rows, cols, hspace=0.35, wspace=0.15,
-            top=0.97, bottom=0.03, left=0.05, right=0.99)
-
-        n_disp = N_DISPLAY_ROWS
-
-        for i, e in enumerate(self._entities):
-            r, c = divmod(i, cols)
-            dmode = e.display_mode
-            show_spec = dmode in ('Spectrogram', 'Both')
-            show_wave = dmode in ('Waveform', 'Both')
-            show_entropy = (e.spectral_trigger_mode != 'Amplitude Only')
-
-            # Build inner subplot rows
-            inner_rows = []
-            inner_ratios = []
-            if show_spec:
-                inner_rows.append('spec')
-                inner_ratios.append(3)
-            if show_wave:
-                inner_rows.append('wave')
-                inner_ratios.append(1 if show_spec else 3)
-            inner_rows.append('amp')
-            inner_ratios.append(1)
-            # #32: thin detect/record events strip under the amp axis,
-            # mirrors the config-mode layout.
-            inner_rows.append('events')
-            inner_ratios.append(0.3)
-            if show_entropy:
-                inner_rows.append('entropy')
-                inner_ratios.append(1)
-
-            inner = outer_gs[r, c].subgridspec(
-                len(inner_rows), 1, height_ratios=inner_ratios, hspace=0.08)
-            inner_idx = {key: idx for idx, key in enumerate(inner_rows)}
-
-            # Create axes based on display mode
-            ax_spec = None
-            ax_wave = None
-            spec_im = None
-            cursor_spec = None
-            wave_line = None
-            wave_line_r = None
-            cursor_wave = None
-            ax_entropy = None
-            entropy_line = None
-            entropy_thr_line = None
-            cursor_entropy = None
-            ax_events = None
-            events_im = None
-            cursor_events = None
-
-            e_disp = e.display_seconds
-            e_ts = e._total_samples
-            e_t_axis = np.linspace(0.0, e_disp, e_ts, endpoint=False, dtype=np.float32)
-
-            # First axis (anchor for sharex)
-            if show_spec:
-                ax_spec = self._fig.add_subplot(inner[inner_idx['spec']])
-                first_ax = ax_spec
-            elif show_wave:
-                ax_wave = self._fig.add_subplot(inner[inner_idx['wave']])
-                first_ax = ax_wave
-
-            if show_spec:
-                db_floor = min(e.db_floor, e.db_ceil - 0.1)
-                dummy = np.full((n_disp, e._n_cols), db_floor, dtype=np.float32)
-                spec_im = ax_spec.imshow(
-                    dummy, aspect='auto', origin='lower',
-                    extent=[0.0, e_disp, 0, n_disp],
-                    vmin=db_floor, vmax=e.db_ceil,
-                    cmap=COLORMAP, interpolation='nearest',
-                )
-                cursor_spec = ax_spec.axvline(x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
-                self._apply_spec_yticks(ax_spec, e)
-                ax_spec.tick_params(labelbottom=False)
-                ax_spec.set_ylabel('Freq', fontsize=7)
-
-            if show_wave:
-                if ax_wave is None:
-                    ax_wave = self._fig.add_subplot(inner[inner_idx['wave']], sharex=first_ax)
-                amp_ylim = e.amp_ylim
-                (wave_line,) = ax_wave.plot(
-                    e_t_axis, np.zeros(e_ts),
-                    color=C['teal'], linewidth=0.6, antialiased=False,
-                    label='L' if e.channel_mode == 'Stereo' else None,
-                )
-                wave_line_r = None
-                if e.channel_mode == 'Stereo':
-                    (wave_line_r,) = ax_wave.plot(
-                        e_t_axis, np.zeros(e_ts),
-                        color=C['pink'], linewidth=0.6, antialiased=False, label='R',
-                    )
-                    ax_wave.legend(loc='upper right', fontsize=7,
-                                   facecolor=C['mantle'], edgecolor=C['surface1'],
-                                   labelcolor=C['text'])
-                ax_wave.set_xlim(0.0, e_disp)
-                ax_wave.set_ylim(-amp_ylim, amp_ylim)
-                cursor_wave = ax_wave.axvline(x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
-                ax_wave.tick_params(labelbottom=False)
-                ax_wave.set_ylabel('Wave', fontsize=7)
-
-            ax_amp = self._fig.add_subplot(inner[inner_idx['amp']], sharex=first_ax)
-
-            # Seed the line in display units so an initial linear-zero
-            # snapshot doesn't render at y=0 of a dB-axis (the top edge)
-            # and stick there until something forces a full re-render.
-            scale = getattr(e, 'amp_scale', 'linear')
-            seed = _amp_to_display(np.zeros(e_ts), scale)
-            (amp_line,) = ax_amp.plot(
-                e_t_axis, seed,
-                color=C['blue'], linewidth=0.6, antialiased=False,
-            )
-            amp_line_r = None
-            if e.channel_mode == 'Stereo':
-                (amp_line_r,) = ax_amp.plot(
-                    e_t_axis, seed,
-                    color=C['pink'], linewidth=0.6, antialiased=False,
-                )
-            amp_lo, amp_hi = _amp_axis_limits(e)
-            ax_amp.set_xlim(0.0, e_disp)
-            ax_amp.set_ylim(amp_lo, amp_hi)
-            cursor_amp = ax_amp.axvline(x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
-
-            thr_line = ax_amp.axhline(
-                y=_thr_to_display(e.threshold, scale),
-                color=C['yellow'], linewidth=1.0,
-                linestyle=(0, (6, 3)),
-            )
-
-            # The amp axis is no longer the bottom of this cell (events
-            # strip and/or entropy axis come below). Hide its x tick
-            # labels; whichever axis ends up last will carry the label.
-            ax_amp.tick_params(labelbottom=False)
-            ax_amp.set_ylabel('Amp (dB)' if scale == 'log' else 'Amp', fontsize=7)
-
-            # #32: detect/record events strip (row 0 = det / yellow,
-            # row 1 = rec / green). Same construction as config mode.
-            ax_events = self._fig.add_subplot(
-                inner[inner_idx['events']], sharex=first_ax)
-            rgba0 = np.empty((2, max(1, e._n_cols), 4), dtype=np.float32)
-            rgba0[..., 0] = 0x18 / 255.0
-            rgba0[..., 1] = 0x18 / 255.0
-            rgba0[..., 2] = 0x25 / 255.0
-            rgba0[..., 3] = 1.0
-            events_im = ax_events.imshow(
-                rgba0, aspect='auto', origin='upper',
-                extent=[0.0, e_disp, 0, 2],
-                interpolation='nearest',
-            )
-            ax_events.set_xlim(0.0, e_disp)
-            ax_events.set_ylim(0, 2)
-            ax_events.set_yticks([0.5, 1.5])
-            ax_events.set_yticklabels(['rec', 'det'], fontsize=6)
-            ax_events.tick_params(axis='y', length=0, pad=2)
-            cursor_events = ax_events.axvline(
-                x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
-            # Events is either the bottom axis in this cell, or entropy
-            # is below it. Default: hide its x ticks — entropy (if
-            # present) or the fallback below handles the label.
-            ax_events.tick_params(labelbottom=False)
-
-            # Entropy subplot
-            if show_entropy:
-                ax_entropy = self._fig.add_subplot(inner[inner_idx['entropy']], sharex=first_ax)
-                ent_t = np.linspace(0.0, e_disp, e._n_cols, endpoint=False, dtype=np.float32)
-                (entropy_line,) = ax_entropy.plot(
-                    ent_t, np.ones(e._n_cols),
-                    color=C['mauve'], linewidth=0.6, antialiased=False,
-                )
-                ax_entropy.set_xlim(0.0, e_disp)
-                ax_entropy.set_ylim(0.0, 1.05)
-                entropy_thr_line = ax_entropy.axhline(
-                    y=e.spectral_threshold, color=C['peach'], linewidth=1.0,
-                    linestyle=(0, (6, 3)),
-                )
-                cursor_entropy = ax_entropy.axvline(
-                    x=0.0, color=C['green'], linewidth=1.0, alpha=0.7)
-                ax_entropy.set_ylabel('Ent', fontsize=7)
-                ax_entropy.tick_params(labelbottom=False)
-                # Entropy is the bottom axis when present — it carries
-                # the x-label on the bottom row of cells.
-                if r >= rows - 1:
-                    ax_entropy.tick_params(labelbottom=True)
-                    ax_entropy.set_xlabel('Time (s)', fontsize=7)
-            elif r >= rows - 1:
-                # No entropy: events strip is the bottom axis. Give it
-                # the x-label on the bottom row of cells.
-                ax_events.tick_params(labelbottom=True)
-                ax_events.set_xlabel('Time (s)', fontsize=7)
-
-            # Title and status on the topmost axis
-            top_ax = ax_spec if ax_spec is not None else ax_wave
-            title_obj = top_ax.set_title(e.name, loc='left', fontsize=9,
-                                         color=C['text'], fontweight='bold', pad=3)
-            status_text = top_ax.text(
-                0.99, 1.02, '', transform=top_ax.transAxes, fontsize=8,
-                ha='right', va='bottom', fontfamily='Consolas')
-            # #28 / #29: sticky saturation + drop indicators, mirroring
-            # the sidebar 'S' / 'D' badges so view-mode (monitoring
-            # grid) surfaces the same session-wide flags. Placed at the
-            # top-right corner INSIDE the top axis with a backing box so
-            # they're readable over the spectrogram without crowding
-            # the title / status row above the axes. Display-only here
-            # — user flips to config mode to clear.
-            _badge_bbox = dict(facecolor=C['mantle'], edgecolor=C['red'],
-                               linewidth=0.6, boxstyle='round,pad=0.25',
-                               alpha=0.9)
-            sat_text = top_ax.text(
-                0.985, 0.97, 'SAT', transform=top_ax.transAxes, fontsize=8,
-                ha='right', va='top', fontfamily='Consolas',
-                color=C['red'], fontweight='bold', bbox=_badge_bbox,
-                visible=False)
-            drop_text = top_ax.text(
-                0.985, 0.82, '', transform=top_ax.transAxes, fontsize=8,
-                ha='right', va='top', fontfamily='Consolas',
-                color=C['red'], fontweight='bold', bbox=_badge_bbox,
-                visible=False)
-            # #43 / #44 / #48: pipeline error overlay. Peach accent so
-            # it reads as "attention" rather than "clipping / data loss"
-            # (the red SAT / DROP badges).
-            _err_bbox = dict(facecolor=C['mantle'], edgecolor=C['peach'],
-                             linewidth=0.6, boxstyle='round,pad=0.25',
-                             alpha=0.9)
-            err_text = top_ax.text(
-                0.985, 0.67, 'ERR', transform=top_ax.transAxes, fontsize=8,
-                ha='right', va='top', fontfamily='Consolas',
-                color=C['peach'], fontweight='bold', bbox=_err_bbox,
-                visible=False)
-
-            self._vm_axes.append({
-                'ax_spec': ax_spec, 'ax_amp': ax_amp, 'ax_wave': ax_wave,
-                'ax_entropy': ax_entropy, 'ax_events': ax_events,
-                'spec_im': spec_im,
-                'amp_line': amp_line, 'amp_line_r': amp_line_r,
-                'wave_line': wave_line, 'wave_line_r': wave_line_r,
-                'entropy_line': entropy_line,
-                'events_im': events_im,
-                'cursor_spec': cursor_spec, 'cursor_amp': cursor_amp,
-                'cursor_wave': cursor_wave, 'cursor_entropy': cursor_entropy,
-                'cursor_events': cursor_events,
-                'thr_line': thr_line, 'entropy_thr_line': entropy_thr_line,
-                'title': title_obj, 'status_text': status_text,
-                'sat_text': sat_text, 'drop_text': drop_text,
-                'err_text': err_text,
-            })
-
-        # Set up blitting for view mode
-        for vm in self._vm_axes:
-            for a in self._get_vm_artists(vm):
-                a.set_animated(True)
-        self._canvas.draw()
-        self._bg = self._canvas.copy_from_bbox(self._fig.bbox)
 
     def _on_vm_cols_changed(self, val):
         self._vm_n_cols = val
@@ -3651,145 +2844,6 @@ class ChirpWindow(QMainWindow):
         else:
             self._vm_height_spin.setValue(tile)  # → _on_vm_height_changed
 
-    def _update_plot_view_mode(self):
-        """Update all entity displays in view mode (blitting)."""
-        if not self._vm_axes or self._bg is None:
-            return
-
-        self._canvas.restore_region(self._bg)
-
-        for i, e in enumerate(self._entities):
-            if i >= len(self._vm_axes):
-                break
-            vm = self._vm_axes[i]
-            cursor_x = (e.write_head / e.sample_rate) % e.display_seconds
-
-            amp_color_l = '#ff5555' if e.saturated else C['blue']
-            amp_color_r = '#ff5555' if e.saturated else C['pink']
-
-            # Spectrogram
-            if vm.get('spec_im') is not None:
-                vm['spec_im'].set_data(e.resample_spec(e.spec_buffer))
-                clim_lo = min(e.db_floor, e.db_ceil - 0.1)
-                vm['spec_im'].set_clim(clim_lo, e.db_ceil)
-                vm['cursor_spec'].set_xdata([cursor_x, cursor_x])
-
-            # Waveform
-            if vm.get('wave_line') is not None:
-                wave_color_l = '#ff5555' if e.saturated else C['teal']
-                vm['wave_line'].set_color(wave_color_l)
-                vm['wave_line'].set_ydata(e.amp_buffer)
-                vm['cursor_wave'].set_xdata([cursor_x, cursor_x])
-            if vm.get('wave_line_r') is not None and e.channel_mode == 'Stereo':
-                wave_color_r = '#ff5555' if e.saturated else C['pink']
-                vm['wave_line_r'].set_color(wave_color_r)
-                vm['wave_line_r'].set_ydata(e.amp_buffer_r)
-
-            # Amplitude envelope (per-entity linear/log display).
-            scale = getattr(e, 'amp_scale', 'linear')
-            vm['amp_line'].set_color(amp_color_l)
-            vm['amp_line'].set_ydata(_amp_to_display(e.abs_amp_buffer, scale))
-            if vm['amp_line_r'] is not None and e.channel_mode == 'Stereo':
-                vm['amp_line_r'].set_color(amp_color_r)
-                vm['amp_line_r'].set_ydata(_amp_to_display(e.abs_amp_buffer_r, scale))
-
-            vm['cursor_amp'].set_xdata([cursor_x, cursor_x])
-            thr_disp = _thr_to_display(e.threshold, scale)
-            vm['thr_line'].set_ydata([thr_disp, thr_disp])
-
-            # Entropy
-            if vm.get('entropy_line') is not None:
-                col_cursor_x = (e.col_head / e._n_cols) * e.display_seconds
-                vm['entropy_line'].set_ydata(e.entropy_buffer)
-                vm['cursor_entropy'].set_xdata([col_cursor_x, col_cursor_x])
-                vm['entropy_thr_line'].set_ydata([e.spectral_threshold, e.spectral_threshold])
-
-            # #32: detect / record events strip
-            if vm.get('events_im') is not None:
-                rgba = self._build_events_rgba(e)
-                if rgba is not None:
-                    vm['events_im'].set_data(rgba)
-                vm['cursor_events'].set_xdata([cursor_x, cursor_x])
-
-            # Status text
-            parts = []
-            if e.acq_running:
-                parts.append('ACQ')
-            if e.rec_enabled:
-                parts.append('REC')
-            if e.recorder.is_recording:
-                parts.append('TRIG')
-            status_str = '  '.join(parts) if parts else 'STOPPED'
-
-            vm['status_text'].set_text(status_str)
-            if e.recorder.is_recording:
-                vm['status_text'].set_color(C['red'])
-            elif e.rec_enabled:
-                vm['status_text'].set_color(C['green'])
-            elif e.acq_running:
-                vm['status_text'].set_color(C['blue'])
-            else:
-                vm['status_text'].set_color(C['surface2'])
-
-            # #28 / #29: sticky saturation / drop indicators. Mirror
-            # the sidebar 'S' / 'D' badges so view mode (which hides
-            # the sidebar) still surfaces session-wide flags. Toggle
-            # visibility rather than blanking the text — an empty
-            # string with a bbox still renders an empty pill outline.
-            if vm.get('sat_text') is not None:
-                vm['sat_text'].set_visible(
-                    bool(getattr(e, 'saturated_ever', False)))
-            if vm.get('drop_text') is not None:
-                cap = getattr(e, 'capture', None)
-                has_ever = bool(getattr(cap, 'has_ever_dropped', False))
-                if has_ever:
-                    total = int(getattr(cap, 'drop_count_total', 0))
-                    vm['drop_text'].set_text(f'DROP×{total}')
-                    vm['drop_text'].set_visible(True)
-                else:
-                    vm['drop_text'].set_visible(False)
-
-            # #43 / #44 / #48: pipeline error overlay — visible when any
-            # of ingest exceptions, OS-level overflows, capture open
-            # failure, or WAV writer failures have fired on this stream.
-            if vm.get('err_text') is not None:
-                cap = getattr(e, 'capture', None)
-                ingest_ever = bool(getattr(e, 'has_ever_ingest_errored', False))
-                os_ever = bool(getattr(cap, 'has_ever_os_dropped', False))
-                open_err = getattr(cap, 'open_error', None)
-                try:
-                    from chirp.recording import writer as _writer
-                    wr_has, _, _ = _writer.error_stats()
-                except Exception:
-                    wr_has = False
-                if ingest_ever or os_ever or bool(open_err) or wr_has:
-                    # Differentiate categories in the label so the grid
-                    # conveys which failure mode hit without a tooltip.
-                    tag_parts = []
-                    if ingest_ever:
-                        tag_parts.append('DSP')
-                    if os_ever:
-                        tag_parts.append('OS')
-                    if open_err:
-                        tag_parts.append('OPEN')
-                    if wr_has:
-                        tag_parts.append('WAV')
-                    vm['err_text'].set_text('ERR ' + '/'.join(tag_parts))
-                    vm['err_text'].set_visible(True)
-                else:
-                    vm['err_text'].set_visible(False)
-
-            # Blit each animated artist
-            for a in self._get_vm_artists(vm):
-                a.axes.draw_artist(a)
-
-        self._canvas.blit(self._fig.bbox)
-
-        # Sidebar is hidden in view mode — skip expensive mini-amp updates
-        # Status is still tracked so cached state stays correct
-        for i, ent in enumerate(self._entities):
-            self._sidebar.update_item_status(i, ent.acq_running, ent.rec_enabled,
-                                             ent.recorder.is_recording)
 
     # ──────────────────────────────────────────────────────────────────────
     # Audio ingestion + plot refresh
@@ -3873,13 +2927,11 @@ class ChirpWindow(QMainWindow):
     def _on_update_plot_error(self, exc: Exception) -> None:
         """#58: handle an exception escaping ``_update_plot_body``.
 
-        Bumps the consecutive-error counter, stashes the message,
-        attempts to re-baseline the blit cache so the next tick can
-        recover, and after ``_update_plot_freeze_threshold`` straight
-        failures shows a sticky note in the trigger-status label so
-        the user knows the display is degraded (the mic and writer
-        keep working — they're on background threads — so the user
-        should NOT force-kill).
+        Bumps the consecutive-error counter, stashes the message, and
+        after ``_update_plot_freeze_threshold`` straight failures shows
+        a sticky note in the trigger-status label so the user knows the
+        display is degraded (the mic and writer keep working — they're
+        on background threads — so the user should NOT force-kill).
         """
         import traceback
         self._update_plot_err_count += 1
@@ -3888,19 +2940,9 @@ class ChirpWindow(QMainWindow):
         # Stderr trace so a developer can debug from the console; the
         # GUI will surface a sticky note after threshold is reached.
         traceback.print_exc()
-        # Try to re-baseline the blit cache so the next tick has a
-        # clean background to restore from. ``draw()`` is expensive
-        # (~10 ms) but we only get here on error.
-        try:
-            if getattr(self, '_canvas', None) is not None:
-                self._canvas.draw()
-                if getattr(self, '_fig', None) is not None:
-                    self._bg = self._canvas.copy_from_bbox(self._fig.bbox)
-        except Exception:
-            # If even draw() fails, leave _bg alone — the next tick's
-            # ``if self._bg is not None`` short-circuit will skip the
-            # blit path until the user toggles a redraw.
-            pass
+        # (Phase C: the matplotlib blit-cache re-baseline that used to
+        # live here is gone — pyqtgraph repaints from scratch each
+        # frame, so there is no cached background to repair.)
         # Sticky note after N consecutive failures.
         if (self._update_plot_err_count >= self._update_plot_freeze_threshold
                 and getattr(self, '_lbl_trig_status', None) is not None):

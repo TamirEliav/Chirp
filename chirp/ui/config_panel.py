@@ -131,9 +131,24 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
     # ── Layout ────────────────────────────────────────────────────────
     @staticmethod
     def _signature(e) -> tuple:
+        # display_seconds is part of the layout signature because the
+        # fixed X ranges are set at rebuild time.
         return (e.display_mode, e.channel_mode == 'Stereo',
                 e.spectral_trigger_mode != 'Amplitude Only',
-                getattr(e, 'amp_scale', 'log'))
+                getattr(e, 'amp_scale', 'log'),
+                float(e.display_seconds))
+
+    def current_amp_ylim(self):
+        """Top of the amplitude plot's Y range when the linear scale is
+        active (the user may have wheel-zoomed it); None on the dB scale,
+        whose range is fixed."""
+        if self._amp is None or self._amp_scale == 'log':
+            return None
+        try:
+            vb = self._amp.getViewBox()
+            return float(vb.viewRange()[1][1])
+        except Exception:
+            return None
 
     def rebuild_if_needed(self, e) -> None:
         sig = self._signature(e)

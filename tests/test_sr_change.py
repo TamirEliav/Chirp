@@ -171,8 +171,6 @@ def _make_window_for_sr_tests(n_entities: int, initial_sr: int = 44100):
     win._monitor.source_id = None
     # Methods called near the end of the handler
     win._apply_monitor_source = MagicMock()
-    win._setup_axes           = MagicMock()
-    win._update_spec_yticks   = MagicMock()
     win._refresh_transport_ui = MagicMock()
     return win
 

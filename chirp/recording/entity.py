@@ -228,6 +228,12 @@ class RecordingEntity:
         # each ingested chunk for the recorder's onset timestamps.
         self._wall_anchor_time: datetime.datetime | None = None
         self._wall_anchor_samples = 0
+        # M8: running max of the per-chunk trigger ENVELOPE peak — the
+        # exact signal ``ingest_chunk`` compares against the threshold.
+        # Auto-calibrate polls this via ``consume_env_peak`` so the
+        # threshold is derived from the same statistic the trigger
+        # uses, not from |filtered| sampled at the UI tick rate.
+        self._env_peak_acc = -1.0
 
         # Freq mapping
         self.freq_map_idx_floor = None
@@ -384,6 +390,17 @@ class RecordingEntity:
         n = self.ingest_error_count
         self.ingest_error_count = 0
         return n
+
+    def consume_env_peak(self):
+        """M8: return the max trigger-envelope peak observed since the
+        last call and reset the accumulator; None when no chunk has
+        been ingested since. Called by the auto-calibrate timer — every
+        chunk contributes, unlike the old 100 ms sampling of
+        ``abs_amp_buffer`` which missed most chunks and measured
+        |filtered| instead of the envelope the trigger compares."""
+        p = self._env_peak_acc
+        self._env_peak_acc = -1.0
+        return p if p >= 0.0 else None
 
     def check_ingest_alive(self) -> None:
         """M3: latch a distinct error if acquisition claims to be
@@ -1009,6 +1026,12 @@ class RecordingEntity:
         else:
             filt_combined_env = _envelope(filt)
         amp_mask = filt_combined_env >= self.threshold
+
+        # M8: accumulate the envelope peak for auto-calibrate. Cheap
+        # scalar max; consumed (and reset) by ``consume_env_peak``.
+        env_peak = float(filt_combined_env.max()) if n else 0.0
+        if env_peak > self._env_peak_acc:
+            self._env_peak_acc = env_peak
 
         stm = self.spectral_trigger_mode
         # #14: spectral entropy is meaningless during FFT warm-up. Use

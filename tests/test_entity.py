@@ -257,7 +257,9 @@ def test_amp_display_helpers_linear_and_log():
     """Verify the conversion helpers used by the amp axis are consistent
     end-to-end: a value's display form (log) round-trips through the
     inverse to the original linear value (within tolerance)."""
-    from chirp.ui.window import (
+    # Phase C: the helpers live in the pyqtgraph config panel now — the
+    # matplotlib window copies were removed with the rest of that stack.
+    from chirp.ui.config_panel import (
         _amp_to_display, _thr_to_display, _display_to_thr,
     )
     # Linear is identity

@@ -53,6 +53,7 @@ preferable to crashing the audio pipeline.
 import datetime
 import os
 import queue
+import sys
 import threading
 import time
 
@@ -74,7 +75,15 @@ _last_log_at: dict[tuple[str, str], float] = {}
 
 
 def _path() -> str:
-    return os.path.join(os.getcwd(), _LOG_FILENAME)
+    # L5: in a frozen (PyInstaller) build the CWD of a shortcut-launched
+    # app is often system32 or the user profile — anchor the log next to
+    # the executable so the user can actually find it. Dev runs keep the
+    # CWD (the repo root when launched via ``python -m chirp``).
+    if getattr(sys, 'frozen', False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.getcwd()
+    return os.path.join(base, _LOG_FILENAME)
 
 
 def _ensure_writer() -> None:

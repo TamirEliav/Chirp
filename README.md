@@ -4,7 +4,7 @@
 
 Chirp is a desktop application for multi-stream audio monitoring, visualization, and threshold-triggered recording. It was designed with bioacoustics research in mind but works for any audio analysis task.
 
-![Version](https://img.shields.io/badge/Version-v3.1.0-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5%20%2B%20pyqtgraph-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
+![Version](https://img.shields.io/badge/Version-v3.2.0-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5%20%2B%20pyqtgraph-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 ---
 
@@ -105,6 +105,16 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - Swap the live capture for a WAV file (`WavFileCapture`) to feed a reproducible signal through the full pipeline — trigger, writer, spectrogram, entropy — for regression testing and offline analysis
 
 ---
+
+## What's New in v3.2.0
+
+The Phase-C cleanup release completing the v3.0 → v3.1 audit backlog.
+
+- **matplotlib fully removed from the rendering path** — the hidden legacy figure that was still being built and rebuilt on every sample-rate/channel/display change is gone (~1,100 lines deleted from the window code). pyqtgraph/OpenGL is the sole renderer; matplotlib remains only as the source of the inferno colormap table. Amp-zoom persistence across Config↔View switches now reads from the live pyqtgraph viewbox (it had silently read a hidden, never-shown axis since the v3.0 port).
+- **Busy cursor during device operations** — changing the input device, sample rate, channel mode, or WAV-simulation file shows a wait cursor for the duration of the multi-second rebuild instead of appearing frozen.
+- **Auto-calibrate accuracy** — calibration now accumulates the per-chunk *trigger envelope* peak on the DSP thread (every chunk contributes, same statistic the trigger compares) instead of sampling the display buffer every 100 ms, which missed most chunks and biased thresholds low.
+- **Collision-safe WAV publishing** — a filename collision at publish time gets a `_rNN` de-dup token instead of silently overwriting an earlier recording.
+- **Findable error log in packaged builds** — `chirp_errors.log` is written next to the executable in frozen builds instead of whatever working directory the shortcut supplied.
 
 ## What's New in v3.1.0
 

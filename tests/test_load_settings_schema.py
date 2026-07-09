@@ -66,8 +66,6 @@ def _make_window():
     # Methods invoked at end of load
     win._refresh_monitor_source_combo = MagicMock()
     win._load_params_from_entity = MagicMock()
-    win._setup_axes = MagicMock()
-    win._update_spec_yticks = MagicMock()
     win._refresh_transport_ui = MagicMock()
     win._setup_view_mode_axes = MagicMock()
     win._mark_clean = MagicMock()
