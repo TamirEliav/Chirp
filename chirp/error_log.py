@@ -30,6 +30,9 @@ Categories
                   (DSP / FFT / trigger). Logged every event.
 ``open``        — Capture failed to open the device or the WAV input
                   file. Logged every event.
+``capture_dead``— Live-device capture stopped delivering frames (RDP
+                  session change / device removal); also logs the
+                  matching auto-reconnect. Logged every event.
 ``wav_writer``  — Worker failed while writing a triggered WAV. Logged
                   every event; ``wav_path`` carries the target folder
                   so the user can see which output was affected.

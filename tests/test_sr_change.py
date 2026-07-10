@@ -29,8 +29,10 @@ The fix adds three belts:
     the WAV header is still labelled with the true capture rate.
   - ``_on_sample_rate_changed`` is gated by ``_sr_change_busy`` and
     disables the SR combo for the duration of the rebuild.
-  - When ``_chk_shared_spec`` is checked, every other entity is also
-    re-rated to the new SR (each via its own per-entity flush path).
+
+(The third belt — live-sync SR broadcast via ``_chk_shared_spec`` — was
+removed in v3.3.0 together with the sync checkboxes; bulk changes now go
+through Apply All / the all-streams table.)
 """
 
 from __future__ import annotations
@@ -164,8 +166,6 @@ def _make_window_for_sr_tests(n_entities: int, initial_sr: int = 44100):
     win._sb_disp_freq_lo    = MagicMock()
     win._sb_disp_freq_hi    = MagicMock()
     win._sb_disp_freq_hi.value = MagicMock(return_value=0)
-    win._chk_shared_spec    = MagicMock()
-    win._chk_shared_spec.isChecked = MagicMock(return_value=False)
     # Monitor stub
     win._monitor = MagicMock()
     win._monitor.source_id = None
@@ -203,62 +203,15 @@ def test_on_sr_change_is_reentrancy_safe():
     win._entities[0].change_sample_rate.assert_not_called()
 
 
-def test_on_sr_change_syncs_to_all_entities_when_shared():
-    """When sync-settings is on, every other entity must also get
-    change_sample_rate called with the new rate."""
+def test_on_sr_change_touches_only_selected_entity():
+    """4a (v3.3.0): the live-sync broadcast was removed with the sync
+    checkboxes — an SR change applies to the selected entity only.
+    Bulk changes go through Apply All / the all-streams table."""
     win = _make_window_for_sr_tests(n_entities=3, initial_sr=44100)
-    win._chk_shared_spec.isChecked = MagicMock(return_value=True)
-    win._sr_combo.currentData = MagicMock(return_value=22050)
-
-    win._on_sample_rate_changed(0)
-
-    # Every entity had change_sample_rate called.
-    for ent in win._entities:
-        ent.change_sample_rate.assert_called_once_with(22050)
-
-
-def test_on_sr_change_does_not_sync_when_not_shared():
-    """When sync-settings is off, only the selected entity changes."""
-    win = _make_window_for_sr_tests(n_entities=3, initial_sr=44100)
-    win._chk_shared_spec.isChecked = MagicMock(return_value=False)
     win._sr_combo.currentData = MagicMock(return_value=22050)
 
     win._on_sample_rate_changed(0)
 
     win._entities[0].change_sample_rate.assert_called_once_with(22050)
     win._entities[1].change_sample_rate.assert_not_called()
-    win._entities[2].change_sample_rate.assert_not_called()
-
-
-def test_on_sr_change_sync_failure_on_one_entity_does_not_abort_others():
-    """If entity #1 throws inside change_sample_rate, entity #2 must
-    still be re-rated — one device failure shouldn't leave the rest
-    of the session at mismatched SRs."""
-    win = _make_window_for_sr_tests(n_entities=3, initial_sr=44100)
-    win._chk_shared_spec.isChecked = MagicMock(return_value=True)
-    win._sr_combo.currentData = MagicMock(return_value=22050)
-    # Poison entity #1.
-    def _bad(sr): raise RuntimeError('simulated SR failure')
-    win._entities[1].change_sample_rate = MagicMock(side_effect=_bad)
-
-    # Must not propagate the exception.
-    win._on_sample_rate_changed(0)
-
-    # Entities #0 and #2 still changed.
-    win._entities[0].change_sample_rate.assert_called_once_with(22050)
-    win._entities[2].change_sample_rate.assert_called_once_with(22050)
-
-
-def test_on_sr_change_does_not_touch_entities_already_at_new_rate():
-    """If an entity is already at the target SR, sync must skip it
-    (avoid an unnecessary rebuild / flush)."""
-    win = _make_window_for_sr_tests(n_entities=3, initial_sr=44100)
-    win._entities[2].sample_rate = 48000  # already there
-    win._chk_shared_spec.isChecked = MagicMock(return_value=True)
-    win._sr_combo.currentData = MagicMock(return_value=48000)
-
-    win._on_sample_rate_changed(0)
-
-    win._entities[0].change_sample_rate.assert_called_once_with(48000)
-    win._entities[1].change_sample_rate.assert_called_once_with(48000)
     win._entities[2].change_sample_rate.assert_not_called()

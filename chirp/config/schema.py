@@ -33,7 +33,8 @@ CONFIG_SCHEMA_VERSION = 1
 # ``use_opengl`` (Phase 4) toggles GPU-accelerated view-mode rendering.
 # Added as an optional view_mode key; older files simply omit it and get
 # the default, so no schema version bump is needed.
-DEFAULT_VIEW_MODE = {"columns": 1, "panel_height": 300, "use_opengl": True}
+DEFAULT_VIEW_MODE = {"columns": 1, "panel_height": 300, "use_opengl": True,
+                     "active_only": True}
 
 
 # Set of top-level keys recognized by the loader. Anything else triggers
@@ -57,13 +58,16 @@ _KNOWN_RECORDING_KEYS: frozenset[str] = frozenset({
     "ref_date", "dph_folder_prefix",
     "amp_ylim", "amp_scale",
     "spectral_trigger_mode", "spectral_threshold",
+    # v3.3.0 additions — optional per-recording keys; older files simply
+    # omit them and get the defaults, so no schema-version bump.
+    "entropy_min_cross_sec", "rec_mode",
     "display_mode",
     "analysis_nperseg", "analysis_window",
     "input_source", "wav_file_path", "wav_loop",
 })
 
 _KNOWN_VIEW_MODE_KEYS: frozenset[str] = frozenset({
-    "columns", "panel_height", "use_opengl",
+    "columns", "panel_height", "use_opengl", "active_only",
 })
 
 
@@ -113,6 +117,7 @@ def build_settings_dict(entities: Iterable[RecordingEntity],
             "columns":      vm.get("columns", DEFAULT_VIEW_MODE["columns"]),
             "panel_height": vm.get("panel_height", DEFAULT_VIEW_MODE["panel_height"]),
             "use_opengl":   bool(vm.get("use_opengl", DEFAULT_VIEW_MODE["use_opengl"])),
+            "active_only":  bool(vm.get("active_only", DEFAULT_VIEW_MODE["active_only"])),
         },
         "recordings": [e.to_dict() for e in entities],
     }
@@ -149,6 +154,7 @@ def load_settings_dict(data: dict) -> tuple[list[RecordingEntity], dict, list[st
         "columns":      vm_raw.get("columns", DEFAULT_VIEW_MODE["columns"]),
         "panel_height": vm_raw.get("panel_height", DEFAULT_VIEW_MODE["panel_height"]),
         "use_opengl":   bool(vm_raw.get("use_opengl", DEFAULT_VIEW_MODE["use_opengl"])),
+        "active_only":  bool(vm_raw.get("active_only", DEFAULT_VIEW_MODE["active_only"])),
     }
 
     entities: list[RecordingEntity] = []

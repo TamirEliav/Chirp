@@ -46,9 +46,10 @@ def test_use_opengl_roundtrip_and_default():
 def test_empty_config_roundtrip():
     data = build_settings_dict([], view_mode={"columns": 3, "panel_height": 250})
     assert data["version"] == CONFIG_SCHEMA_VERSION
-    # use_opengl (Phase 4) defaults True when the caller doesn't set it.
+    # use_opengl (Phase 4) / active_only (v3.3.0) default True when the
+    # caller doesn't set them.
     assert data["view_mode"] == {"columns": 3, "panel_height": 250,
-                                 "use_opengl": True}
+                                 "use_opengl": True, "active_only": True}
     assert data["recordings"] == []
 
     # JSON round-trip should be lossless
@@ -57,7 +58,8 @@ def test_empty_config_roundtrip():
 
     entities, vm, warnings = load_settings_dict(decoded)
     assert entities == []
-    assert vm == {"columns": 3, "panel_height": 250, "use_opengl": True}
+    assert vm == {"columns": 3, "panel_height": 250, "use_opengl": True,
+                  "active_only": True}
     assert warnings == []
 
 

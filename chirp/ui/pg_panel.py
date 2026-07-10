@@ -24,7 +24,8 @@ import matplotlib
 import numpy as np
 import pyqtgraph as pg
 
-from chirp.constants import C, N_DISPLAY_ROWS, SPEC_DB_MAX, SPEC_DB_MIN
+from chirp.constants import (C, CHUNK_FRAMES, N_DISPLAY_ROWS, SPEC_DB_MAX,
+                             SPEC_DB_MIN)
 
 # Inferno LUT (256 RGB rows) built once from matplotlib's colormap so the
 # spectrogram matches the previous renderer's look. Applied on the GPU/Qt
@@ -75,6 +76,33 @@ def spec_ytick_key(e) -> tuple:
     mapping actually changes."""
     return (getattr(e, 'freq_scale', ''), getattr(e, 'display_freq_lo', 0.0),
             getattr(e, 'display_freq_hi', 0.0), getattr(e, 'sample_rate', 0))
+
+
+def events_rgba(e):
+    """2-row RGBA strip for the detect/record events display: row 0
+    (bottom) = detect mask, row 1 (top) = record mask, one column per
+    CHUNK_FRAMES block. Shared by the Config panel and the View-mode
+    tiles (moved here from config_panel in Phase 3 of v3.3.0).
+
+    uint8 RGBA — direct colour, so pyqtgraph needs no levels (a float
+    image without levels raises in ImageItem.render).
+    """
+    nc = e._n_cols
+    need = nc * CHUNK_FRAMES
+    if e.detect_mask_buffer.shape[0] < need:
+        return None
+    det = e.detect_mask_buffer[:need].reshape(nc, CHUNK_FRAMES).any(axis=1)
+    rec = e.record_mask_buffer[:need].reshape(nc, CHUNK_FRAMES).any(axis=1)
+    rgba = np.zeros((2, nc, 4), dtype=np.ubyte)
+    # Background (Catppuccin surface0) so empty cells aren't pure black.
+    rgba[..., 0] = 49
+    rgba[..., 1] = 50
+    rgba[..., 2] = 68
+    rgba[..., 3] = 255
+    # Row 0 = detect (yellow), row 1 = record (green).
+    rgba[0, det] = (249, 226, 175, 255)
+    rgba[1, rec] = (166, 227, 161, 255)
+    return rgba
 
 
 def _decimate_max(y: np.ndarray, max_cols: int) -> np.ndarray:
@@ -154,6 +182,21 @@ class StreamPlotPanel(pg.GraphicsLayoutWidget):
             self._wave_curve.setDownsampling(auto=True, method='peak')
             self._wave_curve.setClipToView(True)
 
+        # ── Detect/record events strip (Phase 3 / TODO#14) ─────────────
+        self._ev_plot = self.addPlot(row=2, col=0)
+        self._ev_plot.setMenuEnabled(False)
+        self._ev_plot.setMouseEnabled(x=False, y=False)
+        self._ev_plot.setMaximumHeight(46)
+        self._ev_plot.setXLink(self._spec_plot)
+        self._ev_plot.getAxis('left').setTicks(
+            [[(0.5, 'det'), (1.5, 'rec')]])
+        self._ev_plot.getAxis('bottom').setStyle(showValues=False)
+        self._events_img = pg.ImageItem()
+        self._ev_plot.addItem(self._events_img)
+        self._ev_cursor = pg.InfiniteLine(
+            angle=90, pen=pg.mkPen(C['red'], width=1))
+        self._ev_plot.addItem(self._ev_cursor)
+
         self._t_axis: np.ndarray | None = None
         self._t_len = 0
         self._ytick_key: tuple | None = None
@@ -196,6 +239,14 @@ class StreamPlotPanel(pg.GraphicsLayoutWidget):
         cursor_x = (e.write_head / e.sample_rate) % disp_secs
         self._spec_cursor.setValue(cursor_x)
         self._amp_cursor.setValue(cursor_x)
+        self._ev_cursor.setValue(cursor_x)
+
+        # Detect/record events strip.
+        rgba = events_rgba(e)
+        if rgba is not None:
+            self._events_img.setImage(rgba, autoLevels=False)
+            self._events_img.setRect(
+                pg.QtCore.QRectF(0.0, 0.0, disp_secs, 2.0))
 
         # Amplitude envelope — peak-decimated to display resolution
         # before the dB conversion (H3).

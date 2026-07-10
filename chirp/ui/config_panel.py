@@ -28,7 +28,7 @@ from PyQt5.QtWidgets import QMenu
 
 from chirp.constants import (AMP_DB_EPS, AMP_DB_MAX, AMP_DB_MIN, C,
                              CHUNK_FRAMES)
-from chirp.ui.pg_panel import spec_ytick_key, spec_ytick_list
+from chirp.ui.pg_panel import events_rgba, spec_ytick_key, spec_ytick_list
 
 _INFERNO_LUT = (
     matplotlib.colormaps['inferno'](np.linspace(0.0, 1.0, 256))[:, :3] * 255
@@ -261,10 +261,11 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
                 self._on_spec_thr_dragged)
             ent_p.addItem(self._spec_thr_line)
 
-        # Detect/record events strip.
-        ev_p = add_plot(height=44)
+        # Detect/record events strip. Taller than the old 44 px and with
+        # the 'det'/'rec' row labels the matplotlib version had (TODO#14).
+        ev_p = add_plot(height=80)
         ev_p.setLabel('left', 'Events')
-        ev_p.getAxis('left').setStyle(showValues=False)
+        ev_p.getAxis('left').setTicks([[(0.5, 'det'), (1.5, 'rec')]])
         ev_p.setLabel('bottom', 'Time', units='s')
         self._events_img = pg.ImageItem()
         ev_p.addItem(self._events_img)
@@ -406,28 +407,7 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
             self._entropy.setData(self._t_axis(nc, disp), e.entropy_buffer)
 
         if self._events_img is not None:
-            rgba = self._events_rgba(e)
+            rgba = events_rgba(e)
             if rgba is not None:
                 self._events_img.setImage(rgba, autoLevels=False)
                 self._events_img.setRect(pg.QtCore.QRectF(0.0, 0.0, disp, 2.0))
-
-    @staticmethod
-    def _events_rgba(e):
-        nc = e._n_cols
-        need = nc * CHUNK_FRAMES
-        if e.detect_mask_buffer.shape[0] < need:
-            return None
-        det = e.detect_mask_buffer[:need].reshape(nc, CHUNK_FRAMES).any(axis=1)
-        rec = e.record_mask_buffer[:need].reshape(nc, CHUNK_FRAMES).any(axis=1)
-        # uint8 RGBA — direct colour, so pyqtgraph needs no levels (a float
-        # image without levels raises in ImageItem.render).
-        rgba = np.zeros((2, nc, 4), dtype=np.ubyte)
-        # Background (Catppuccin surface0) so empty cells aren't pure black.
-        rgba[..., 0] = 49
-        rgba[..., 1] = 50
-        rgba[..., 2] = 68
-        rgba[..., 3] = 255
-        # Row 0 = detect (yellow), row 1 = record (green).
-        rgba[0, det] = (249, 226, 175, 255)
-        rgba[1, rec] = (166, 227, 161, 255)
-        return rgba

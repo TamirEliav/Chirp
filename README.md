@@ -4,7 +4,7 @@
 
 Chirp is a desktop application for multi-stream audio monitoring, visualization, and threshold-triggered recording. It was designed with bioacoustics research in mind but works for any audio analysis task.
 
-![Version](https://img.shields.io/badge/Version-v3.2.0-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5%20%2B%20pyqtgraph-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
+![Version](https://img.shields.io/badge/Version-v3.3.0-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5%20%2B%20pyqtgraph-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 ---
 
@@ -35,6 +35,9 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - Drag the threshold line directly on the amplitude plot
 - **Stereo channel selection** — trigger on Left Channel, Right Channel, Average, Any Channel, or Both Channels
 - **Auto-Calibrate** — automatically measure ambient noise and set threshold with configurable calibration duration and margin multiplier
+- **Force Trigger toggle** — press to open a recording segment immediately (pre-trigger lookback included), press again to close it on the spot; Max Rec splitting still applies
+- **Continuous recording mode** (per stream) — record everything while REC is on, rotating to a new file every Max Rec seconds; all other trigger parameters are ignored
+- **Entropy Min Duration** — a debounce for the spectral gate: entropy must stay below its threshold continuously for the configured time before the spectral condition turns ON
 - **Detect / record events strip** beneath the amplitude plot — a yellow row lights up for every sample the trigger condition is met, a green row for every sample being written to the WAV file. Derived from the same per-sample mask the state machine consumes (no parallel computation), so the strip is exact — including bandpass and spectral-entropy gating. Visible in both Config and View modes.
 
 ### Spectral Entropy Trigger
@@ -85,7 +88,7 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 
 ### Two Display Modes
 - **Config Mode** — full control panel for adjusting all parameters
-- **View Mode** — distraction-free monitoring of all streams in a grid, with adjustable **columns**, per-tile **height**, and a **Fit to screen** button that sizes the tiles so every stream is visible without scrolling. Off-screen tiles are skipped while rendering, and the frame rate adapts under load so audio capture always takes priority.
+- **View Mode** — distraction-free monitoring of all streams in a grid, with adjustable **columns**, per-tile **height**, and a **Fit to screen** button that sizes the tiles so every stream is visible without scrolling. Each tile carries a header with the stream name, **acq/rec/trig status dots**, and the sticky **S / D / !** badges (click to clear) — plus the detect/record **events strip** under the amplitude plot. An **"Active only"** toggle hides idle streams. Off-screen tiles are skipped while rendering, and the frame rate adapts under load so audio capture always takes priority.
 
 ### Theme
 - **Catppuccin Mocha** dark theme with teal and peach accent colors
@@ -95,16 +98,33 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - **Load** restores complete configurations (also reads legacy `.chirp` files)
 - All parameters preserved including device names, sample rates, trigger settings, and display options
 
-### Sync Controls
-- Optionally synchronize threshold, spectrogram settings, frequency range, and sample rate across all streams
+### Bulk Editing
+- **Apply All Settings** — one-shot copy of every setting from the selected stream to all others
+- **All-Streams Table** — an editable side-by-side table of every parameter of every stream (double-click a cell to edit; structural params like device and sample rate are shown read-only)
 
 ### Audio Monitor Loopback
-- Per-stream monitor toggle routes raw audio to a shared output device for live listening
+- Per-stream monitor routes raw audio to a shared output device for live listening
+- **Enable/disable toggle** that remembers the source and output selections — unmute restores the exact same routing
+- **Follow-selection mode** — the monitor automatically re-targets to the stream selected in the sidebar (Config mode) or the tile clicked in the grid (View mode); the monitored tile shows a 🎧 marker
 
 ### WAV File Replay (Testing)
 - Swap the live capture for a WAV file (`WavFileCapture`) to feed a reproducible signal through the full pipeline — trigger, writer, spectrogram, entropy — for regression testing and offline analysis
 
 ---
+
+## What's New in v3.3.0
+
+A feature round driven by field use, plus two bug fixes.
+
+- **Continuous recording mode** (per stream) — record everything while REC is on; the existing Max-Rec force-split machinery rotates files (`part01`, `part02`, …) with no gaps and bounded RAM (streaming writes).
+- **Force Trigger toggle** — manually open/close a recording segment while REC is armed; the open includes the pre-trigger lookback, the close is immediate (no hold/post tail).
+- **Entropy Min Duration** — debounce for the spectral trigger: entropy must stay below threshold continuously for N seconds before the spectral gate opens; brief tonal blips no longer trigger.
+- **Remote Desktop resilience** — a capture watchdog detects a stream that stopped delivering frames (RDP session changes tear down Windows audio endpoints), flushes in-flight events safely, and auto-reconnects the device by name until it returns; recording re-arms automatically. The manual gains a "Recording over Remote Desktop" section with the client/GPO settings that prevent the disruption in the first place.
+- **View-mode parity** — per-tile headers with status dots and the sticky S/D/! badges (click to clear), the detect/record events strip in every tile, an "Active only" filter (persisted), and a 🎧 marker on the monitored stream.
+- **All-Streams Table** — an editable side-by-side table of every parameter of every stream; replaces the removed live-sync checkboxes ("Apply All Settings" remains for one-shot copying).
+- **Monitor upgrades** — enable/disable toggle that remembers the routing, and a follow-selection mode (sidebar selection or view-tile click re-targets the monitor).
+- **Fixes** — spectrogram frequencies after a sample-rate change (stale FFT overlap contaminated the first columns; the display range now follows the new Nyquist), taller events strip with `det`/`rec` labels in Config mode, Save button disabled when there's nothing to save.
+- **App icon** — Chirp finally has one (generated by `scripts/make_icon.py`; wired into the window and the PyInstaller build via `--icon assets/chirp.ico --add-data "assets;assets"`).
 
 ## What's New in v3.2.0
 

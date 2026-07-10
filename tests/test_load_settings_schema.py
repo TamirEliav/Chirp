@@ -62,6 +62,7 @@ def _make_window():
     win._vm_panel_height = 300
     win._vm_cols_spin = MagicMock()
     win._vm_height_spin = MagicMock()
+    win._chk_vm_active_only = MagicMock()
 
     # Methods invoked at end of load
     win._refresh_monitor_source_combo = MagicMock()

@@ -61,6 +61,29 @@ def host_api_name(device_info: dict) -> str:
     return ''
 
 
+def refresh_portaudio() -> bool:
+    """Re-initialize PortAudio so its cached device list reflects the
+    current Windows audio endpoints (TODO#1 / RDP recovery).
+
+    An RDP connect/disconnect can remove or re-route WASAPI endpoints;
+    PortAudio only enumerates devices at initialization, so a vanished
+    device can never be found again without this. DANGER: terminating
+    PortAudio kills every open stream — the caller must ensure no
+    healthy live stream exists before calling. Returns True on success.
+    """
+    try:
+        sd._terminate()
+        sd._initialize()
+        return True
+    except Exception as exc:
+        print(f'[devices] PortAudio refresh failed: {exc}')
+        try:
+            sd._initialize()
+        except Exception:
+            pass
+        return False
+
+
 def _strip_bracket_suffix(name: str) -> str:
     """Return the portion of *name* before the first `[`, stripped."""
     return name.split('[')[0].strip()

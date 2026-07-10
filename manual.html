@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Chirp v3.2.0 — User Manual</title>
+<title>Chirp v3.3.0 — User Manual</title>
 <style>
   :root {
     --base: #1e1e2e;
@@ -304,7 +304,7 @@
 <nav class="sidebar">
   <div class="logo">
     <h1>Chirp</h1>
-    <span>User Manual &mdash; v3.2.0</span>
+    <span>User Manual &mdash; v3.3.0</span>
   </div>
   <ul>
     <li><a href="#overview">Overview</a></li>
@@ -350,6 +350,7 @@
     <li><a href="#view-mode">View Mode</a></li>
     <li><a href="#settings-mgmt">Settings Management</a></li>
     <li><a href="#error-log">Error Logging</a></li>
+    <li><a href="#rdp">Remote Desktop (RDP)</a></li>
     <li><a href="#interactions">Mouse &amp; Keyboard</a></li>
     <li><a href="#tips">Tips &amp; Best Practices</a></li>
   </ul>
@@ -364,7 +365,7 @@
 <header class="hero">
   <h1>Chirp</h1>
   <p class="subtitle">Real-Time Audio Monitoring, Visualization &amp; Triggered Recording</p>
-  <span class="version">v3.2.0</span>
+  <span class="version">v3.3.0</span>
 </header>
 
 <!-- ── 1. Overview ── -->
@@ -696,6 +697,26 @@ python chirp.py</code></pre>
     </div>
   </details>
 
+  <h3 id="rec-modes">Recording Modes &amp; Force Trigger <em>(v3.3.0)</em></h3>
+  <p>
+    The <strong>Rec Mode</strong> selector at the top of the Trigger panel picks how recording is
+    driven, per stream:
+  </p>
+  <ul>
+    <li><strong>Triggered</strong> (default) &mdash; the threshold state machine described above.</li>
+    <li><strong>Continuous</strong> &mdash; while REC is on, everything is recorded: a file opens on
+      the first sample after <em>Start Rec</em> and a new file starts every <strong>Max Rec</strong>
+      seconds (named <code>part01</code>, <code>part02</code>, &hellip; with no gap between them).
+      All other trigger parameters are ignored and greyed out. Memory stays flat regardless of
+      duration &mdash; audio streams to disk as it arrives.</li>
+  </ul>
+  <p>
+    In Triggered mode, the <strong>&#9679; Force Trigger</strong> button (enabled while REC is on)
+    manually opens a recording segment <em>right now</em> &mdash; including the configured
+    pre-trigger lookback &mdash; and pressing it again closes the segment immediately, with no hold
+    or post-trigger tail. Max&nbsp;Rec splitting applies to forced segments too.
+  </p>
+
   <h3 id="output-files">Output Files</h3>
   <p>Recordings are saved as uncompressed WAV files (PCM 16-bit) with the following naming pattern:</p>
   <pre><code>&lt;prefix&gt;_&lt;epochMs&gt;_YYYYMMDD_HHMMSS_mmm_&lt;suffix&gt;.wav</code></pre>
@@ -745,6 +766,16 @@ python chirp.py</code></pre>
     reduce false triggers. Broadband noise has high entropy and will not satisfy the spectral
     condition.
   </div>
+
+  <h3 id="entropy-min-dur">Entropy Min Duration <em>(v3.3.0)</em></h3>
+  <p>
+    The <strong>Entropy Min Dur</strong> parameter debounces the spectral gate: entropy must stay
+    below the threshold <em>continuously</em> for at least this long (evaluated per FFT chunk,
+    &asymp;23&nbsp;ms at 44.1&nbsp;kHz) before the spectral condition turns ON. It turns OFF again
+    on the first chunk back above the threshold. This filters out momentary tonal blips without
+    touching the amplitude <em>Min Cross</em>, which still applies to the combined detection mask.
+    Set to <code>0</code> for the instantaneous (pre-v3.3) behavior.
+  </p>
 
   <h3 id="entropy-plot">Entropy Trace Plot</h3>
   <p>
@@ -845,14 +876,18 @@ python chirp.py</code></pre>
     <li>Each cell shows a compact spectrogram or waveform, amplitude plot, threshold line,
         detect / record events strip (v2.1), and status text.</li>
     <li>The sidebar and configuration panels are hidden to maximize display area.</li>
-    <li><strong>Sticky health badges</strong> (v2.1) are overlaid on each tile:
-      <span style="color:var(--red); font-weight:bold">SAT</span> lights up if the stream has ever
-      clipped, and <span style="color:var(--red); font-weight:bold">DROP&times;N</span> lights up if
-      the capture has ever dropped chunks (with the session-total count). Since view mode hides the
-      sidebar, these overlays are how you spot health problems while monitoring; clearing them is
-      done from config mode by clicking the sidebar
-      <span style="color:var(--red); font-weight:bold">S</span> /
-      <span style="color:var(--red); font-weight:bold">D</span> badges.</li>
+    <li><strong>Per-tile header</strong> (v3.3.0): each tile shows the stream name,
+      <strong>acq / rec / trig status dots</strong> (blue / green / red — same vocabulary as the
+      sidebar), and the sticky health badges
+      <span style="color:var(--red); font-weight:bold">S</span> (saturation),
+      <span style="color:var(--red); font-weight:bold">D</span> (dropped chunks) and
+      <span style="color:var(--peach); font-weight:bold">!</span> (pipeline errors) — hover for
+      details, <strong>click a lit badge to clear it</strong> right from the grid. A
+      &#127911; marker shows which stream feeds the audio monitor.</li>
+    <li>Each tile also includes the <strong>detect / record events strip</strong> (yellow = trigger
+      condition met, green = written to WAV), so trigger activity is visible while monitoring.</li>
+    <li><strong>Active only</strong> (v3.3.0): a toolbar checkbox that hides streams whose
+      acquisition is stopped. The setting is saved with the configuration.</li>
     <li>Per-tile <strong>Height</strong> is adjustable, or click <strong>Fit to screen</strong> to
         size every tile so all streams are visible at once without scrolling (based on the current
         column count).</li>
@@ -887,6 +922,25 @@ python chirp.py</code></pre>
     When loading a configuration, Chirp resolves audio devices by name. If an exact match is not
     found, it attempts a partial string match. This allows configurations to be portable across
     systems where devices may have slightly different names.
+  </p>
+  <h3 id="config-table">All-Streams Table <em>(v3.3.0)</em></h3>
+  <p>
+    The <strong>All Streams Table&hellip;</strong> button (next to <em>Apply All Settings</em>)
+    opens a side-by-side table of every parameter of every stream — rows are parameters, columns
+    are streams. <strong>Double-click a cell to edit</strong>; the change applies to that stream
+    immediately, exactly as if you had edited it in the per-stream panel. Choice-valued rows list
+    their allowed values in the tooltip; invalid input reverts. Structural parameters (device,
+    sample rate, channel mode, input source) are shown read-only — change those from the Settings
+    panel. This replaces the live-sync checkboxes from earlier versions; for one-shot copying of
+    everything from one stream to all others, use <em>Apply All Settings</em>.
+  </p>
+  <h3 id="monitor-controls">Audio Monitor Controls <em>(v3.3.0)</em></h3>
+  <p>
+    The monitor bar gained a <strong>&#128266; enable/disable toggle</strong> — muting closes the
+    output stream but keeps both the source and output device selections, so re-enabling restores
+    the exact same routing. The <strong>Follow</strong> checkbox makes the monitor track your
+    selection: selecting a stream in the sidebar (Config mode) or clicking a tile (View mode)
+    routes that stream to the speakers.
   </p>
   <h3>Reference Date &amp; Subfolder Naming</h3>
   <p>
@@ -995,6 +1049,54 @@ python chirp.py</code></pre>
   </div>
 </section>
 
+<!-- ── Recording over Remote Desktop ── -->
+<section id="rdp">
+  <h2>Recording over Remote Desktop (RDP)</h2>
+  <p>
+    Connecting to (or disconnecting from) the recording machine via Windows Remote Desktop can
+    interrupt an ongoing recording: RDP's <em>audio redirection</em> tears down or re-routes the
+    host's audio endpoints when the session state changes, which silently kills the open capture
+    streams. Chirp defends against this in two layers &mdash; but the best fix is to prevent the
+    redirection in the first place.
+  </p>
+
+  <h3>Prevention (recommended)</h3>
+  <p>On the machine you connect <em>from</em>, in the Remote Desktop client (<code>mstsc</code>):</p>
+  <ul>
+    <li>Open <strong>Show Options &rarr; Local Resources &rarr; Remote audio &rarr; Settings&hellip;</strong></li>
+    <li>Set <strong>Remote audio playback</strong> to <strong>&ldquo;Play on remote computer&rdquo;</strong>.</li>
+    <li>Set <strong>Remote audio recording</strong> to <strong>&ldquo;Do not record&rdquo;</strong>.</li>
+  </ul>
+  <p>
+    Alternatively (and more robustly, since it works regardless of the client's settings), disable
+    audio redirection on the <em>recording host</em> via Group Policy (<code>gpedit.msc</code>):
+    <em>Computer Configuration &rarr; Administrative Templates &rarr; Windows Components &rarr;
+    Remote Desktop Services &rarr; Remote Desktop Session Host &rarr; Device and Resource
+    Redirection</em> &mdash; set <strong>&ldquo;Allow audio recording redirection&rdquo;</strong> to
+    <strong>Disabled</strong> (registry equivalent: <code>fDisableAudioCapture=1</code> under
+    <code>HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services</code>). Consider also
+    disabling &ldquo;Allow audio and video playback redirection&rdquo; if you don't need remote
+    playback.
+  </p>
+
+  <h3>Auto-reconnect watchdog (built in)</h3>
+  <p>
+    Even with redirection disabled, Windows may briefly bounce audio endpoints on a session
+    switch. Chirp watches every live-device stream: if a capture stops delivering frames for
+    ~2&nbsp;seconds while acquisition is running, it is declared dead &mdash; in-flight trigger
+    events are flushed to disk first, then Chirp re-resolves the device <em>by name</em> and
+    reopens it, retrying every few seconds until the device returns. Recording re-arms
+    automatically. The stream's <span class="badge">!</span> badge latches and
+    <code>chirp_errors.log</code> gets <code>capture_dead</code> entries for both the outage and
+    the reconnect, so the gap is always visible after the fact.
+  </p>
+  <div class="callout warn">
+    <strong>Note:</strong> samples that arrive while the device is gone are lost at the OS level
+    &mdash; the watchdog bounds the gap, it cannot eliminate it. For gap-free operation use the
+    prevention settings above.
+  </div>
+</section>
+
 <!-- ── 12. Mouse & Keyboard ── -->
 <section id="interactions">
   <h2>Mouse &amp; Keyboard Interactions</h2>
@@ -1096,7 +1198,7 @@ python chirp.py</code></pre>
 
 <!-- Footer -->
 <footer style="margin-top:3rem; padding-top:1.5rem; border-top:1px solid var(--surface0); text-align:center; color:var(--overlay0); font-size:0.82rem;">
-  <p>Chirp v3.2.0 &mdash; User Manual</p>
+  <p>Chirp v3.3.0 &mdash; User Manual</p>
   <p>Designed for bioacoustics research. Built with Python, PyQt5, and pyqtgraph.</p>
 </footer>
 

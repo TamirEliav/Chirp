@@ -21,6 +21,8 @@ import threading
 import numpy as np
 import sounddevice as sd
 
+import time
+
 from chirp.audio import AudioCapture, WavFileCapture
 from chirp.audio.devices import find_device_by_name, host_api_name
 from chirp.audio.ringbuffer import AudioRing
@@ -115,12 +117,27 @@ class RecordingEntity:
         self.freq_filter_enabled = False
         self.freq_lo       = DEFAULT_FREQ_LO
         self.freq_hi       = DEFAULT_FREQ_HI
+        # 2a: 'Triggered' (threshold state machine) or 'Continuous'
+        # (record everything while REC is on; a new file every
+        # max_rec_sec via the force-split machinery). Persisted.
+        self.rec_mode      = 'Triggered'
+        # 2b: force-trigger toggle. While True the detection mask is
+        # all-True (manual segment); toggling off requests an immediate
+        # flush, consumed on the ingest thread.
+        self.force_rec_active     = False
+        self._force_stop_requested = False
 
         # Spectral trigger params
         self.spectral_trigger_mode = 'Amplitude Only'  # 'Amplitude Only', 'Spectral Only', 'Amp AND Spectral', 'Amp OR Spectral'
         self.spectral_threshold    = 0.5                # entropy threshold (trigger when below)
         self.spectral_entropy      = 1.0                # current entropy value (display only)
         self.spectral_entropy_r    = 1.0                # right channel entropy (stereo)
+        # 2c: entropy debounce — the spectral gate turns ON only after
+        # entropy has stayed below the threshold continuously for this
+        # long (seconds, chunk granularity); OFF immediately on a chunk
+        # above threshold. 0 = instantaneous (legacy behavior).
+        self.entropy_min_cross_sec = 0.0
+        self._entropy_below_sec    = 0.0   # running consecutive-below time
 
         # Spectrogram display
         self.spec_nperseg = SPECTROGRAM_NPERSEG
@@ -234,6 +251,16 @@ class RecordingEntity:
         # threshold is derived from the same statistic the trigger
         # uses, not from |filtered| sampled at the UI tick rate.
         self._env_peak_acc = -1.0
+        # TODO#1 (RDP): capture-stall watchdog state. ``device_name_hint``
+        # / ``device_hostapi_hint`` are stamped whenever a live-device
+        # capture opens, so recovery can re-resolve the device by NAME —
+        # PortAudio indices shift when Windows audio endpoints churn.
+        self.device_name_hint    = ''
+        self.device_hostapi_hint = ''
+        self.capture_stalled     = False   # latched by check_capture_stalled
+        self._stall_wt           = -1      # last observed ring write_total
+        self._stall_wt_t         = 0.0     # monotonic time of last advance
+        self.recovery_count      = 0       # successful auto-reconnects
 
         # Freq mapping
         self.freq_map_idx_floor = None
@@ -402,6 +429,90 @@ class RecordingEntity:
         self._env_peak_acc = -1.0
         return p if p >= 0.0 else None
 
+    # ── TODO#1 (RDP): capture-stall watchdog ──────────────────────────
+
+    #: Seconds without a single new frame from the PortAudio callback
+    #: before the capture is declared dead. Callbacks fire every ~23 ms
+    #: (1024 frames @ 44.1 kHz), so 2 s is far beyond any scheduler
+    #: hiccup while still reacting quickly to an RDP endpoint churn.
+    CAPTURE_STALL_SECONDS = 2.0
+
+    def check_capture_stalled(self) -> bool:
+        """Return True when acquisition claims to run on a live device
+        but the PortAudio callback has stopped delivering frames (the
+        RDP connect/disconnect signature — Windows tore down or
+        re-routed the audio endpoint). Latches ``capture_stalled`` and
+        the sticky error badge on first detection. Polled per UI tick.
+        """
+        if (not self.acq_running or self.input_source != 'device'
+                or self.ring is None):
+            self._stall_wt = -1
+            return self.capture_stalled
+        wt = self.ring.write_total
+        now = time.monotonic()
+        if wt != self._stall_wt:
+            self._stall_wt = wt
+            self._stall_wt_t = now
+            return self.capture_stalled
+        if (not self.capture_stalled
+                and now - self._stall_wt_t >= self.CAPTURE_STALL_SECONDS):
+            self.capture_stalled = True
+            self.has_ever_ingest_errored = True
+            self.last_ingest_error = (
+                'audio device stopped delivering samples (device lost / '
+                'RDP session change?) — attempting reconnect')
+            print(f'[Chirp] {self.name}: capture stalled — no frames for '
+                  f'{self.CAPTURE_STALL_SECONDS:.0f}s; starting recovery')
+            _err_log('capture_dead', self.name,
+                     f'no frames for {self.CAPTURE_STALL_SECONDS:.0f}s — '
+                     f'device lost (RDP session change?); auto-reconnect '
+                     f'engaged')
+        return self.capture_stalled
+
+    def attempt_capture_recovery(self) -> bool:
+        """One auto-reconnect attempt for a stalled live-device capture
+        (throttled by the caller). Flushes in-flight events, closes the
+        dead stream, re-resolves the device BY NAME, reopens, and
+        restarts acquisition. ``rec_enabled`` is preserved so recording
+        resumes automatically. Returns True on success."""
+        if not self.capture_stalled:
+            return True
+        was_rec = self.rec_enabled
+        # Tear down the dead pipeline. acq_running must go False so
+        # start_acq will rearm (and so the watchdog stays quiet while
+        # we work).
+        self.acq_running = False
+        self._stop_ingest_and_flush(reason='capture_recovery')
+        try:
+            self.capture.close()
+        except Exception:
+            pass
+        # Re-resolve by name — indices shift when endpoints churn.
+        dev_id = self.device_id
+        if self.device_name_hint:
+            resolved, _warn = find_device_by_name(
+                self.device_name_hint, self.device_hostapi_hint)
+            if resolved is not None:
+                dev_id = resolved
+        self.device_id = dev_id
+        need_ch = 2 if self.channel_mode != 'Mono' else 1
+        self.capture = self._make_capture(channels=need_ch)
+        if not self.capture.valid:
+            return False   # stays stalled; caller retries later
+        self.rec_enabled = was_rec
+        self.start_acq()
+        self.capture_stalled = False
+        self._stall_wt = -1
+        self.recovery_count += 1
+        self.last_ingest_error = (
+            f'audio device reconnected (auto-recovery #{self.recovery_count}'
+            f') — samples during the outage were lost')
+        print(f'[Chirp] {self.name}: capture recovered '
+              f'(#{self.recovery_count})')
+        _err_log('capture_dead', self.name,
+                 f'device reconnected (auto-recovery #{self.recovery_count})')
+        return True
+
     def check_ingest_alive(self) -> None:
         """M3: latch a distinct error if acquisition claims to be
         running but the ingest thread is dead (a BaseException escaped
@@ -542,6 +653,16 @@ class RecordingEntity:
             cap = AudioCapture(self.ring, device=self.device_id,
                                channels=channels, samplerate=self.sample_rate,
                                name=self.name)
+            # TODO#1: remember the device NAME so the RDP-recovery
+            # watchdog can re-resolve it after an endpoint churn
+            # (PortAudio indices are not stable across churn).
+            try:
+                if self.device_id is not None:
+                    info = sd.query_devices(self.device_id)
+                    self.device_name_hint    = info.get('name', '') or ''
+                    self.device_hostapi_hint = host_api_name(info)
+            except Exception:
+                pass
         # Re-wire the monitor on every new capture so a device / SR /
         # WAV-file switch doesn't silently drop the loopback (#7).
         if self._monitor is not None:
@@ -686,10 +807,22 @@ class RecordingEntity:
         self.capture.close()
         self.ring.drain_unread()
 
+        # TODO#7: display range follows the Nyquist. If the user had the
+        # high limit AT the old Nyquist (the default full-range view),
+        # follow the new Nyquist in both directions; a user-narrowed
+        # range is preserved and only clamped down when it would exceed
+        # the new Nyquist.
+        old_nyq = float(self.sample_rate // 2)
+        new_nyq = float(new_rate // 2)
+        was_full_range = self.display_freq_hi >= old_nyq - 1.0
+
         self.sample_rate = new_rate
         self._n_cols        = max(1, int(self.display_seconds * new_rate / CHUNK_FRAMES))
         self._total_samples = self._n_cols * CHUNK_FRAMES
-        self.display_freq_hi = min(self.display_freq_hi, float(new_rate // 2))
+        if was_full_range:
+            self.display_freq_hi = new_nyq
+        else:
+            self.display_freq_hi = min(self.display_freq_hi, new_nyq)
 
         # Rebuild buffers
         self.amp_buffer       = np.zeros(self._total_samples, dtype=np.float32)
@@ -710,6 +843,18 @@ class RecordingEntity:
         # Rebuild filters and capture
         self.bpf   = BandpassFilter(sample_rate=new_rate)
         self.bpf_r = BandpassFilter(sample_rate=new_rate)
+        # TODO#7: reset the FFT accumulators — their 4096-sample overlap
+        # still holds OLD-rate audio. Without this, the first columns
+        # after an SR change mix old samples into the new-rate FFT: the
+        # spectrogram briefly shows the previous signal at wrongly
+        # scaled frequencies, and the spectral trigger evaluates that
+        # garbage as if primed.
+        self.spec_acc.reset()
+        self.spec_acc_r.reset()
+        if self._analysis_acc is not None:
+            self._analysis_acc.reset()
+        if self._analysis_acc_r is not None:
+            self._analysis_acc_r.reset()
         need_ch = 2 if self.channel_mode != 'Mono' else 1
         self.capture = self._make_capture(channels=need_ch)
         self.rebuild_freq_mapping()
@@ -861,6 +1006,28 @@ class RecordingEntity:
 
     def stop_rec(self):
         self.rec_enabled = False
+        # 2b: a manual segment can't outlive REC — the disable-flush in
+        # the recorder closes it on the next chunk.
+        self.force_rec_active = False
+
+    def set_force_trigger(self, active: bool) -> None:
+        """2b: toggle the manual force-trigger segment.
+
+        ON: the detection mask becomes all-True from the next chunk —
+        an event opens immediately (with pre-trigger lookback) and Max
+        Rec splitting applies as usual. OFF: requests an immediate
+        flush, consumed on the ingest thread — the segment ends with no
+        hold / post-trigger tail. Only meaningful while REC is enabled.
+        """
+        active = bool(active)
+        if active == self.force_rec_active:
+            return
+        if active:
+            self.force_rec_active = True
+            self._force_stop_requested = False
+        else:
+            self.force_rec_active = False
+            self._force_stop_requested = True
 
     # ── Chunk ingestion ───────────────────────────────────────────────────
 
@@ -875,6 +1042,14 @@ class RecordingEntity:
             self._ingest_chunk_locked(raw_chunk)
 
     def _ingest_chunk_locked(self, raw_chunk: np.ndarray):
+        # 2b: force-trigger toggled OFF — flush the manual segment
+        # immediately (no hold / post-trigger tail). Consumed here, on
+        # the ingest thread, so the recorder is never touched from the
+        # GUI thread.
+        if self._force_stop_requested:
+            self._force_stop_requested = False
+            self._flush_active_events(reason='force_trigger_stop')
+
         mode = self.channel_mode
         if raw_chunk.ndim == 2:
             left  = raw_chunk[:, 0]
@@ -1039,6 +1214,17 @@ class RecordingEntity:
         # the display accumulator (#12 / c19).
         spec_primed = self.analysis_acc.primed and (
             mode != 'Stereo' or self.analysis_acc_r.primed)
+        # 2c: entropy debounce — track how long entropy has stayed
+        # continuously below the threshold (chunk granularity). The
+        # spectral gate only turns ON once that reaches
+        # ``entropy_min_cross_sec`` (0 = instantaneous, legacy) and
+        # turns OFF on the first chunk back above threshold.
+        if not spec_primed:
+            self._entropy_below_sec = 0.0
+        elif entropy < self.spectral_threshold:
+            self._entropy_below_sec += n / self.sample_rate
+        else:
+            self._entropy_below_sec = 0.0
         if stm == 'Amplitude Only':
             trigger_mask = amp_mask
         elif not spec_primed:
@@ -1049,7 +1235,9 @@ class RecordingEntity:
             else:  # 'Amp OR Spectral'
                 trigger_mask = amp_mask
         else:
-            spec_triggered = bool(entropy < self.spectral_threshold)
+            spec_triggered = (
+                self._entropy_below_sec > 0.0
+                and self._entropy_below_sec >= self.entropy_min_cross_sec)
             if stm == 'Spectral Only':
                 trigger_mask = np.full(n, spec_triggered, dtype=bool)
             elif stm == 'Amp AND Spectral':
@@ -1060,6 +1248,13 @@ class RecordingEntity:
                 trigger_mask = (np.ones(n, dtype=bool)
                                 if spec_triggered
                                 else amp_mask)
+
+        # 2a / 2b: continuous mode and the force-trigger toggle override
+        # detection entirely — the mask (and therefore the detect strip
+        # and the recorder walk) is all-True while active.
+        continuous = (self.rec_mode == 'Continuous' and self.rec_enabled)
+        if continuous or self.force_rec_active:
+            trigger_mask = np.ones(n, dtype=bool)
 
         # Write amplitude buffers (filtered when band filter active)
         if mode == 'Stereo':
@@ -1129,15 +1324,27 @@ class RecordingEntity:
                 seconds=(self._samples_total - self._wall_anchor_samples)
                 / self.sample_rate)
 
+        # 2a / 2b: effective open-gating params. Continuous mode records
+        # from the first sample after Start Rec (no qualification run,
+        # no lookback); a forced segment opens immediately but keeps the
+        # user's pre-trigger lookback.
+        eff_min_cross = self.min_cross_sec
+        eff_pre_trig  = self.pre_trig_sec
+        if continuous:
+            eff_min_cross = 0.0
+            eff_pre_trig  = 0.0
+        elif self.force_rec_active:
+            eff_min_cross = 0.0
+
         report = self.recorder.process_chunk(
             record,
             trigger_peak  = trigger_peak,
             threshold     = self.threshold,
-            min_cross_sec = self.min_cross_sec,
+            min_cross_sec = eff_min_cross,
             hold_sec      = self.hold_sec,
             post_trig_sec = self.post_trig_sec,
             max_rec_sec   = self.max_rec_sec,
-            pre_trig_sec  = self.pre_trig_sec,
+            pre_trig_sec  = eff_pre_trig,
             output_dir    = out_dir,
             enabled       = self.rec_enabled,
             filename_prefix = self.filename_prefix,
@@ -1272,6 +1479,8 @@ class RecordingEntity:
             'amp_scale':           self.amp_scale,
             'spectral_trigger_mode': self.spectral_trigger_mode,
             'spectral_threshold':    self.spectral_threshold,
+            'entropy_min_cross_sec': self.entropy_min_cross_sec,
+            'rec_mode':            self.rec_mode,
             'display_mode':        self.display_mode,
             'analysis_nperseg':    self.analysis_nperseg,
             'analysis_window':     self.analysis_window,
@@ -1304,6 +1513,7 @@ class RecordingEntity:
                      'output_dir', 'filename_prefix', 'filename_suffix',
                      'dph_folder_prefix', 'amp_ylim', 'amp_scale',
                      'spectral_trigger_mode', 'spectral_threshold',
+                     'entropy_min_cross_sec', 'rec_mode',
                      'display_mode',
                      'input_source', 'wav_file_path', 'wav_loop'):
             if attr in d:

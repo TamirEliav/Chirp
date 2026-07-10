@@ -78,6 +78,9 @@ class ChirpWindow(QMainWindow):
         # headless tests via ``_pg_use_opengl``.
         self._pg_grid = None
         self._pg_use_opengl = True
+        # 3c: view-mode 'Active only' filter (persisted in view_mode).
+        self._vm_active_only = True
+        self._vm_visible_sig: tuple = ()
         # Phase 4 audio-priority: adaptively skip view-mode render frames
         # when a render costs more than ~half a tick, so DSP / capture
         # threads keep the GIL and audio never drops. EMA of view render
@@ -99,6 +102,9 @@ class ChirpWindow(QMainWindow):
         # per tick) — get_mini_amplitude is a full-buffer reduction and
         # N streams × 20 Hz of it is pure GIL burn for a 30px preview.
         self._mini_amp_rr = 0
+        # TODO#1 (RDP): capture-recovery throttle state.
+        self._recovery_last_attempt = 0.0
+        self._recovery_needs_refresh = False
 
         # #7: shared audio-monitor loopback. One output stream; each
         # RecordingEntity is wired into it in `_add_recording` and the
@@ -131,12 +137,20 @@ class ChirpWindow(QMainWindow):
             self._config_dirty = True
             self._update_title()
             self._update_save_tooltip()
+            self._update_save_button()
 
     def _mark_clean(self):
         """Reset dirty flag after a successful save or load."""
         self._config_dirty = False
         self._update_title()
         self._update_save_tooltip()
+        self._update_save_button()
+
+    def _update_save_button(self):
+        """4c (TODO#12): Save is enabled only when there are unsaved
+        changes (Save As stays always available)."""
+        if hasattr(self, '_btn_save'):
+            self._btn_save.setEnabled(self._config_dirty)
 
     def _update_title(self):
         base = f'Chirp v{__version__} — Triggered Sound Recording'
@@ -166,13 +180,19 @@ class ChirpWindow(QMainWindow):
         (PortAudio open, buffer rebuild, 10 s ingest join). Without any
         feedback the app looks hung and users force-kill it, orphaning
         the writer pool. Moving these off the GUI thread is a larger
-        refactor; the cursor at least tells the user work is happening."""
-        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+        refactor; the cursor at least tells the user work is happening.
+
+        No-op when no QApplication exists (stub-window unit tests)."""
+        app = QApplication.instance()
+        if app is not None:
+            QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
         try:
-            QApplication.processEvents()
+            if app is not None:
+                QApplication.processEvents()
             yield
         finally:
-            QApplication.restoreOverrideCursor()
+            if app is not None:
+                QApplication.restoreOverrideCursor()
 
     # ──────────────────────────────────────────────────────────────────────
     # Central plot panel (pyqtgraph)
@@ -291,6 +311,16 @@ class ChirpWindow(QMainWindow):
         self._btn_config_mode.clicked.connect(self._toggle_view_mode)
         h.addWidget(self._btn_config_mode)
 
+        h.addSpacing(14)
+
+        # 3c: show only acquiring streams in the grid.
+        self._chk_vm_active_only = QCheckBox('Active only')
+        self._chk_vm_active_only.setChecked(True)
+        self._chk_vm_active_only.setToolTip(
+            'Show only streams whose acquisition is running')
+        self._chk_vm_active_only.toggled.connect(self._on_vm_active_only)
+        h.addWidget(self._chk_vm_active_only)
+
         h.addStretch()
 
         lbl_c = QLabel('Columns:')
@@ -372,6 +402,38 @@ class ChirpWindow(QMainWindow):
         icon.setStyleSheet(f'color: {C["mauve"]}; font-size: 12pt;')
         icon.setToolTip('Audio monitor loopback — routes one input stream to an output device')
         h.addWidget(icon)
+
+        # 4d (TODO#13): master enable/mute toggle. Turning the monitor
+        # off keeps both combo selections, so turning it back on
+        # restores the exact same routing without re-picking devices.
+        self._monitor_muted = False
+        self._btn_monitor_mute = QPushButton('\U0001F50A')
+        self._btn_monitor_mute.setCheckable(True)
+        self._btn_monitor_mute.setChecked(True)
+        self._btn_monitor_mute.setFixedSize(30, 24)
+        self._btn_monitor_mute.setToolTip(
+            'Enable / disable the audio monitor. Disabling keeps the '
+            'source and output selections, so re-enabling restores the '
+            'same routing.')
+        self._btn_monitor_mute.setStyleSheet(
+            f'QPushButton {{ background-color: {C["surface0"]}; '
+            f'border: 1px solid {C["surface1"]}; border-radius: 4px; '
+            f'min-width: 0px; padding: 0px; font-size: 10pt; }}'
+            f'QPushButton:!checked {{ color: {C["surface2"]}; }}'
+        )
+        self._btn_monitor_mute.toggled.connect(self._on_monitor_mute_toggled)
+        h.addWidget(self._btn_monitor_mute)
+
+        # 4d (TODO#10): follow the selection — the monitor re-targets to
+        # whichever stream is selected (Config mode) or clicked in the
+        # View-mode grid.
+        self._chk_monitor_follow = QCheckBox('Follow')
+        self._chk_monitor_follow.setToolTip(
+            'Monitor follows the selection: selecting a stream in the '
+            'sidebar (Config mode) or clicking a tile (View mode) routes '
+            'that stream to the monitor output.')
+        self._chk_monitor_follow.toggled.connect(self._on_monitor_follow_toggled)
+        h.addWidget(self._chk_monitor_follow)
 
         lbl_src = QLabel('Monitor:')
         lbl_src.setStyleSheet(f'color: {C["subtext"]}; font-size: 9pt;')
@@ -468,6 +530,13 @@ class ChirpWindow(QMainWindow):
         at that entity's sample rate / channel count so the playback
         isn't speed-shifted.
         """
+        # 4d: while muted, selections are remembered (the combos hold
+        # them) but the backend stays silent and the output stream
+        # stays closed.
+        if self._monitor_muted:
+            self._monitor.set_source(None)
+            self._update_monitor_status()
+            return
         if source_token == self._MON_OFF or source_token is None:
             self._monitor.set_source(None)
             self._update_monitor_status()
@@ -491,10 +560,52 @@ class ChirpWindow(QMainWindow):
         self._monitor.set_source(source_token)
         self._update_monitor_status()
 
+    def _sync_monitor_source_combo(self) -> None:
+        """Point the source combo at whatever the monitor backend is
+        actually playing (used by monitor-follow / tile clicks) without
+        re-triggering the apply handler."""
+        combo = self._monitor_src_combo
+        target = self._monitor.source_id
+        combo.blockSignals(True)
+        pick = 0
+        for i in range(combo.count()):
+            if combo.itemData(i) == (target if target is not None
+                                     else self._MON_OFF):
+                pick = i
+                break
+        combo.setCurrentIndex(pick)
+        combo.blockSignals(False)
+
     def _on_monitor_source_changed(self, _idx: int):
         self._apply_monitor_source(self._monitor_src_combo.currentData())
 
+    def _on_monitor_mute_toggled(self, enabled: bool):
+        """4d (TODO#13): master monitor enable. OFF closes the output
+        stream (silence, device released) but leaves both combos alone;
+        ON re-applies whatever they hold."""
+        self._monitor_muted = not enabled
+        self._btn_monitor_mute.setText('\U0001F50A' if enabled else '\U0001F507')
+        if self._monitor_muted:
+            self._monitor.set_source(None)
+            self._monitor.set_output_device(None)   # close the stream
+            self._update_monitor_status()
+        else:
+            # Re-open the output and re-apply the source selection.
+            self._on_monitor_output_changed(0)
+            self._apply_monitor_source(self._monitor_src_combo.currentData())
+
+    def _on_monitor_follow_toggled(self, on: bool):
+        """4d (TODO#10): follow-selection just turned on — snap the
+        monitor to the currently selected stream right away."""
+        if on and self._sel is not None:
+            self._apply_monitor_source(id(self._sel))
+            self._sync_monitor_source_combo()
+
     def _on_monitor_output_changed(self, _idx: int):
+        if self._monitor_muted:
+            # Remember the choice (the combo holds it); apply on unmute.
+            self._update_monitor_status()
+            return
         dev = self._monitor_out_combo.currentData()
         # Pick the SR/channels of the currently-selected source so the
         # first playback doesn't have to reopen the stream.
@@ -528,6 +639,11 @@ class ChirpWindow(QMainWindow):
     def _update_monitor_status(self):
         """Reflect backend state on the little status label."""
         if not hasattr(self, '_monitor_status'):
+            return
+        if self._monitor_muted:
+            self._monitor_status.setText('muted')
+            self._monitor_status.setStyleSheet(
+                f'color: {C["surface2"]}; font-size: 9pt; min-width: 40px;')
             return
         if self._monitor.source_id is None:
             self._monitor_status.setText('off')
@@ -573,6 +689,27 @@ class ChirpWindow(QMainWindow):
         self._btn_start_rec.setToolTip('Enable threshold-triggered WAV recording for the selected recording')
         self._btn_stop_rec .setToolTip('Disable threshold-triggered WAV recording for the selected recording')
 
+        # 2b: force-trigger toggle — manual segment while REC is on.
+        self._btn_force_trig = QPushButton('● Force Trigger')
+        self._btn_force_trig.setCheckable(True)
+        self._btn_force_trig.setEnabled(False)
+        self._btn_force_trig.setToolTip(
+            'Force recording NOW (toggle): press to open a recording '
+            'segment immediately (pre-trigger lookback included), press '
+            'again to close it immediately (no hold / post-trigger tail). '
+            'Max Rec splitting still applies. Enabled while REC is on in '
+            'Triggered mode.')
+        self._btn_force_trig.setStyleSheet(
+            f'QPushButton {{ background-color: {C["surface0"]}; color: {C["peach"]}; '
+            f'border: 1px solid {C["peach"]}; border-radius: 5px; '
+            f'padding: 4px 8px; font-weight: bold; min-width: 0px; }}'
+            f'QPushButton:hover {{ background-color: {C["surface1"]}; }}'
+            f'QPushButton:checked {{ background-color: {C["peach"]}; '
+            f'color: {C["mantle"]}; }}'
+            f'QPushButton:disabled {{ color: {C["surface2"]}; '
+            f'border-color: {C["surface1"]}; }}'
+        )
+
         self._btn_reset = QPushButton('Reset')
         self._btn_reset.setObjectName('btn_browse')
         self._btn_reset.setToolTip('Reset all trigger and display parameters to their defaults')
@@ -600,11 +737,12 @@ class ChirpWindow(QMainWindow):
         btn_g.addWidget(self._btn_stop_acq,  0, 1)
         btn_g.addWidget(self._btn_start_rec, 1, 0)
         btn_g.addWidget(self._btn_stop_rec,  1, 1)
-        btn_g.addWidget(self._btn_save,      2, 0)
-        btn_g.addWidget(self._btn_save_as,   2, 1)
-        btn_g.addWidget(self._btn_load,      3, 0)
-        btn_g.addWidget(self._btn_reset,     3, 1)
-        btn_g.addWidget(self._btn_view_mode, 4, 0, 1, 2)
+        btn_g.addWidget(self._btn_force_trig, 2, 0, 1, 2)
+        btn_g.addWidget(self._btn_save,      3, 0)
+        btn_g.addWidget(self._btn_save_as,   3, 1)
+        btn_g.addWidget(self._btn_load,      4, 0)
+        btn_g.addWidget(self._btn_reset,     4, 1)
+        btn_g.addWidget(self._btn_view_mode, 5, 0, 1, 2)
 
         # Right column: status labels
         status_box = QGroupBox('STATUS')
@@ -668,19 +806,40 @@ class ChirpWindow(QMainWindow):
         trig_g.setHorizontalSpacing(8)
         trig_g.setContentsMargins(8, 4, 8, 4)
 
-        self._sb_mc = self._param_row(trig_g, 0, 0, 'Min Cross',
+        # 2a: recording mode — Triggered (threshold state machine) or
+        # Continuous (record everything while REC is on; new file every
+        # Max Rec). Per-stream, persisted in the config.
+        lbl_rmode = QLabel('Rec Mode')
+        lbl_rmode.setObjectName('param_label')
+        self._combo_rec_mode = QComboBox()
+        self._combo_rec_mode.setFixedWidth(160)
+        for rm in ('Triggered', 'Continuous'):
+            self._combo_rec_mode.addItem(rm)
+        self._combo_rec_mode.setToolTip(
+            'Recording mode:\n'
+            '  • Triggered — threshold-based event detection (all params below)\n'
+            '  • Continuous — record everything while REC is on; a new file '
+            'starts every Max Rec seconds (other trigger params are ignored)')
+        rmode_row = QHBoxLayout()
+        rmode_row.setSpacing(8)
+        rmode_row.addWidget(lbl_rmode)
+        rmode_row.addWidget(self._combo_rec_mode)
+        rmode_row.addStretch()
+        trig_g.addLayout(rmode_row, 0, 0, 1, 3)
+
+        self._sb_mc = self._param_row(trig_g, 1, 0, 'Min Cross',
             sb_min=0.0, sb_max=60.0, sb_step=0.001, sb_dec=3, suffix=' s',
             sb_init=DEFAULT_MIN_CROSS)
-        self._sb_hold = self._param_row(trig_g, 1, 0, 'Hold',
+        self._sb_hold = self._param_row(trig_g, 2, 0, 'Hold',
             sb_min=0.0, sb_max=60.0, sb_step=0.1, sb_dec=2, suffix=' s',
             sb_init=DEFAULT_HOLD)
-        self._sb_pre = self._param_row(trig_g, 2, 0, 'Pre-Trigger',
+        self._sb_pre = self._param_row(trig_g, 3, 0, 'Pre-Trigger',
             sb_min=0.0, sb_max=60.0, sb_step=0.1, sb_dec=2, suffix=' s',
             sb_init=DEFAULT_PRE_TRIG)
-        self._sb_post_trig = self._param_row(trig_g, 3, 0, 'Post-Trigger',
+        self._sb_post_trig = self._param_row(trig_g, 4, 0, 'Post-Trigger',
             sb_min=0.0, sb_max=60.0, sb_step=0.1, sb_dec=2, suffix=' s',
             sb_init=DEFAULT_POST_TRIG)
-        self._sb_maxr = self._param_row(trig_g, 4, 0, 'Max Rec',
+        self._sb_maxr = self._param_row(trig_g, 5, 0, 'Max Rec',
             sb_min=1.0, sb_max=3600.0, sb_step=1.0, sb_dec=1, suffix=' s',
             sb_init=DEFAULT_MAX_REC)
 
@@ -733,9 +892,9 @@ class ChirpWindow(QMainWindow):
         filt_row.addWidget(lbl_hi)
         filt_row.addWidget(self._sb_freq_hi)
         filt_row.addStretch()
-        trig_g.addLayout(filt_row, 5, 0, 1, 3)
+        trig_g.addLayout(filt_row, 6, 0, 1, 3)
 
-        # Detect mode row (row 6)
+        # Detect mode row (row 7)
         lbl_detect = QLabel('Detect Mode')
         lbl_detect.setObjectName('param_label')
         lbl_detect.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
@@ -756,18 +915,29 @@ class ChirpWindow(QMainWindow):
         detect_row.addWidget(lbl_detect)
         detect_row.addWidget(self._combo_detect_mode)
         detect_row.addStretch()
-        trig_g.addLayout(detect_row, 6, 0, 1, 3)
+        trig_g.addLayout(detect_row, 7, 0, 1, 3)
 
-        # Entropy threshold row (row 7)
-        self._sb_entropy_thr = self._param_row(trig_g, 7, 0, 'Entropy Thr',
+        # Entropy threshold row (row 8)
+        self._sb_entropy_thr = self._param_row(trig_g, 8, 0, 'Entropy Thr',
             sb_min=0.0, sb_max=1.0, sb_step=0.01, sb_dec=2, suffix='',
             sb_init=0.50)
         self._sb_entropy_thr.setEnabled(False)
         self._sb_entropy_thr.setToolTip('Spectral entropy threshold — triggers when entropy falls below this value (0 = pure tone, 1 = white noise)')
 
+        # 2c: entropy debounce duration (row 9)
+        self._sb_entropy_mc = self._param_row(trig_g, 9, 0, 'Entropy Min Dur',
+            sb_min=0.0, sb_max=10.0, sb_step=0.05, sb_dec=2, suffix=' s',
+            sb_init=0.0)
+        self._sb_entropy_mc.setEnabled(False)
+        self._sb_entropy_mc.setToolTip(
+            'Entropy Min Duration: entropy must stay below the threshold '
+            'continuously for this long before the spectral condition turns '
+            'ON (debounce; 0 = instantaneous). Evaluated per FFT chunk; the '
+            'amplitude Min Cross still applies to the combined detection.')
+
         self._combo_detect_mode.currentTextChanged.connect(self._on_detect_mode_changed)
 
-        # Auto-calibrate row (row 8)
+        # Auto-calibrate row (row 10)
         self._btn_calibrate = QPushButton('Auto Calibrate')
         self._btn_calibrate.setObjectName('btn_small')
         self._btn_calibrate.setFixedWidth(110)
@@ -808,24 +978,29 @@ class ChirpWindow(QMainWindow):
         calib_row.addWidget(self._sb_calib_margin)
         calib_row.addWidget(self._lbl_calib_status)
         calib_row.addStretch()
-        trig_g.addLayout(calib_row, 8, 0, 1, 3)
+        trig_g.addLayout(calib_row, 10, 0, 1, 3)
 
-        # #10 / c24: sync + apply-all controls
+        # 4a (v3.3.0): the live-sync checkboxes are gone \u2014 bulk editing
+        # is the one-shot Apply All button or the all-streams table.
         sync_row = QHBoxLayout()
         sync_row.setSpacing(10)
-        self._chk_shared_trigger = QCheckBox('Sync trigger across all recordings')
-        self._chk_shared_trigger.setToolTip(
-            'When enabled, trigger parameter changes propagate to all recordings')
         self._btn_apply_all = QPushButton('Apply All Settings \u2192')
         self._btn_apply_all.setObjectName('btn_small')
         self._btn_apply_all.setFixedWidth(150)
         self._btn_apply_all.setToolTip(
             'Copy ALL settings (trigger + display + output) from the selected '
             'recording to every other recording (one-shot)')
-        sync_row.addWidget(self._chk_shared_trigger)
+        # 4b: side-by-side editable table of every stream's parameters.
+        self._btn_config_table = QPushButton('All Streams Table\u2026')
+        self._btn_config_table.setObjectName('btn_small')
+        self._btn_config_table.setFixedWidth(140)
+        self._btn_config_table.setToolTip(
+            'Open a table showing all parameters of all streams side by '
+            'side \u2014 double-click a cell to edit')
         sync_row.addWidget(self._btn_apply_all)
+        sync_row.addWidget(self._btn_config_table)
         sync_row.addStretch()
-        trig_g.addLayout(sync_row, 9, 0, 1, 3)
+        trig_g.addLayout(sync_row, 11, 0, 1, 3)
 
         outer.addWidget(trig_box)
         return w
@@ -948,10 +1123,6 @@ class ChirpWindow(QMainWindow):
         self._combo_display_mode.setToolTip('Visualization mode — Spectrogram, raw Waveform, or Both')
         grid.addWidget(lbl_dmode,                  6, 3)
         grid.addWidget(self._combo_display_mode,   6, 4)
-
-        self._chk_shared_spec = QCheckBox('Sync across all recordings')
-        self._chk_shared_spec.setToolTip('When enabled, display settings (gain, FFT, scale, etc.) apply to all recordings')
-        grid.addWidget(self._chk_shared_spec, 7, 0, 1, 5)
 
         outer.addWidget(box)
         return w
@@ -1213,6 +1384,10 @@ class ChirpWindow(QMainWindow):
         self._sb_maxr.valueChanged.connect(lambda _: self._write_trigger_params())
         self._combo_detect_mode.currentTextChanged.connect(lambda _: self._write_trigger_params())
         self._sb_entropy_thr.valueChanged.connect(lambda _: self._write_trigger_params())
+        self._sb_entropy_mc.valueChanged.connect(lambda _: self._write_trigger_params())
+        # 2a / 2b: recording mode + force-trigger toggle
+        self._combo_rec_mode.currentTextChanged.connect(self._on_rec_mode_changed)
+        self._btn_force_trig.toggled.connect(self._on_force_trigger_toggled)
 
         # Spectrogram display write-through
         self._sb_gain .valueChanged.connect(lambda _: self._write_spec_params())
@@ -1223,12 +1398,12 @@ class ChirpWindow(QMainWindow):
         self._combo_fscale.currentTextChanged .connect(self._on_freq_scale_changed)
         self._sb_disp_freq_lo.valueChanged.connect(self._on_disp_freq_changed)
         self._sb_disp_freq_hi.valueChanged.connect(self._on_disp_freq_changed)
-        self._chk_shared_spec.toggled.connect(self._on_shared_spec_toggled)
         self._combo_display_mode.currentTextChanged.connect(self._on_display_mode_changed)
 
-        # #10 / c24: global settings scope
-        self._chk_shared_trigger.toggled.connect(self._on_shared_trigger_toggled)
+        # One-shot bulk copy (the live-sync checkboxes were removed in 4a).
         self._btn_apply_all.clicked.connect(self._on_apply_all_settings)
+        # 4b: editable all-streams table.
+        self._btn_config_table.clicked.connect(self._open_config_table)
 
         # Plot interaction (threshold drag, scroll-zoom, amp-scale menu) is
         # handled by the pyqtgraph ConfigPlotPanel signals wired in
@@ -1261,17 +1436,7 @@ class ChirpWindow(QMainWindow):
         e.max_rec_sec   = self._sb_maxr.value()
         e.spectral_trigger_mode = self._combo_detect_mode.currentText()
         e.spectral_threshold    = self._sb_entropy_thr.value()
-        # #10 / c24: propagate to all when sync is on.
-        if self._chk_shared_trigger.isChecked():
-            for ent in self._entities:
-                if ent is not e:
-                    ent.min_cross_sec = e.min_cross_sec
-                    ent.hold_sec      = e.hold_sec
-                    ent.post_trig_sec = e.post_trig_sec
-                    ent.max_rec_sec   = e.max_rec_sec
-                    ent.pre_trig_sec  = e.pre_trig_sec
-                    ent.spectral_trigger_mode = e.spectral_trigger_mode
-                    ent.spectral_threshold    = e.spectral_threshold
+        e.entropy_min_cross_sec = self._sb_entropy_mc.value()
         self._mark_dirty()
 
     def _write_spec_params(self):
@@ -1281,12 +1446,6 @@ class ChirpWindow(QMainWindow):
         e.gain_db  = self._sb_gain.value()
         e.db_floor = self._sb_floor.value()
         e.db_ceil  = self._sb_ceil.value()
-        if self._chk_shared_spec.isChecked():
-            for ent in self._entities:
-                if ent is not e:
-                    ent.gain_db  = e.gain_db
-                    ent.db_floor = e.db_floor
-                    ent.db_ceil  = e.db_ceil
         self._mark_dirty()
 
     def _on_freq_filter_toggled(self, on: bool):
@@ -1297,12 +1456,6 @@ class ChirpWindow(QMainWindow):
             e.freq_filter_enabled = on
             e.bpf.reset()
             e.bpf_r.reset()
-            if self._chk_shared_trigger.isChecked():
-                for ent in self._entities:
-                    if ent is not e:
-                        ent.freq_filter_enabled = on
-                        ent.bpf.reset()
-                        ent.bpf_r.reset()
             self._mark_dirty()
 
     def _on_freq_filter_param(self, _val):
@@ -1310,11 +1463,6 @@ class ChirpWindow(QMainWindow):
         if e:
             e.freq_lo = self._sb_freq_lo.value()
             e.freq_hi = self._sb_freq_hi.value()
-            if self._chk_shared_trigger.isChecked():
-                for ent in self._entities:
-                    if ent is not e:
-                        ent.freq_lo = e.freq_lo
-                        ent.freq_hi = e.freq_hi
             self._mark_dirty()
 
     # ──────────────────────────────────────────────────────────────────────
@@ -1360,6 +1508,8 @@ class ChirpWindow(QMainWindow):
             e.device_id = sel
         e.spectral_trigger_mode = self._combo_detect_mode.currentText()
         e.spectral_threshold    = self._sb_entropy_thr.value()
+        e.entropy_min_cross_sec = self._sb_entropy_mc.value()
+        e.rec_mode      = self._combo_rec_mode.currentText()
         e.display_mode  = self._combo_display_mode.currentText()
 
     def _load_params_from_entity(self, idx: int):
@@ -1464,8 +1614,18 @@ class ChirpWindow(QMainWindow):
         self._combo_detect_mode.setCurrentText(e.spectral_trigger_mode)
         self._combo_detect_mode.blockSignals(False)
         _set(self._sb_entropy_thr, e.spectral_threshold)
+        _set(self._sb_entropy_mc, e.entropy_min_cross_sec)
         ent_on = (e.spectral_trigger_mode != 'Amplitude Only')
         self._sb_entropy_thr.setEnabled(ent_on)
+        self._sb_entropy_mc.setEnabled(ent_on)
+
+        # 2a / 2b: recording mode combo + widget enable states + force
+        # trigger button state for this stream.
+        self._combo_rec_mode.blockSignals(True)
+        self._combo_rec_mode.setCurrentText(
+            getattr(e, 'rec_mode', 'Triggered'))
+        self._combo_rec_mode.blockSignals(False)
+        self._apply_rec_mode_ui(e)
 
         # Sample rate combo
         self._sr_combo.blockSignals(True)
@@ -1519,6 +1679,12 @@ class ChirpWindow(QMainWindow):
         self._sidebar.select(new_idx)
         self._load_params_from_entity(new_idx)
         self._refresh_transport_ui()
+        # 4d: monitor-follow — route the newly selected stream to the
+        # audio monitor.
+        if (self._chk_monitor_follow.isChecked()
+                and 0 <= new_idx < len(self._entities)):
+            self._apply_monitor_source(id(self._entities[new_idx]))
+            self._sync_monitor_source_combo()
 
     # ──────────────────────────────────────────────────────────────────────
     # Add / Remove / Move recordings
@@ -1536,6 +1702,7 @@ class ChirpWindow(QMainWindow):
         idx = self._sidebar.add_item(name)
         self._switch_selection(idx)
         self._refresh_monitor_source_combo()
+        self._refresh_config_table()
         self._mark_dirty()
 
     def _remove_recording(self, idx: int):
@@ -1556,6 +1723,7 @@ class ChirpWindow(QMainWindow):
                 self._selected_idx = max(0, self._selected_idx - 1)
             self._switch_selection(self._selected_idx)
             self._refresh_monitor_source_combo()
+            self._refresh_config_table()
             self._mark_dirty()
 
     def _move_recording(self, idx: int, direction: int):
@@ -1579,6 +1747,7 @@ class ChirpWindow(QMainWindow):
             self._entities[idx].name = name
             # Keep the monitor-source combo labels in sync with renames.
             self._refresh_monitor_source_combo()
+            self._refresh_config_table()
             self._mark_dirty()
 
     # ── #28 / #29: sticky-flag reset handlers ────────────────────────────
@@ -1599,56 +1768,11 @@ class ChirpWindow(QMainWindow):
 
     def _update_error_sticky(self, idx: int, e) -> None:
         """#43 / #44 / #48: compose ingest / OS-drop / open / writer
-        error state into a single sticky badge. The tooltip lists
-        whichever categories have fired so the user can tell at a
-        glance why the `!` lit up.
+        error state into a single sticky badge. Shared with the
+        view-mode tile headers via ``status_util.compose_error_state``.
         """
-        cap = getattr(e, 'capture', None)
-        ingest_ever = bool(getattr(e, 'has_ever_ingest_errored', False))
-        os_drop_ever = bool(getattr(cap, 'has_ever_os_dropped', False))
-        open_err = getattr(cap, 'open_error', None)
-        # #54: WAV-replay multi-channel truncation. The capture latches
-        # this on open when ``file_channels`` exceeds the session's
-        # configured channel count.
-        ch_trunc = bool(getattr(cap, 'channels_truncated', False))
-        ch_trunc_msg = getattr(cap, 'channels_truncated_msg', '') or ''
-        # Writer error stats are process-global, not per-stream. We
-        # surface them on every stream's badge because there's no
-        # reliable way to attribute a given write failure to its
-        # originating stream from here.
-        try:
-            from chirp.recording import writer as _writer
-            wr_has, wr_total, wr_last = _writer.error_stats()
-        except Exception:
-            wr_has, wr_total, wr_last = False, 0, None
-
-        any_err = (ingest_ever or os_drop_ever or bool(open_err)
-                   or ch_trunc or wr_has)
-        if not any_err:
-            tip = 'No pipeline errors recorded for this stream.'
-        else:
-            parts = []
-            if ingest_ever:
-                n = int(getattr(e, 'ingest_error_count_total', 0))
-                last = getattr(e, 'last_ingest_error', None) or '?'
-                parts.append(
-                    f'{n} DSP ingestion error{"s" if n != 1 else ""} '
-                    f'(last: {last})')
-            if os_drop_ever:
-                n = int(getattr(cap, 'os_drop_count_total', 0))
-                parts.append(
-                    f'{n} OS-level input overflow{"s" if n != 1 else ""} — '
-                    f'samples lost before our queue')
-            if open_err:
-                parts.append(f'Capture open failed: {open_err}')
-            if ch_trunc:
-                parts.append(f'WAV channel truncation: {ch_trunc_msg}')
-            if wr_has:
-                last = wr_last or '?'
-                parts.append(
-                    f'{int(wr_total)} WAV write failure'
-                    f'{"s" if wr_total != 1 else ""} (last: {last})')
-            tip = ' · '.join(parts) + ' — click to clear.'
+        from chirp.ui.status_util import compose_error_state
+        any_err, tip = compose_error_state(e)
         self._sidebar.update_item_error_sticky(idx, any_err, tip)
 
     def _on_clear_errors(self, idx: int):
@@ -1733,6 +1857,8 @@ class ChirpWindow(QMainWindow):
         self._sb_freq_hi.setValue(DEFAULT_FREQ_HI)
         self._combo_detect_mode.setCurrentText('Amplitude Only')
         self._sb_entropy_thr.setValue(0.5)
+        self._sb_entropy_mc.setValue(0.0)
+        self._combo_rec_mode.setCurrentText('Triggered')
         self._sb_gain .setValue(0.0)
         self._sb_floor.setValue(SPEC_DB_MIN)
         self._sb_ceil .setValue(SPEC_DB_MAX)
@@ -1763,6 +1889,7 @@ class ChirpWindow(QMainWindow):
                 'columns':      self._vm_n_cols,
                 'panel_height': self._vm_panel_height,
                 'use_opengl':   self._pg_use_opengl,
+                'active_only':  self._vm_active_only,
             },
         )
 
@@ -1871,6 +1998,7 @@ class ChirpWindow(QMainWindow):
         self._vm_n_cols = view_mode['columns']
         self._vm_panel_height = view_mode['panel_height']
         self._pg_use_opengl = bool(view_mode.get('use_opengl', True))
+        self._vm_active_only = bool(view_mode.get('active_only', True))
         # Drop any grid built with the previous OpenGL setting so it is
         # recreated with the new one on next view-mode entry.
         self._pg_grid = None
@@ -1880,6 +2008,9 @@ class ChirpWindow(QMainWindow):
         self._vm_height_spin.blockSignals(True)
         self._vm_height_spin.setValue(self._vm_panel_height)
         self._vm_height_spin.blockSignals(False)
+        self._chk_vm_active_only.blockSignals(True)
+        self._chk_vm_active_only.setChecked(self._vm_active_only)
+        self._chk_vm_active_only.blockSignals(False)
 
         # Per-entity device warnings come back inside ``schema_warnings``
         # already (load_settings_dict appends RecordingEntity.from_dict's
@@ -1952,6 +2083,9 @@ class ChirpWindow(QMainWindow):
             lbl.style().unpolish(lbl)
             lbl.style().polish(lbl)
 
+        # 2b: force-trigger availability follows REC state + rec mode.
+        self._refresh_force_trig_button(e)
+
     # ──────────────────────────────────────────────────────────────────────
     # Threshold sync
     # ──────────────────────────────────────────────────────────────────────
@@ -1960,10 +2094,6 @@ class ChirpWindow(QMainWindow):
         e = self._sel
         if e:
             e.threshold = val
-            if self._chk_shared_trigger.isChecked():
-                for ent in self._entities:
-                    if ent is not e:
-                        ent.threshold = val
             self._mark_dirty()
         self._sync_thr_line(val)
 
@@ -2123,50 +2253,53 @@ class ChirpWindow(QMainWindow):
         e.display_freq_lo = self._sb_disp_freq_lo.value()
         e.display_freq_hi = self._sb_disp_freq_hi.value()
         e.rebuild_freq_mapping()
-        if self._chk_shared_spec.isChecked():
-            for ent in self._entities:
-                if ent is not e:
-                    ent.display_freq_lo = e.display_freq_lo
-                    ent.display_freq_hi = e.display_freq_hi
-                    ent.rebuild_freq_mapping()
 
-    def _on_shared_spec_toggled(self, on: bool):
-        if on:
-            e = self._sel
-            if not e:
-                return
-            for ent in self._entities:
-                if ent is not e:
-                    ent.gain_db  = e.gain_db
-                    ent.db_floor = e.db_floor
-                    ent.db_ceil  = e.db_ceil
-                    ent.freq_scale = e.freq_scale
-                    ent.display_freq_lo = e.display_freq_lo
-                    ent.display_freq_hi = e.display_freq_hi
-                    ent.rebuild_freq_mapping()
-                    ent.change_fft_params(e.spec_nperseg, e.spec_window)
+    # ── 4b: all-streams config table ─────────────────────────────────
 
-    def _on_shared_trigger_toggled(self, on: bool):
-        """When shared-trigger is turned on, push current entity's trigger
-        params to all others immediately (#10 / c24)."""
-        if on:
-            e = self._sel
-            if not e:
-                return
-            for ent in self._entities:
-                if ent is not e:
-                    ent.threshold     = e.threshold
-                    ent.min_cross_sec = e.min_cross_sec
-                    ent.hold_sec      = e.hold_sec
-                    ent.post_trig_sec = e.post_trig_sec
-                    ent.max_rec_sec   = e.max_rec_sec
-                    ent.pre_trig_sec  = e.pre_trig_sec
-                    ent.freq_filter_enabled = e.freq_filter_enabled
-                    ent.freq_lo       = e.freq_lo
-                    ent.freq_hi       = e.freq_hi
-                    ent.spectral_trigger_mode = e.spectral_trigger_mode
-                    ent.spectral_threshold    = e.spectral_threshold
-            self._mark_dirty()
+    def _open_config_table(self):
+        from chirp.ui.config_table import ConfigTableDialog
+        if getattr(self, '_config_table_dlg', None) is None:
+            self._config_table_dlg = ConfigTableDialog(self)
+        self._config_table_dlg.show()
+        self._config_table_dlg.raise_()
+        self._config_table_dlg.activateWindow()
+
+    def _refresh_config_table(self):
+        """Refresh the table if it's open (entity added/removed/renamed)."""
+        dlg = getattr(self, '_config_table_dlg', None)
+        if dlg is not None and dlg.isVisible():
+            dlg.refresh()
+
+    def _apply_table_edit(self, idx: int, key: str, value):
+        """Apply one table edit to entity ``idx`` through the same code
+        paths the per-stream widgets use (side effects included)."""
+        if not (0 <= idx < len(self._entities)):
+            return
+        e = self._entities[idx]
+        if key == 'spec_nperseg':
+            e.change_fft_params(int(value), e.spec_window)
+        elif key == 'spec_window':
+            e.change_fft_params(e.spec_nperseg, value)
+        elif key == 'display_seconds':
+            e.change_display_seconds(float(value))
+        else:
+            if key in ('threshold', 'min_cross_sec', 'hold_sec',
+                       'pre_trig_sec', 'post_trig_sec', 'max_rec_sec',
+                       'freq_lo', 'freq_hi', 'spectral_threshold',
+                       'entropy_min_cross_sec', 'gain_db', 'db_floor',
+                       'db_ceil', 'display_freq_lo', 'display_freq_hi'):
+                value = float(value)
+            setattr(e, key, value)
+            if key in ('freq_scale', 'display_freq_lo', 'display_freq_hi'):
+                e.rebuild_freq_mapping()
+            if key in ('freq_filter_enabled', 'freq_lo', 'freq_hi'):
+                e.bpf.reset()
+                e.bpf_r.reset()
+        self._mark_dirty()
+        # Keep the per-stream panel in sync when the edited stream is
+        # the selected one.
+        if idx == self._selected_idx:
+            self._load_params_from_entity(idx)
 
     def _on_apply_all_settings(self):
         """One-shot: copy ALL user-configurable settings from the selected
@@ -2220,19 +2353,67 @@ class ChirpWindow(QMainWindow):
         self._mark_dirty()
 
     def _on_detect_mode_changed(self, mode: str):
-        self._sb_entropy_thr.setEnabled(mode != 'Amplitude Only')
+        spectral = (mode != 'Amplitude Only')
+        self._sb_entropy_thr.setEnabled(spectral)
+        self._sb_entropy_mc.setEnabled(spectral)
         self._write_trigger_params()
+
+    # ── 2a / 2b: recording mode + force trigger ─────────────────────────
+
+    def _on_rec_mode_changed(self, mode: str):
+        e = self._sel
+        if not e:
+            return
+        e.rec_mode = mode
+        self._apply_rec_mode_ui(e)
+        self._mark_dirty()
+
+    def _apply_rec_mode_ui(self, e) -> None:
+        """Grey out the trigger-detection params in Continuous mode —
+        only Max Rec matters there. Force Trigger is a Triggered-mode
+        tool (Continuous already records everything)."""
+        continuous = (getattr(e, 'rec_mode', 'Triggered') == 'Continuous')
+        for wdg in (self._sb_mc, self._sb_hold, self._sb_pre,
+                    self._sb_post_trig, self._combo_detect_mode,
+                    self._chk_freq, self._btn_calibrate):
+            wdg.setEnabled(not continuous)
+        spectral = (e.spectral_trigger_mode != 'Amplitude Only')
+        self._sb_entropy_thr.setEnabled(not continuous and spectral)
+        self._sb_entropy_mc.setEnabled(not continuous and spectral)
+        band_on = bool(e.freq_filter_enabled)
+        self._sb_freq_lo.setEnabled(not continuous and band_on)
+        self._sb_freq_hi.setEnabled(not continuous and band_on)
+        self._refresh_force_trig_button(e)
+
+    def _refresh_force_trig_button(self, e) -> None:
+        """Force Trigger is enabled while REC is on in Triggered mode;
+        its checked state mirrors the entity's flag."""
+        enabled = bool(e is not None and e.rec_enabled
+                       and getattr(e, 'rec_mode', 'Triggered') == 'Triggered')
+        self._btn_force_trig.blockSignals(True)
+        self._btn_force_trig.setEnabled(enabled)
+        self._btn_force_trig.setChecked(
+            bool(e is not None and e.force_rec_active))
+        self._btn_force_trig.blockSignals(False)
+
+    def _on_force_trigger_toggled(self, checked: bool):
+        e = self._sel
+        if e is None:
+            return
+        if checked and not e.rec_enabled:
+            # Shouldn't happen (button disabled), but never force
+            # without REC — the recorder would ignore the mask anyway.
+            self._btn_force_trig.blockSignals(True)
+            self._btn_force_trig.setChecked(False)
+            self._btn_force_trig.blockSignals(False)
+            return
+        e.set_force_trigger(checked)
 
     def _on_freq_scale_changed(self, scale: str):
         e = self._sel
         if e:
             e.freq_scale = scale
             e.rebuild_freq_mapping()
-            if self._chk_shared_spec.isChecked():
-                for ent in self._entities:
-                    if ent is not e:
-                        ent.freq_scale = scale
-                        ent.rebuild_freq_mapping()
             self._mark_dirty()
 
     def _on_fft_params_changed(self):
@@ -2243,10 +2424,6 @@ class ChirpWindow(QMainWindow):
         window  = self._combo_win.currentData()
         if nperseg and window:
             e.change_fft_params(nperseg, window)
-            if self._chk_shared_spec.isChecked():
-                for ent in self._entities:
-                    if ent is not e:
-                        ent.change_fft_params(nperseg, window)
             self._mark_dirty()
 
     # ──────────────────────────────────────────────────────────────────────
@@ -2666,25 +2843,17 @@ class ChirpWindow(QMainWindow):
             return
         self._sr_change_busy = True
         self._sr_combo.setEnabled(False)
-        # M4: wait cursor for the whole multi-second rebuild.
-        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
-        QApplication.processEvents()
+        # M4: wait cursor for the whole multi-second rebuild. (No-op
+        # without a QApplication — stub-window unit tests.)
+        _app = QApplication.instance()
+        if _app is not None:
+            QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+            QApplication.processEvents()
         try:
             e.change_sample_rate(new_sr)
-            # #46: if sync-settings is on, mirror the SR change to
-            # every other entity — otherwise the user silently ends
-            # up with mismatched SR across "linked" streams. Every
-            # per-entity change_sample_rate flushes its own in-flight
-            # events at the OLD rate first (PR 2), so no mixed-SR
-            # WAV can sneak out.
-            if self._chk_shared_spec.isChecked():
-                for ent in self._entities:
-                    if ent is not e and ent.sample_rate != new_sr:
-                        try:
-                            ent.change_sample_rate(new_sr)
-                        except Exception as exc:
-                            print(f'[Chirp] sync SR change failed for '
-                                  f'{ent.name}: {exc}')
+            # (4a: the live-sync SR broadcast is gone with the sync
+            # checkboxes — use Apply All / the all-streams table for
+            # bulk changes.)
             # #7: if this entity is the monitor source, the output stream
             # needs to be reopened at the new SR so playback isn't pitched.
             if self._monitor.source_id == id(e):
@@ -2695,11 +2864,20 @@ class ChirpWindow(QMainWindow):
             self._sb_freq_hi.setRange(1.0, nyq - 1)
             self._sb_disp_freq_lo.setRange(0.0, nyq - 1)
             self._sb_disp_freq_hi.setRange(1.0, nyq)
-            if self._sb_disp_freq_hi.value() > nyq:
-                self._sb_disp_freq_hi.setValue(nyq)
+            # TODO#7: the entity followed the Nyquist (up or down) in
+            # change_sample_rate — mirror its values into the spinboxes
+            # instead of only clamping down, so the UI and the mapping
+            # can't disagree.
+            self._sb_disp_freq_lo.blockSignals(True)
+            self._sb_disp_freq_lo.setValue(e.display_freq_lo)
+            self._sb_disp_freq_lo.blockSignals(False)
+            self._sb_disp_freq_hi.blockSignals(True)
+            self._sb_disp_freq_hi.setValue(e.display_freq_hi)
+            self._sb_disp_freq_hi.blockSignals(False)
             self._refresh_transport_ui()
         finally:
-            QApplication.restoreOverrideCursor()
+            if _app is not None:
+                QApplication.restoreOverrideCursor()
             self._sr_change_busy = False
             self._sr_combo.setEnabled(True)
 
@@ -2751,6 +2929,16 @@ class ChirpWindow(QMainWindow):
             if self._sel:
                 self._load_params_from_entity(self._selected_idx)
 
+    def _visible_view_entities(self) -> tuple[list, list[int]]:
+        """3c: the (entities, indices) shown in the view grid — filtered
+        to acquiring streams when 'Active only' is on."""
+        pairs = [(e, i) for i, e in enumerate(self._entities)]
+        if self._vm_active_only:
+            pairs = [(e, i) for e, i in pairs if e.acq_running]
+        ents = [p[0] for p in pairs]
+        idxs = [p[1] for p in pairs]
+        return ents, idxs
+
     def _rebuild_view(self) -> None:
         """Phase 4: build/populate the pyqtgraph view-mode grid and swap it
         into the central scroll area (detaching the config panel without
@@ -2758,8 +2946,21 @@ class ChirpWindow(QMainWindow):
         if self._pg_grid is None:
             from chirp.ui.central_plots import MultiStreamGrid
             self._pg_grid = MultiStreamGrid(use_opengl=self._pg_use_opengl)
+            # 3a: tile interactions — badges clear by ENTITY index; a
+            # plain tile click re-targets the monitor when follow mode
+            # is on (4d).
+            self._pg_grid.clear_sat_requested.connect(self._on_clear_sat)
+            self._pg_grid.clear_drops_requested.connect(self._on_clear_drops)
+            self._pg_grid.clear_errors_requested.connect(self._on_clear_errors)
+            self._pg_grid.tile_clicked.connect(self._on_view_tile_clicked)
         self._pg_grid.set_tile_height(self._vm_panel_height)
-        self._pg_grid.rebuild(self._entities, cols=self._vm_n_cols)
+        ents, idxs = self._visible_view_entities()
+        self._vm_visible_sig = tuple(id(e) for e in ents)
+        self._pg_grid.rebuild(
+            ents, cols=self._vm_n_cols, indices=idxs,
+            empty_hint=("No active streams — start acquisition or untick "
+                        "'Active only'" if self._vm_active_only
+                        else 'No recordings'))
         if self._canvas_scroll.widget() is not self._pg_grid:
             # takeWidget detaches the current widget (the config panel,
             # which we still hold via self._config_panel) without
@@ -2768,9 +2969,16 @@ class ChirpWindow(QMainWindow):
             self._canvas_scroll.setWidget(self._pg_grid)
 
     def _refresh_view(self) -> None:
-        """Phase 4: per-tick update of the pyqtgraph view-mode grid."""
-        if self._pg_grid is not None:
-            self._pg_grid.update_all(self._entities)
+        """Phase 4: per-tick update of the pyqtgraph view-mode grid.
+        Rebuilds the grid when the visible (active) set changed (3c)."""
+        if self._pg_grid is None:
+            return
+        ents, _idxs = self._visible_view_entities()
+        if tuple(id(e) for e in ents) != self._vm_visible_sig:
+            self._rebuild_view()
+            ents, _idxs = self._visible_view_entities()
+        self._pg_grid.update_all(ents,
+                                 monitor_source_id=self._monitor.source_id)
 
     def _restore_config_canvas(self) -> None:
         """Swap the pyqtgraph config panel back into the scroll area when
@@ -2820,12 +3028,30 @@ class ChirpWindow(QMainWindow):
         if self._view_mode and self._pg_grid is not None:
             self._pg_grid.set_tile_height(val)
 
+    def _on_vm_active_only(self, on: bool):
+        """3c: 'Active only' toggled — rebuild the grid with the new
+        filter (persisted via the view_mode config section)."""
+        self._vm_active_only = bool(on)
+        self._mark_dirty()
+        if self._view_mode:
+            self._rebuild_view()
+
+    def _on_view_tile_clicked(self, idx: int):
+        """3a/4d: a view-mode tile was clicked. When monitor-follow is
+        on, route that stream to the audio monitor."""
+        if not (0 <= idx < len(self._entities)):
+            return
+        chk = getattr(self, '_chk_monitor_follow', None)
+        if chk is not None and chk.isChecked():
+            self._apply_monitor_source(id(self._entities[idx]))
+            self._sync_monitor_source_combo()
+
     def _on_vm_fit_to_screen(self):
-        """Pick a tile height so all streams fit the viewport without
-        scrolling, given the current column count."""
+        """Pick a tile height so all visible streams fit the viewport
+        without scrolling, given the current column count."""
         if not self._view_mode or self._pg_grid is None:
             return
-        n = len(self._entities)
+        n = len(self._visible_view_entities()[0])
         if n == 0:
             return
         cols = max(1, min(self._vm_n_cols, n))
@@ -2907,6 +3133,12 @@ class ChirpWindow(QMainWindow):
         except Exception:
             pass
 
+        # TODO#1 (RDP): capture-stall watchdog + auto-reconnect.
+        try:
+            self._capture_watchdog_tick()
+        except Exception:
+            pass
+
         # #58: top-level guard around the main display body. The
         # individual sidebar updates above are already try/except'd
         # per-update; everything from here through the end of the slot
@@ -2955,6 +3187,44 @@ class ChirpWindow(QMainWindow):
                 self._lbl_trig_status.style().polish(self._lbl_trig_status)
             except Exception:
                 pass
+
+    def _capture_watchdog_tick(self):
+        """TODO#1: detect live-device captures that stopped delivering
+        frames (RDP session change ripping out Windows audio endpoints)
+        and auto-reconnect them, throttled to one attempt round per 3 s.
+
+        A global PortAudio refresh (needed when the endpoint list itself
+        went stale) is only performed when NO healthy live-device stream
+        exists — terminating PortAudio kills every open stream. The
+        monitor output stream may also die in a full endpoint churn; the
+        user re-enables it from the monitor bar (its combos keep their
+        selection).
+        """
+        stalled = [e for e in self._entities if e.check_capture_stalled()]
+        if not stalled:
+            return
+        now = time.monotonic()
+        if now - self._recovery_last_attempt < 3.0:
+            return
+        self._recovery_last_attempt = now
+        healthy = [e for e in self._entities
+                   if e.acq_running and e.input_source == 'device'
+                   and not e.capture_stalled]
+        if not healthy and self._recovery_needs_refresh:
+            from chirp.audio.devices import refresh_portaudio
+            refresh_portaudio()
+            self._recovery_needs_refresh = False
+        any_fail = False
+        for e in stalled:
+            try:
+                if not e.attempt_capture_recovery():
+                    any_fail = True
+            except Exception as exc:
+                any_fail = True
+                print(f'[Chirp] capture recovery failed for {e.name}: {exc}')
+        # If reopening by name failed, the PortAudio device list itself
+        # is probably stale — allow a global refresh on the next round.
+        self._recovery_needs_refresh = any_fail
 
     def _update_plot_body(self):
         """#58: extracted from ``_update_plot`` so the top-level
@@ -3240,9 +3510,28 @@ def _log_opengl_status():
               f'software raster likely>')
 
 
+def _app_icon_path() -> str | None:
+    """Locate assets/chirp.ico for both dev runs (repo root) and frozen
+    PyInstaller builds (bundled next to the executable via --add-data)."""
+    if getattr(sys, 'frozen', False):
+        bases = [getattr(sys, '_MEIPASS', ''),
+                 os.path.dirname(sys.executable)]
+    else:
+        bases = [os.path.join(os.path.dirname(__file__), '..', '..')]
+    for base in bases:
+        p = os.path.join(base, 'assets', 'chirp.ico')
+        if base and os.path.exists(p):
+            return p
+    return None
+
+
 def main():
     app = QApplication(sys.argv)
     app.setStyleSheet(QSS)
+    icon_path = _app_icon_path()
+    if icon_path:
+        from PyQt5.QtGui import QIcon
+        app.setWindowIcon(QIcon(icon_path))
     win = ChirpWindow()
     _log_opengl_status()
     win.showMaximized()
