@@ -35,6 +35,7 @@ from chirp.constants import (
     DEFAULT_HOLD,
     DEFAULT_MAX_REC,
     DEFAULT_MIN_CROSS,
+    DEFAULT_MIN_TOTAL_CROSS,
     DEFAULT_POST_TRIG,
     DEFAULT_PRE_TRIG,
     DEFAULT_THRESHOLD,
@@ -110,6 +111,10 @@ class RecordingEntity:
         # Trigger params
         self.threshold     = DEFAULT_THRESHOLD
         self.min_cross_sec = DEFAULT_MIN_CROSS
+        # Min total crossing: an event whose ACCUMULATED above-threshold
+        # duration stays below this is discarded at finalize time
+        # instead of being written/published (0 = keep everything).
+        self.min_total_cross_sec = DEFAULT_MIN_TOTAL_CROSS
         self.hold_sec      = DEFAULT_HOLD
         self.pre_trig_sec  = DEFAULT_PRE_TRIG
         self.post_trig_sec = DEFAULT_POST_TRIG
@@ -433,9 +438,12 @@ class RecordingEntity:
 
     #: Seconds without a single new frame from the PortAudio callback
     #: before the capture is declared dead. Callbacks fire every ~23 ms
-    #: (1024 frames @ 44.1 kHz), so 2 s is far beyond any scheduler
-    #: hiccup while still reacting quickly to an RDP endpoint churn.
-    CAPTURE_STALL_SECONDS = 2.0
+    #: (1024 frames @ 44.1 kHz), so anything past a couple of seconds is
+    #: far beyond a scheduler hiccup. 5 s (was 2 s) rides out the
+    #: transient endpoint churn a remote-desktop attach (AnyDesk / RDP)
+    #: causes — tearing down a stream that would have resumed by itself
+    #: is far more expensive than reacting three seconds later.
+    CAPTURE_STALL_SECONDS = 5.0
 
     def check_capture_stalled(self) -> bool:
         """Return True when acquisition claims to run on a live device
@@ -453,6 +461,18 @@ class RecordingEntity:
         if wt != self._stall_wt:
             self._stall_wt = wt
             self._stall_wt_t = now
+            # Frames resumed on their own (transient churn — e.g. a
+            # remote-desktop attach briefly pausing the endpoint):
+            # un-latch so the recovery worker doesn't tear down a
+            # stream that is healthy again.
+            if self.capture_stalled:
+                self.capture_stalled = False
+                self.last_ingest_error = (
+                    'audio device resumed on its own — no reconnect needed')
+                print(f'[Chirp] {self.name}: capture resumed on its own; '
+                      f'recovery cancelled')
+                _err_log('capture_dead', self.name,
+                         'frames resumed before reconnect — transient stall')
             return self.capture_stalled
         if (not self.capture_stalled
                 and now - self._stall_wt_t >= self.CAPTURE_STALL_SECONDS):
@@ -1341,6 +1361,7 @@ class RecordingEntity:
             trigger_peak  = trigger_peak,
             threshold     = self.threshold,
             min_cross_sec = eff_min_cross,
+            min_total_cross_sec = self.min_total_cross_sec,
             hold_sec      = self.hold_sec,
             post_trig_sec = self.post_trig_sec,
             max_rec_sec   = self.max_rec_sec,
@@ -1455,6 +1476,7 @@ class RecordingEntity:
             'trigger_mode':        self.trigger_mode,
             'threshold':           self.threshold,
             'min_cross_sec':       self.min_cross_sec,
+            'min_total_cross_sec': self.min_total_cross_sec,
             'hold_sec':            self.hold_sec,
             'post_trig_sec':       self.post_trig_sec,
             'max_rec_sec':         self.max_rec_sec,
@@ -1506,7 +1528,8 @@ class RecordingEntity:
 
         # Scalar attributes
         for attr in ('channel_mode', 'trigger_mode', 'threshold',
-                     'min_cross_sec', 'hold_sec', 'post_trig_sec', 'max_rec_sec', 'pre_trig_sec',
+                     'min_cross_sec', 'min_total_cross_sec',
+                     'hold_sec', 'post_trig_sec', 'max_rec_sec', 'pre_trig_sec',
                      'freq_filter_enabled', 'freq_lo', 'freq_hi',
                      'freq_scale', 'gain_db', 'db_floor', 'db_ceil',
                      'display_freq_lo', 'display_freq_hi',

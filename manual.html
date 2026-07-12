@@ -504,6 +504,7 @@ python chirp.py</code></pre>
     <tbody>
       <tr><td>Threshold</td><td>Amplitude level that triggers recording. Also draggable on the plot.</td></tr>
       <tr><td>Min Cross</td><td>Minimum duration the signal must stay above threshold to confirm a trigger.</td></tr>
+      <tr><td>Min Total Cross</td><td>Minimum <em>accumulated</em> above-threshold duration over the whole event — files whose total crossing time is shorter are discarded instead of saved (0 = keep everything).</td></tr>
       <tr><td>Hold</td><td>Duration to keep recording after the signal drops below threshold.</td></tr>
       <tr><td>Post-Trigger</td><td>Additional time appended after the last threshold crossing.</td></tr>
       <tr><td>Max Rec</td><td>Maximum duration of a single recording segment (auto-splits if exceeded).</td></tr>
@@ -662,6 +663,21 @@ python chirp.py</code></pre>
       <p>The minimum continuous duration (in seconds) the signal must remain above the threshold
       before a trigger is confirmed. This prevents brief transient spikes (e.g., a click or bump)
       from creating recordings. Typical values range from 0.01 s to 0.5 s.</p>
+    </div>
+  </details>
+  <details>
+    <summary>Min Total Cross</summary>
+    <div>
+      <p>The minimum <em>accumulated</em> above-threshold duration (in seconds) an event must reach
+      for its file to be kept. Unlike <em>Min Cross</em> (which gates the <em>start</em> of an event
+      on one continuous run), Min Total Cross sums every above-threshold sample across the whole
+      event — separate bursts bridged by <em>Hold</em> all count. The check runs just before the
+      file is finalized: an event that never accumulates enough crossing time is discarded (its
+      in-progress temporary file is deleted) instead of being saved. Set to 0 to disable the filter
+      and keep every triggered file. Files force-split by <em>Max Rec</em> are judged on the whole
+      event's running total, so a long split recording never loses its parts to a quiet tail.
+      Continuous-mode and Force Trigger recordings always pass (their entire duration counts as
+      crossing time).</p>
     </div>
   </details>
   <details>
@@ -1083,10 +1099,13 @@ python chirp.py</code></pre>
   <p>
     Even with redirection disabled, Windows may briefly bounce audio endpoints on a session
     switch. Chirp watches every live-device stream: if a capture stops delivering frames for
-    ~2&nbsp;seconds while acquisition is running, it is declared dead &mdash; in-flight trigger
+    ~5&nbsp;seconds while acquisition is running, it is declared dead &mdash; in-flight trigger
     events are flushed to disk first, then Chirp re-resolves the device <em>by name</em> and
-    reopens it, retrying every few seconds until the device returns. Recording re-arms
-    automatically. The stream's <span class="badge">!</span> badge latches and
+    reopens it, retrying with increasing backoff until the device returns. Recording re-arms
+    automatically. If frames resume on their own before the reconnect starts (a transient churn,
+    common when AnyDesk or RDP attaches), the recovery is cancelled and the healthy stream is left
+    untouched. All recovery work runs on a background thread, so the UI stays responsive even if
+    the audio driver blocks. The stream's <span class="badge">!</span> badge latches and
     <code>chirp_errors.log</code> gets <code>capture_dead</code> entries for both the outage and
     the reconnect, so the gap is always visible after the fact.
   </p>
@@ -1095,6 +1114,17 @@ python chirp.py</code></pre>
     &mdash; the watchdog bounds the gap, it cannot eliminate it. For gap-free operation use the
     prevention settings above.
   </div>
+
+  <h3>Display rendering in remote sessions (built in)</h3>
+  <p>
+    Windows Remote Desktop replaces the display driver for the duration of the session, which
+    breaks live OpenGL rendering (the historical cause of Chirp appearing frozen when viewed over
+    RDP). Chirp handles this automatically: when it starts inside a remote session &mdash; or when
+    an RDP session attaches mid-run &mdash; every plot switches to software (raster) rendering,
+    and OpenGL is restored when the console session comes back. Screen-mirroring tools such as
+    AnyDesk or TeamViewer mirror the console session and are unaffected. No configuration is
+    required.
+  </p>
 </section>
 
 <!-- ── 12. Mouse & Keyboard ── -->

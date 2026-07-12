@@ -39,6 +39,7 @@ _ROWS: list = [
     ('rec_mode',      'Rec Mode',     'choice', ('Triggered', 'Continuous')),
     ('threshold',     'Threshold',    'float', (0.0, 1.0)),
     ('min_cross_sec', 'Min Cross (s)', 'float', (0.0, 60.0)),
+    ('min_total_cross_sec', 'Min Total Cross (s)', 'float', (0.0, 3600.0)),
     ('hold_sec',      'Hold (s)',     'float', (0.0, 60.0)),
     ('pre_trig_sec',  'Pre-Trigger (s)', 'float', (0.0, 60.0)),
     ('post_trig_sec', 'Post-Trigger (s)', 'float', (0.0, 60.0)),

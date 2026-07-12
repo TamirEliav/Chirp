@@ -151,6 +151,29 @@ def test_failed_recovery_stays_stalled_for_retry(monkeypatch, fast_stall):
         e.close()
 
 
+def test_transient_stall_unlatches_on_resume(monkeypatch, fast_stall):
+    """Frames resuming on their own (transient endpoint churn during a
+    remote-desktop attach) must cancel the pending recovery — tearing
+    down a stream that is healthy again is exactly the regression that
+    froze the app under AnyDesk."""
+    e = _make_stalled_entity(monkeypatch)
+    try:
+        assert e.check_capture_stalled() is False
+        time.sleep(0.1)
+        assert e.check_capture_stalled() is True
+        # Frames resume before the recovery worker gets to this entity.
+        e.ring.write(np.zeros(CHUNK_FRAMES, dtype=np.float32))
+        assert e.check_capture_stalled() is False
+        assert e.capture_stalled is False
+        # Recovery is now a no-op: nothing torn down, no reconnect.
+        assert e.attempt_capture_recovery() is True
+        assert e.recovery_count == 0
+        assert e.acq_running is True
+    finally:
+        e.acq_running = False
+        e.close()
+
+
 def test_recovery_flushes_open_events_first(monkeypatch, fast_stall):
     """An event mid-recording when the device dies must land on disk
     (via the flush path) before the pipeline is rebuilt."""

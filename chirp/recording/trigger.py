@@ -66,6 +66,11 @@ class ThresholdRecorder:
         # monkeypatches ``_start_flush`` to capture full buffers —
         # behaves exactly as before. RecordingEntity opts in.
         self._streaming = bool(streaming)
+        # Min-total-crossing filter: accumulated above-threshold samples
+        # an event must reach or its file is discarded at finalize time
+        # (0 = disabled). Updated from the ``min_total_cross_sec`` param
+        # on every process_chunk call so flush_all sees the last value.
+        self._min_total_samps = 0
 
     def _streaming_active(self) -> bool:
         """True when this recorder should stream events to disk.
@@ -129,6 +134,7 @@ class ThresholdRecorder:
                       post_trig_sec: float,
                       max_rec_sec: float, pre_trig_sec: float,
                       output_dir: str, enabled: bool,
+                      min_total_cross_sec: float = 0.0,
                       filename_prefix: str = '', filename_suffix: str = '',
                       sample_rate: int = SAMPLE_RATE,
                       should_trigger: bool | None = None,
@@ -163,6 +169,10 @@ class ThresholdRecorder:
         # a backlogged ingest thread no longer shifts every filename
         # timestamp late by the backlog.
         self._chunk_end_wall = chunk_end_wall
+
+        # Min-total-crossing filter threshold, in samples. Updated before
+        # any flush path (including the disable-flush below) can run.
+        self._min_total_samps = max(0, int(min_total_cross_sec * sample_rate))
 
         # ── Resize pre-trigger rolling buffer (in chunks) ─────────────────
         # Holds enough history to cover (pre_trig + min_cross) of lookback.
@@ -238,7 +248,8 @@ class ThresholdRecorder:
         if trigger_pos is not None:
             just_created = self._open_event(
                 trigger_pos, n, need, pre_trig_samps, sample_rate,
-                global_chunk_end=global_chunk_end)
+                global_chunk_end=global_chunk_end,
+                initial_above=int(streak_counts[trigger_pos]))
             self._active_events.append(just_created)
 
         # ── Walk every active event through this chunk ───────────────────
@@ -286,11 +297,19 @@ class ThresholdRecorder:
                             ev['last_above_kept'] = chunk_kept_start + walk_start + lt
                         ev['ended'] = True
                         ev['target_kept'] = ev['last_above_kept'] + 1 + post_trig_samps
+                        # Min-total-crossing accounting: above samples up
+                        # to (and including) the sample that ended the
+                        # event. Above samples in the post-trigger tail
+                        # belong to whatever NEW event they may open.
+                        ev['above_total'] = (ev.get('above_total', 0)
+                                             + int(np.count_nonzero(sub[:end_b + 1])))
                     else:
                         ev['silent_samps'] = int(sil_run[-1])
                         lt = int(last_above_acc[-1])
                         if lt != -1:
                             ev['last_above_kept'] = chunk_kept_start + walk_start + lt
+                        ev['above_total'] = (ev.get('above_total', 0)
+                                             + int(np.count_nonzero(sub)))
 
             # Flush when the post-trigger tail is fully captured.
             if ev['ended'] and ev['samples_kept'] >= ev['target_kept']:
@@ -322,7 +341,8 @@ class ThresholdRecorder:
                 ev['split_index'] = ev.get('split_index') or 1
                 flushed_spans.append(self._span_for_flush(ev))
                 self._flush_event(ev, output_dir, filename_prefix,
-                                  filename_suffix, sample_rate, filename_stream)
+                                  filename_suffix, sample_rate,
+                                  filename_stream, splitting=True)
                 to_remove.append(ev)
 
                 cont = self._open_continuation(
@@ -377,7 +397,8 @@ class ThresholdRecorder:
 
     def _open_event(self, trigger_pos: int, n: int, need: int,
                     pre_trig_samps: int, sample_rate: int,
-                    *, global_chunk_end: int | None = None) -> dict:
+                    *, global_chunk_end: int | None = None,
+                    initial_above: int | None = None) -> dict:
         """Build a new event dict at the given trigger sample.
 
         `trigger_pos` is the sample index in the current chunk where the
@@ -459,6 +480,12 @@ class ThresholdRecorder:
             'writer':          None,   # StreamingWavWriter, lazy
             'written':         0,      # kept-coord samples already on disk
             'stream_failed':   False,
+            # Accumulated above-threshold samples of this event — the
+            # qualifying streak that opened it (may span chunks via the
+            # carry) plus whatever the per-chunk walks add. Compared to
+            # ``_min_total_samps`` at finalize time.
+            'above_total':     int(initial_above
+                                   if initial_above is not None else need),
         }
 
     def _open_continuation(self, parent_ev: dict, chunk: np.ndarray,
@@ -509,6 +536,7 @@ class ThresholdRecorder:
         last_above_kept = samples_kept - 1 if samples_kept > 0 else -1
         ended = False
         target_kept: int | None = None
+        leftover_above = 0
         sub = mask[cont_chunk_pos:]
         nb = sub.shape[0]
         if nb:
@@ -524,11 +552,13 @@ class ThresholdRecorder:
                 ended = True
                 target_kept = last_above_kept + 1 + post_trig_samps
                 sil = int(sil_run[end_b])
+                leftover_above = int(np.count_nonzero(sub[:end_b + 1]))
             else:
                 lt = int(last_above_acc[-1])
                 if lt != -1:
                     last_above_kept = lt
                 sil = int(sil_run[-1])
+                leftover_above = int(np.count_nonzero(sub))
 
         # Continuation's onset is parent's onset + parent's duration so
         # the timestamps reflect the actual capture time of the
@@ -567,6 +597,14 @@ class ThresholdRecorder:
             'writer':          None,
             'written':         0,
             'stream_failed':   False,
+            # The min-total-crossing criterion is a per-EVENT measure:
+            # a continuation carries the parent's accumulated crossing
+            # so the final part of a long split event is judged on the
+            # whole event, never deleted for a quiet tail. (The parent's
+            # walk may already have counted some of the leftover samples
+            # — the small over-count only makes deletion less likely.)
+            'above_total':     (int(parent_ev.get('above_total', 0))
+                                + leftover_above),
         }
 
     # ── H1: streaming storage helpers ────────────────────────────────────
@@ -722,9 +760,45 @@ class ThresholdRecorder:
                 break
         return out
 
+    @staticmethod
+    def _discard_event(ev: dict, filename_stream: str,
+                       min_samps: int) -> None:
+        """Drop an event that failed the min-total-crossing criterion.
+
+        Buffered events simply release their RAM; streamed events abort
+        their StreamingWavWriter, which deletes the in-progress ``.tmp``
+        file — nothing is ever published under the canonical name.
+        """
+        sr = ev.get('sample_rate', SAMPLE_RATE) or SAMPLE_RATE
+        w = ev.get('writer')
+        ev['writer'] = None
+        if w is not None:
+            try:
+                w.abort()
+            except Exception:
+                pass
+        ev['buf'] = []
+        tag = f' [{filename_stream}]' if filename_stream else ''
+        print(f'[REC] discarded event{tag}: total threshold crossing '
+              f'{ev.get("above_total", 0) / sr:.3f}s < minimum '
+              f'{min_samps / sr:.3f}s')
+
     def _flush_event(self, ev: dict, output_dir: str,
                      filename_prefix: str, filename_suffix: str,
-                     sample_rate: int, filename_stream: str) -> None:
+                     sample_rate: int, filename_stream: str,
+                     *, splitting: bool = False) -> None:
+        # Min-total-crossing filter: discard the whole event if its
+        # accumulated above-threshold duration never reached the minimum.
+        # Assessed only at FINAL flushes — a force-split flush
+        # (``splitting=True``) happens mid-event while the total is
+        # still growing, and the continuation inherits the running
+        # total, so the criterion is applied once, on the event's last
+        # file. Events without the counter (legacy callers) pass.
+        min_samps = self._min_total_samps
+        if (min_samps > 0 and not splitting
+                and ev.get('above_total', min_samps) < min_samps):
+            self._discard_event(ev, filename_stream, min_samps)
+            return
         # #57: tag halves of a force-split event with a ``partNN`` token
         # in the filename so the researcher sees they belong to one
         # contiguous capture. The token is injected into the suffix so

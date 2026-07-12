@@ -10,11 +10,13 @@ Phase 3 fixes will chip away at it:
   - #11 (c22): save-button tooltip + dirty-state indicator
 """
 
+import ctypes
 import datetime
 import json
 import os
 import math
 import sys
+import threading
 import time
 from contextlib import contextmanager
 
@@ -78,6 +80,18 @@ class ChirpWindow(QMainWindow):
         # headless tests via ``_pg_use_opengl``.
         self._pg_grid = None
         self._pg_use_opengl = True
+        # Remote-desktop rendering resilience: an RDP attach swaps the
+        # display driver out from under live OpenGL contexts, which is
+        # what actually froze the app under Windows Remote Desktop
+        # (AnyDesk merely mirrors the console session, so it never hit
+        # this). ``_pg_use_opengl`` stays the CONFIGURED value (what the
+        # user saved); ``_gl_effective`` clamps it to raster whenever a
+        # remote session is (or becomes) active. Mid-run transitions are
+        # tracked via WM_WTSSESSION_CHANGE (see nativeEvent).
+        self._remote_display_active = _is_remote_session()
+        if self._remote_display_active:
+            print('[Chirp] Windows remote session detected — rendering '
+                  'in raster mode (OpenGL restored on console login)')
         # 3c: view-mode 'Active only' filter (persisted in view_mode).
         self._vm_active_only = True
         self._vm_visible_sig: tuple = ()
@@ -102,9 +116,15 @@ class ChirpWindow(QMainWindow):
         # per tick) — get_mini_amplitude is a full-buffer reduction and
         # N streams × 20 Hz of it is pure GIL burn for a 30px preview.
         self._mini_amp_rr = 0
-        # TODO#1 (RDP): capture-recovery throttle state.
+        # TODO#1 (RDP): capture-recovery throttle state. Recovery runs
+        # on a background worker thread — PortAudio calls on a dead
+        # WASAPI device (close/reopen/terminate) can block for seconds
+        # or forever, and doing that on the GUI thread froze the whole
+        # app the moment AnyDesk/RDP churned the audio endpoints.
         self._recovery_last_attempt = 0.0
         self._recovery_needs_refresh = False
+        self._recovery_thread: threading.Thread | None = None
+        self._recovery_backoff = 3.0   # doubles on failure, max 30 s
 
         # #7: shared audio-monitor loopback. One output stream; each
         # RecordingEntity is wired into it in `_add_recording` and the
@@ -126,6 +146,85 @@ class ChirpWindow(QMainWindow):
 
         self._update_title()
         self.resize(1400, 850)
+
+        # Remote-desktop resilience: get WM_WTSSESSION_CHANGE delivered
+        # so a mid-run RDP attach/detach can swap the render backend.
+        self._register_session_notification()
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Remote-desktop rendering resilience
+    # ──────────────────────────────────────────────────────────────────────
+
+    #: WM_WTSSESSION_CHANGE wParam values (wtsapi32).
+    _WM_WTSSESSION_CHANGE = 0x02B1
+    _WTS_CONSOLE_CONNECT  = 0x1
+    _WTS_REMOTE_CONNECT   = 0x3
+
+    @property
+    def _gl_effective(self) -> bool:
+        """OpenGL actually usable right now: the configured setting
+        clamped to raster while a remote-desktop session drives the
+        display (RDP swaps the display driver and kills GL contexts)."""
+        return self._pg_use_opengl and not self._remote_display_active
+
+    def _register_session_notification(self) -> None:
+        if sys.platform != 'win32':
+            return
+        try:
+            ctypes.windll.wtsapi32.WTSRegisterSessionNotification(
+                int(self.winId()), 0)   # NOTIFY_FOR_THIS_SESSION
+        except Exception as exc:
+            print(f'[Chirp] WTS session notification unavailable: {exc}')
+
+    def nativeEvent(self, event_type, message):
+        if sys.platform == 'win32':
+            try:
+                import ctypes.wintypes
+                msg = ctypes.wintypes.MSG.from_address(int(message))
+                if msg.message == self._WM_WTSSESSION_CHANGE:
+                    self._on_wts_session_change(int(msg.wParam))
+            except Exception:
+                pass
+        return super().nativeEvent(event_type, message)
+
+    def _on_wts_session_change(self, wparam: int) -> None:
+        """React to the display moving between the console and a remote
+        session. On remote attach every live pyqtgraph viewport is
+        swapped to raster BEFORE the lost GL context can wedge the
+        paint path; on console return the configured backend comes
+        back."""
+        if wparam == self._WTS_REMOTE_CONNECT:
+            if not self._remote_display_active:
+                self._remote_display_active = True
+                print('[Chirp] remote session attached — switching to '
+                      'raster rendering')
+                self._apply_render_backend()
+        elif wparam == self._WTS_CONSOLE_CONNECT:
+            if self._remote_display_active:
+                self._remote_display_active = False
+                print('[Chirp] console session restored — '
+                      + ('OpenGL re-enabled' if self._pg_use_opengl
+                         else 'staying in raster mode (configured)'))
+                self._apply_render_backend()
+
+    def _apply_render_backend(self) -> None:
+        """Swap every live pyqtgraph viewport between OpenGL and raster
+        to match ``_gl_effective``. pyqtgraph's GraphicsView supports
+        this at runtime (``useOpenGL`` replaces the viewport widget);
+        the global config option covers widgets built afterwards."""
+        try:
+            on = self._gl_effective
+            import pyqtgraph as pg
+            pg.setConfigOptions(useOpenGL=on)
+            for gv in self.findChildren(pg.GraphicsView):
+                try:
+                    gv.useOpenGL(on)
+                except Exception:
+                    pass
+        except Exception:
+            # Best-effort — partially-constructed windows (test stubs)
+            # and headless environments must not crash here.
+            pass
 
     # ──────────────────────────────────────────────────────────────────────
     # Dirty-state tracking (#11 / c22)
@@ -204,7 +303,7 @@ class ChirpWindow(QMainWindow):
         # its own layout from the entity signature (display mode /
         # stereo / spectral / amp scale / display window) on each tick.
         from chirp.ui.config_panel import ConfigPlotPanel
-        self._config_panel = ConfigPlotPanel(use_opengl=self._pg_use_opengl)
+        self._config_panel = ConfigPlotPanel(use_opengl=self._gl_effective)
         self._config_panel.thresholdChanged.connect(self._on_threshold_dragged)
         self._config_panel.spectralThresholdChanged.connect(
             self._on_spectral_threshold_dragged)
@@ -830,26 +929,33 @@ class ChirpWindow(QMainWindow):
         self._sb_mc = self._param_row(trig_g, 1, 0, 'Min Cross',
             sb_min=0.0, sb_max=60.0, sb_step=0.001, sb_dec=3, suffix=' s',
             sb_init=DEFAULT_MIN_CROSS)
-        self._sb_hold = self._param_row(trig_g, 2, 0, 'Hold',
+        self._sb_min_total = self._param_row(trig_g, 2, 0, 'Min Total Cross',
+            sb_min=0.0, sb_max=3600.0, sb_step=0.01, sb_dec=3, suffix=' s',
+            sb_init=DEFAULT_MIN_TOTAL_CROSS)
+        self._sb_hold = self._param_row(trig_g, 3, 0, 'Hold',
             sb_min=0.0, sb_max=60.0, sb_step=0.1, sb_dec=2, suffix=' s',
             sb_init=DEFAULT_HOLD)
-        self._sb_pre = self._param_row(trig_g, 3, 0, 'Pre-Trigger',
+        self._sb_pre = self._param_row(trig_g, 4, 0, 'Pre-Trigger',
             sb_min=0.0, sb_max=60.0, sb_step=0.1, sb_dec=2, suffix=' s',
             sb_init=DEFAULT_PRE_TRIG)
-        self._sb_post_trig = self._param_row(trig_g, 4, 0, 'Post-Trigger',
+        self._sb_post_trig = self._param_row(trig_g, 5, 0, 'Post-Trigger',
             sb_min=0.0, sb_max=60.0, sb_step=0.1, sb_dec=2, suffix=' s',
             sb_init=DEFAULT_POST_TRIG)
-        self._sb_maxr = self._param_row(trig_g, 5, 0, 'Max Rec',
+        self._sb_maxr = self._param_row(trig_g, 6, 0, 'Max Rec',
             sb_min=1.0, sb_max=3600.0, sb_step=1.0, sb_dec=1, suffix=' s',
             sb_init=DEFAULT_MAX_REC)
 
         self._sb_mc.setToolTip('Min Cross: minimum time the signal must stay above the threshold to start a recording')
+        self._sb_min_total.setToolTip(
+            'Min Total Cross: minimum ACCUMULATED above-threshold duration '
+            'over the whole event — files whose total crossing time is '
+            'shorter are discarded instead of saved (0 = keep everything)')
         self._sb_hold.setToolTip('Hold: duration of silence after the signal drops before a recording is considered finished')
         self._sb_pre.setToolTip('Pre-Trigger: audio kept before the trigger point (lookback saved to the WAV)')
         self._sb_post_trig.setToolTip('Post-Trigger: audio kept after the last above-threshold sample (tail of the saved WAV)')
         self._sb_maxr.setToolTip('Max Rec: maximum length of a single WAV segment — longer events are split')
 
-        # Band filter row (row 5)
+        # Band filter row (row 7)
         self._chk_freq = QCheckBox('Band filter')
         self._chk_freq.setChecked(False)
         self._chk_freq.setToolTip('Apply a 4th-order Butterworth band-pass filter to the trigger signal and spectrogram input')
@@ -892,9 +998,9 @@ class ChirpWindow(QMainWindow):
         filt_row.addWidget(lbl_hi)
         filt_row.addWidget(self._sb_freq_hi)
         filt_row.addStretch()
-        trig_g.addLayout(filt_row, 6, 0, 1, 3)
+        trig_g.addLayout(filt_row, 7, 0, 1, 3)
 
-        # Detect mode row (row 7)
+        # Detect mode row (row 8)
         lbl_detect = QLabel('Detect Mode')
         lbl_detect.setObjectName('param_label')
         lbl_detect.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
@@ -915,17 +1021,17 @@ class ChirpWindow(QMainWindow):
         detect_row.addWidget(lbl_detect)
         detect_row.addWidget(self._combo_detect_mode)
         detect_row.addStretch()
-        trig_g.addLayout(detect_row, 7, 0, 1, 3)
+        trig_g.addLayout(detect_row, 8, 0, 1, 3)
 
-        # Entropy threshold row (row 8)
-        self._sb_entropy_thr = self._param_row(trig_g, 8, 0, 'Entropy Thr',
+        # Entropy threshold row (row 9)
+        self._sb_entropy_thr = self._param_row(trig_g, 9, 0, 'Entropy Thr',
             sb_min=0.0, sb_max=1.0, sb_step=0.01, sb_dec=2, suffix='',
             sb_init=0.50)
         self._sb_entropy_thr.setEnabled(False)
         self._sb_entropy_thr.setToolTip('Spectral entropy threshold — triggers when entropy falls below this value (0 = pure tone, 1 = white noise)')
 
-        # 2c: entropy debounce duration (row 9)
-        self._sb_entropy_mc = self._param_row(trig_g, 9, 0, 'Entropy Min Dur',
+        # 2c: entropy debounce duration (row 10)
+        self._sb_entropy_mc = self._param_row(trig_g, 10, 0, 'Entropy Min Dur',
             sb_min=0.0, sb_max=10.0, sb_step=0.05, sb_dec=2, suffix=' s',
             sb_init=0.0)
         self._sb_entropy_mc.setEnabled(False)
@@ -937,7 +1043,7 @@ class ChirpWindow(QMainWindow):
 
         self._combo_detect_mode.currentTextChanged.connect(self._on_detect_mode_changed)
 
-        # Auto-calibrate row (row 10)
+        # Auto-calibrate row (row 11)
         self._btn_calibrate = QPushButton('Auto Calibrate')
         self._btn_calibrate.setObjectName('btn_small')
         self._btn_calibrate.setFixedWidth(110)
@@ -978,7 +1084,7 @@ class ChirpWindow(QMainWindow):
         calib_row.addWidget(self._sb_calib_margin)
         calib_row.addWidget(self._lbl_calib_status)
         calib_row.addStretch()
-        trig_g.addLayout(calib_row, 10, 0, 1, 3)
+        trig_g.addLayout(calib_row, 11, 0, 1, 3)
 
         # 4a (v3.3.0): the live-sync checkboxes are gone \u2014 bulk editing
         # is the one-shot Apply All button or the all-streams table.
@@ -1000,7 +1106,7 @@ class ChirpWindow(QMainWindow):
         sync_row.addWidget(self._btn_apply_all)
         sync_row.addWidget(self._btn_config_table)
         sync_row.addStretch()
-        trig_g.addLayout(sync_row, 11, 0, 1, 3)
+        trig_g.addLayout(sync_row, 12, 0, 1, 3)
 
         outer.addWidget(trig_box)
         return w
@@ -1378,6 +1484,7 @@ class ChirpWindow(QMainWindow):
 
         # Trigger params write-through
         self._sb_mc  .valueChanged.connect(lambda _: self._write_trigger_params())
+        self._sb_min_total.valueChanged.connect(lambda _: self._write_trigger_params())
         self._sb_hold     .valueChanged.connect(lambda _: self._write_trigger_params())
         self._sb_pre .valueChanged.connect(lambda _: self._write_trigger_params())
         self._sb_post_trig.valueChanged.connect(lambda _: self._write_trigger_params())
@@ -1430,6 +1537,7 @@ class ChirpWindow(QMainWindow):
         if not e:
             return
         e.min_cross_sec = self._sb_mc.value()
+        e.min_total_cross_sec = self._sb_min_total.value()
         e.hold_sec      = self._sb_hold.value()
         e.pre_trig_sec  = self._sb_pre.value()
         e.post_trig_sec = self._sb_post_trig.value()
@@ -1475,6 +1583,7 @@ class ChirpWindow(QMainWindow):
         e = self._entities[idx]
         e.threshold     = self._sb_thr.value()
         e.min_cross_sec = self._sb_mc.value()
+        e.min_total_cross_sec = self._sb_min_total.value()
         e.hold_sec      = self._sb_hold.value()
         e.pre_trig_sec  = self._sb_pre.value()
         e.post_trig_sec = self._sb_post_trig.value()
@@ -1524,6 +1633,7 @@ class ChirpWindow(QMainWindow):
 
         _set(self._sb_thr,  e.threshold)
         _set(self._sb_mc,   e.min_cross_sec)
+        _set(self._sb_min_total, e.min_total_cross_sec)
         _set(self._sb_hold,      e.hold_sec)
         _set(self._sb_pre,  e.pre_trig_sec)
         _set(self._sb_post_trig, e.post_trig_sec)
@@ -1848,6 +1958,7 @@ class ChirpWindow(QMainWindow):
             return
         self._sb_thr      .setValue(DEFAULT_THRESHOLD)
         self._sb_mc       .setValue(DEFAULT_MIN_CROSS)
+        self._sb_min_total.setValue(DEFAULT_MIN_TOTAL_CROSS)
         self._sb_hold     .setValue(DEFAULT_HOLD)
         self._sb_post_trig.setValue(DEFAULT_POST_TRIG)
         self._sb_maxr     .setValue(DEFAULT_MAX_REC)
@@ -2000,8 +2111,11 @@ class ChirpWindow(QMainWindow):
         self._pg_use_opengl = bool(view_mode.get('use_opengl', True))
         self._vm_active_only = bool(view_mode.get('active_only', True))
         # Drop any grid built with the previous OpenGL setting so it is
-        # recreated with the new one on next view-mode entry.
+        # recreated with the new one on next view-mode entry, and swap
+        # the live config-panel viewport to match (clamped to raster
+        # while a remote session drives the display).
         self._pg_grid = None
+        self._apply_render_backend()
         self._vm_cols_spin.blockSignals(True)
         self._vm_cols_spin.setValue(self._vm_n_cols)
         self._vm_cols_spin.blockSignals(False)
@@ -2283,7 +2397,8 @@ class ChirpWindow(QMainWindow):
         elif key == 'display_seconds':
             e.change_display_seconds(float(value))
         else:
-            if key in ('threshold', 'min_cross_sec', 'hold_sec',
+            if key in ('threshold', 'min_cross_sec', 'min_total_cross_sec',
+                       'hold_sec',
                        'pre_trig_sec', 'post_trig_sec', 'max_rec_sec',
                        'freq_lo', 'freq_hi', 'spectral_threshold',
                        'entropy_min_cross_sec', 'gain_db', 'db_floor',
@@ -2313,6 +2428,7 @@ class ChirpWindow(QMainWindow):
                 # Trigger params
                 ent.threshold     = e.threshold
                 ent.min_cross_sec = e.min_cross_sec
+                ent.min_total_cross_sec = e.min_total_cross_sec
                 ent.hold_sec      = e.hold_sec
                 ent.post_trig_sec = e.post_trig_sec
                 ent.max_rec_sec   = e.max_rec_sec
@@ -2322,6 +2438,8 @@ class ChirpWindow(QMainWindow):
                 ent.freq_hi       = e.freq_hi
                 ent.spectral_trigger_mode = e.spectral_trigger_mode
                 ent.spectral_threshold    = e.spectral_threshold
+                ent.entropy_min_cross_sec = e.entropy_min_cross_sec
+                ent.rec_mode      = e.rec_mode
                 # Display params
                 ent.gain_db       = e.gain_db
                 ent.db_floor      = e.db_floor
@@ -2373,7 +2491,8 @@ class ChirpWindow(QMainWindow):
         only Max Rec matters there. Force Trigger is a Triggered-mode
         tool (Continuous already records everything)."""
         continuous = (getattr(e, 'rec_mode', 'Triggered') == 'Continuous')
-        for wdg in (self._sb_mc, self._sb_hold, self._sb_pre,
+        for wdg in (self._sb_mc, self._sb_min_total, self._sb_hold,
+                    self._sb_pre,
                     self._sb_post_trig, self._combo_detect_mode,
                     self._chk_freq, self._btn_calibrate):
             wdg.setEnabled(not continuous)
@@ -2945,7 +3064,7 @@ class ChirpWindow(QMainWindow):
         deleting it)."""
         if self._pg_grid is None:
             from chirp.ui.central_plots import MultiStreamGrid
-            self._pg_grid = MultiStreamGrid(use_opengl=self._pg_use_opengl)
+            self._pg_grid = MultiStreamGrid(use_opengl=self._gl_effective)
             # 3a: tile interactions — badges clear by ENTITY index; a
             # plain tile click re-targets the monitor when follow mode
             # is on (4d).
@@ -3190,41 +3309,88 @@ class ChirpWindow(QMainWindow):
 
     def _capture_watchdog_tick(self):
         """TODO#1: detect live-device captures that stopped delivering
-        frames (RDP session change ripping out Windows audio endpoints)
-        and auto-reconnect them, throttled to one attempt round per 3 s.
+        frames (a remote-desktop session change ripping out Windows
+        audio endpoints) and auto-reconnect them.
 
-        A global PortAudio refresh (needed when the endpoint list itself
-        went stale) is only performed when NO healthy live-device stream
-        exists — terminating PortAudio kills every open stream. The
-        monitor output stream may also die in a full endpoint churn; the
-        user re-enables it from the monitor bar (its combos keep their
-        selection).
+        The GUI tick only DETECTS and dispatches: every PortAudio call
+        the recovery needs (closing the dead stream, re-enumerating,
+        reopening, terminate/initialize) can block for seconds — or
+        indefinitely on a WASAPI device Windows tore out — so the
+        actual work runs on a daemon worker thread. One worker at a
+        time; attempt rounds are throttled with exponential backoff
+        (3 s doubling to 30 s) so a device that never comes back
+        doesn't get hammered.
         """
         stalled = [e for e in self._entities if e.check_capture_stalled()]
         if not stalled:
+            self._recovery_backoff = 3.0
             return
+        if (self._recovery_thread is not None
+                and self._recovery_thread.is_alive()):
+            return   # a recovery round is still running (possibly hung
+                     # in PortAudio — the GUI must stay responsive)
         now = time.monotonic()
-        if now - self._recovery_last_attempt < 3.0:
+        if now - self._recovery_last_attempt < self._recovery_backoff:
             return
         self._recovery_last_attempt = now
         healthy = [e for e in self._entities
                    if e.acq_running and e.input_source == 'device'
                    and not e.capture_stalled]
-        if not healthy and self._recovery_needs_refresh:
-            from chirp.audio.devices import refresh_portaudio
-            refresh_portaudio()
-            self._recovery_needs_refresh = False
-        any_fail = False
-        for e in stalled:
-            try:
-                if not e.attempt_capture_recovery():
+        # A global PortAudio refresh (needed when the endpoint list
+        # itself went stale) kills every open stream — only allowed when
+        # NO healthy live-device stream exists, and the worker closes
+        # the monitor's output stream first (terminating PortAudio under
+        # an open output stream is exactly the kind of native hang that
+        # froze the app under AnyDesk).
+        do_refresh = (not healthy) and self._recovery_needs_refresh
+        t = threading.Thread(
+            target=self._capture_recovery_worker,
+            args=(list(stalled), do_refresh),
+            name='chirp-capture-recovery', daemon=True)
+        self._recovery_thread = t
+        t.start()
+
+    def _capture_recovery_worker(self, stalled, do_refresh: bool):
+        """Background body of one capture-recovery round (TODO#1).
+
+        Runs entirely off the GUI thread; a PortAudio call that hangs
+        here leaks this worker but leaves the app usable (the sticky
+        `!` badge keeps telling the user the stream is down). Entities
+        whose capture resumed on its own between detection and this
+        round are skipped by ``attempt_capture_recovery``'s
+        ``capture_stalled`` guard.
+        """
+        try:
+            if do_refresh:
+                try:
+                    # Terminating PortAudio with the monitor's output
+                    # stream open is a native-level hang — close it
+                    # first. The monitor bar keeps its device selection;
+                    # the user re-enables it after the churn settles.
+                    self._monitor.close()
+                except Exception:
+                    pass
+                from chirp.audio.devices import refresh_portaudio
+                refresh_portaudio()
+                self._recovery_needs_refresh = False
+            any_fail = False
+            for e in stalled:
+                try:
+                    if not e.attempt_capture_recovery():
+                        any_fail = True
+                except Exception as exc:
                     any_fail = True
-            except Exception as exc:
-                any_fail = True
-                print(f'[Chirp] capture recovery failed for {e.name}: {exc}')
-        # If reopening by name failed, the PortAudio device list itself
-        # is probably stale — allow a global refresh on the next round.
-        self._recovery_needs_refresh = any_fail
+                    print(f'[Chirp] capture recovery failed for '
+                          f'{e.name}: {exc}')
+            # If reopening by name failed, the PortAudio device list
+            # itself is probably stale — allow a global refresh on the
+            # next round, and back off so a permanently-gone device
+            # isn't hammered every 3 s.
+            self._recovery_needs_refresh = any_fail
+            self._recovery_backoff = (min(self._recovery_backoff * 2, 30.0)
+                                      if any_fail else 3.0)
+        except Exception as exc:
+            print(f'[Chirp] capture recovery round crashed: {exc}')
 
     def _update_plot_body(self):
         """#58: extracted from ``_update_plot`` so the top-level
@@ -3471,6 +3637,21 @@ class ChirpWindow(QMainWindow):
                 pass
 
         super().closeEvent(event)
+
+
+def _is_remote_session() -> bool:
+    """True when this process runs inside a Windows remote-desktop
+    session (``GetSystemMetrics(SM_REMOTESESSION)``). RDP swaps the
+    display driver, so OpenGL must be avoided; screen-mirroring tools
+    (AnyDesk, TeamViewer) attach to the console session and return
+    False here — their rendering path is unaffected."""
+    if sys.platform != 'win32':
+        return False
+    try:
+        SM_REMOTESESSION = 0x1000
+        return bool(ctypes.windll.user32.GetSystemMetrics(SM_REMOTESESSION))
+    except Exception:
+        return False
 
 
 # ──────────────────────────────────────────────────────────────────────────────

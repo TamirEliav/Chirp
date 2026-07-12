@@ -53,6 +53,9 @@ AMP_DB_EPS          = 1e-4   # 10**(AMP_DB_MIN/20) — linear floor
 # ── Recording defaults ─────────────────────────────────────────────────────────
 DEFAULT_THRESHOLD   = 0.05
 DEFAULT_MIN_CROSS   = 0.020
+# Min total crossing: minimum ACCUMULATED above-threshold duration an
+# event must reach for its WAV to be kept (0 = filter disabled).
+DEFAULT_MIN_TOTAL_CROSS = 0.0
 DEFAULT_HOLD        = 1.00
 DEFAULT_PRE_TRIG    = 0.50
 DEFAULT_POST_TRIG   = 0.50
@@ -190,7 +193,8 @@ __all__ = [
     "ANIMATION_INTERVAL", "SPEC_DB_MIN", "SPEC_DB_MAX", "N_DISPLAY_ROWS",
     "AMP_DB_MIN", "AMP_DB_MAX", "AMP_DB_EPS",
     # Recording defaults
-    "DEFAULT_THRESHOLD", "DEFAULT_MIN_CROSS", "DEFAULT_HOLD",
+    "DEFAULT_THRESHOLD", "DEFAULT_MIN_CROSS", "DEFAULT_MIN_TOTAL_CROSS",
+    "DEFAULT_HOLD",
     "DEFAULT_POST_TRIG", "DEFAULT_MAX_REC", "DEFAULT_PRE_TRIG",
     "RECORDINGS_DIR", "DEFAULT_FREQ_LO", "DEFAULT_FREQ_HI",
     # Theme
