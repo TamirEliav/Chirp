@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Chirp is a real-time sound analysis and threshold-triggered recording desktop app for bioacoustics research. Built with Python/PyQt5 + pyqtgraph/OpenGL (v3.0.0 re-architecture). Organized as the `chirp/` package after the Phase 1 refactor (was previously a ~4200-line `chirp.py` monolith). Current version: v3.3.0.
+Chirp is a real-time sound analysis and threshold-triggered recording desktop app for bioacoustics research. Built with Python/PyQt5 + pyqtgraph/OpenGL (v3.0.0 re-architecture). Organized as the `chirp/` package after the Phase 1 refactor (was previously a ~4200-line `chirp.py` monolith). Current version: v3.4.0.
 
 ## Running the App
 
@@ -94,6 +94,8 @@ AudioCapture callback → queue → [ingestion thread] RecordingEntity.ingest_ch
 - **Spectral entropy trigger**: Normalized Shannon entropy (0=pure tone, 1=white noise) computed from FFT magnitudes. Four modes: Amplitude Only, Spectral Only, Amp AND Spectral, Amp OR Spectral. Triggers when entropy falls *below* threshold. Entropy trace plot with draggable threshold appears when a spectral mode is active.
 - **Stereo trigger modes**: Left Channel, Right Channel, Any Channel, Both Channels, Average — applies to both amplitude and entropy triggers.
 - **Auto-calibrate**: Measures ambient noise to set threshold automatically.
+- **Audio monitor gain**: `AudioMonitor.set_gain()` (0.0–2.0, unity 1.0) applied in the output callback with clip-on-boost; UI slider (0–200%) in the monitor bar, session-scoped like source/output.
+- **Per-stream enable switch**: `stream_enabled` (persisted, default True) — a disabled stream keeps its config but is skipped by Start All Acq / Start All Rec (its own buttons still work; Stop All reaches everything). Sidebar On/Off button (disabling stops the stream immediately) + "Enabled" row in the All-Streams table.
 - **Display modes**: `display_mode` on RecordingEntity controls subplot layout — 'Spectrogram' (default), 'Waveform' (raw signed audio in teal), or 'Both'. The subplot grid is rebuilt dynamically in `_rebuild_axes()`.
 - **Config format**: JSON with a `recordings` array and `view_mode` object. Also reads legacy `.chirp` files. v1.1.0 added `spectral_trigger_mode`, `spectral_threshold`, and `display_mode` to serialization.
 - **Styling**: Catppuccin Mocha dark theme via embedded QSS; Consolas monospace font for labels. Teal (`#94e2d5`) for waveform, peach (`#fab387`) for entropy threshold.

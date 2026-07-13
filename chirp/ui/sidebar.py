@@ -84,6 +84,9 @@ class RecordingSidebarItem(QWidget):
     move_down = pyqtSignal(int)
     delete   = pyqtSignal(int)
     renamed  = pyqtSignal(int, str)
+    # Per-stream enable switch: a disabled stream keeps its full
+    # configuration but is skipped by Start All Acq / Start All Rec.
+    toggle_enabled = pyqtSignal(int)
     # #28 / #29: click-to-clear sticky session flags.
     clear_sat_requested   = pyqtSignal(int)
     clear_drops_requested = pyqtSignal(int)
@@ -182,7 +185,7 @@ class RecordingSidebarItem(QWidget):
         self._mini_amp = MiniAmplitudeWidget()
         vbox.addWidget(self._mini_amp)
 
-        # Row 3: move/delete buttons
+        # Row 3: move/delete buttons + per-stream enable switch
         row3 = QHBoxLayout()
         row3.setSpacing(4)
         btn_up = QPushButton('\u25b2')
@@ -197,11 +200,19 @@ class RecordingSidebarItem(QWidget):
         btn_up.clicked.connect(lambda: self.move_up.emit(self._index))
         btn_dn.clicked.connect(lambda: self.move_down.emit(self._index))
         btn_del.clicked.connect(lambda: self.delete.emit(self._index))
+        self._stream_enabled = True
+        self._btn_enable = QPushButton('On')
+        self._btn_enable.setObjectName('btn_small')
+        self._btn_enable.setFixedSize(34, 20)
+        self._btn_enable.clicked.connect(
+            lambda: self.toggle_enabled.emit(self._index))
         row3.addWidget(btn_up)
         row3.addWidget(btn_dn)
         row3.addWidget(btn_del)
         row3.addStretch()
+        row3.addWidget(self._btn_enable)
         vbox.addLayout(row3)
+        self._apply_enabled_style()
 
     @property
     def index(self):
@@ -218,17 +229,51 @@ class RecordingSidebarItem(QWidget):
                 f'background: {C["surface0"]}; '
                 f'border: 2px solid {C["blue"]}; border-radius: 6px; '
                 f'border-left: 4px solid {C["blue"]};')
-            self._name_label.setStyleSheet(
-                f'color: {C["blue"]}; font-weight: bold; font-size: 9pt; border: none;')
         else:
             self.setStyleSheet(
                 f'background: {C["mantle"]}; '
                 f'border: 1px solid {C["surface1"]}; border-radius: 6px;')
-            self._name_label.setStyleSheet(
-                f'color: {C["text"]}; font-weight: bold; font-size: 9pt; border: none;')
+        self._refresh_name_style()
 
     def set_name(self, name: str):
         self._name_label.setText(name)
+
+    # ── Per-stream enable switch ─────────────────────────────────────
+
+    def set_stream_enabled(self, enabled: bool):
+        enabled = bool(enabled)
+        if enabled == self._stream_enabled:
+            return
+        self._stream_enabled = enabled
+        self._apply_enabled_style()
+
+    def _apply_enabled_style(self):
+        en = self._stream_enabled
+        self._btn_enable.setText('On' if en else 'Off')
+        self._btn_enable.setToolTip(
+            'Stream enabled — included in Start All Acq / Start All Rec. '
+            'Click to disable.'
+            if en else
+            'Stream DISABLED — kept configured but skipped by Start All '
+            'Acq / Start All Rec (its own buttons still work). Click to '
+            're-enable.')
+        color = C['green'] if en else C['red']
+        self._btn_enable.setStyleSheet(
+            f'QPushButton {{ color: {color}; font-weight: bold; '
+            f'font-size: 8pt; }}')
+        self._refresh_name_style()
+
+    def _refresh_name_style(self):
+        if not self._stream_enabled:
+            color = C['surface2']
+        elif self._selected:
+            color = C['blue']
+        else:
+            color = C['text']
+        deco = '' if self._stream_enabled else ' text-decoration: line-through;'
+        self._name_label.setStyleSheet(
+            f'color: {color}; font-weight: bold; font-size: 9pt; '
+            f'border: none;{deco}')
 
     def update_status(self, acq: bool, rec: bool, trig: bool):
         key = (acq, rec, trig)
@@ -381,6 +426,8 @@ class RecordingSidebar(QWidget):
     clear_drops_requested = pyqtSignal(int)
     # #43 / #44 / #48: click-to-clear sticky error badge.
     clear_errors_requested = pyqtSignal(int)
+    # Per-stream enable switch (On/Off button on each item).
+    toggle_enabled_requested = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -455,6 +502,7 @@ class RecordingSidebar(QWidget):
         item.clear_sat_requested.connect(self.clear_sat_requested.emit)
         item.clear_drops_requested.connect(self.clear_drops_requested.emit)
         item.clear_errors_requested.connect(self.clear_errors_requested.emit)
+        item.toggle_enabled.connect(self.toggle_enabled_requested.emit)
         self._scroll_layout.insertWidget(idx, item)
         self._items.append(item)
         return idx
@@ -514,6 +562,11 @@ class RecordingSidebar(QWidget):
     def update_item_name(self, idx: int, name: str):
         if 0 <= idx < len(self._items):
             self._items[idx].set_name(name)
+
+    def set_item_stream_enabled(self, idx: int, enabled: bool):
+        """Reflect the per-stream enable switch on one item."""
+        if 0 <= idx < len(self._items):
+            self._items[idx].set_stream_enabled(enabled)
 
     def clear_all(self):
         for item in self._items:

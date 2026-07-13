@@ -212,8 +212,21 @@ class AudioMonitor:
         )
         self._source_id: Any = None
         self._last_error: str | None = None
+        # Output gain, 0.0–2.0 (1.0 = unity / 100%). Applied in the
+        # output callback; survives device reopen and mute toggles.
+        self._gain: float = 1.0
 
     # ── Public API ────────────────────────────────────────────────────
+
+    @property
+    def gain(self) -> float:
+        return self._gain
+
+    def set_gain(self, gain: float) -> None:
+        """Set the monitor output gain (clamped to 0.0–2.0; 1.0 =
+        unity). A single float store, atomic under the GIL — safe to
+        call from the UI thread while the output callback runs."""
+        self._gain = float(min(2.0, max(0.0, gain)))
 
     @property
     def output_device(self) -> Any:
@@ -342,3 +355,11 @@ class AudioMonitor:
             n = self._ring.read(frames, outdata)
             if n < frames:
                 outdata[n:] = 0.0
+        # Output gain (0–200%). In-place scale on the filled region;
+        # boosted output is clipped to full scale so a >100% gain can't
+        # wrap when the driver converts to fixed point.
+        g = self._gain
+        if g != 1.0 and n > 0:
+            outdata[:n] *= g
+            if g > 1.0:
+                np.clip(outdata[:n], -1.0, 1.0, out=outdata[:n])

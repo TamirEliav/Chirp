@@ -305,3 +305,44 @@ def test_monitor_set_source_is_hashable_token():
         assert m.source_id == token
     m.set_source(None)
     assert m.source_id is None
+
+
+# ── Output gain (0–200%) ---------------------------------------------------
+
+def test_gain_default_and_clamping():
+    m = AudioMonitor()
+    assert m.gain == 1.0
+    m.set_gain(0.5)
+    assert m.gain == 0.5
+    m.set_gain(-1.0)
+    assert m.gain == 0.0          # clamped low
+    m.set_gain(5.0)
+    assert m.gain == 2.0          # clamped high (200%)
+
+
+def test_callback_applies_gain():
+    m = AudioMonitor()
+    m.set_gain(0.5)
+    m._ring.write(np.full(CHUNK_FRAMES, 0.8, dtype=np.float32))
+    out = np.zeros((CHUNK_FRAMES, 1), dtype=np.float32)
+    m._callback(out, CHUNK_FRAMES, None, None)
+    np.testing.assert_allclose(out[:, 0], 0.4, atol=1e-6)
+
+
+def test_callback_boost_clips_to_full_scale():
+    m = AudioMonitor()
+    m.set_gain(2.0)
+    m._ring.write(np.full(CHUNK_FRAMES, 0.8, dtype=np.float32))
+    out = np.zeros((CHUNK_FRAMES, 1), dtype=np.float32)
+    m._callback(out, CHUNK_FRAMES, None, None)
+    # 0.8 * 2.0 = 1.6 → clipped to full scale, never wrapped.
+    np.testing.assert_allclose(out[:, 0], 1.0, atol=1e-6)
+
+
+def test_callback_unity_gain_leaves_samples_untouched():
+    m = AudioMonitor()
+    m._ring.write(np.full(4, 0.25, dtype=np.float32))
+    out = np.zeros((CHUNK_FRAMES, 1), dtype=np.float32)
+    m._callback(out, CHUNK_FRAMES, None, None)
+    np.testing.assert_allclose(out[:4, 0], 0.25, atol=1e-7)
+    np.testing.assert_allclose(out[4:, 0], 0.0)

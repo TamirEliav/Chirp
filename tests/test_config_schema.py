@@ -188,3 +188,28 @@ def test_multiple_entities_preserve_order():
     entities, _, _ = load_settings_dict(decoded)
 
     assert [r.name for r in entities] == ["First", "Second", "Third"]
+
+
+def test_stream_enabled_roundtrip_and_default():
+    """Per-stream enable switch: defaults True (older files omit the
+    key), serializes, and survives a to_dict/from_dict round-trip."""
+    e = RecordingEntity(name='se', device_id=None)
+    try:
+        assert e.stream_enabled is True
+        e.stream_enabled = False
+        d = e.to_dict()
+        assert d['stream_enabled'] is False
+        e2, _warn = RecordingEntity.from_dict(d)
+        try:
+            assert e2.stream_enabled is False
+        finally:
+            e2.close()
+        # Legacy dict without the key → default True.
+        d.pop('stream_enabled')
+        e3, _warn = RecordingEntity.from_dict(d)
+        try:
+            assert e3.stream_enabled is True
+        finally:
+            e3.close()
+    finally:
+        e.close()

@@ -62,9 +62,10 @@ _KNOWN_RECORDING_KEYS: frozenset[str] = frozenset({
     # omit them and get the defaults, so no schema-version bump.
     "entropy_min_cross_sec", "rec_mode",
     "display_mode",
-    # v3.4.0 addition — min-total-crossing file filter; optional, older
-    # files omit it and get the default (0 = disabled).
+    # v3.4.0 additions — min-total-crossing file filter + per-stream
+    # enable switch; optional, older files omit them and get defaults.
     "min_total_cross_sec",
+    "stream_enabled",
     "analysis_nperseg", "analysis_window",
     "input_source", "wav_file_path", "wav_loop",
 })

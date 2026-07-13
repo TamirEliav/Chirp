@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Chirp v3.3.0 — User Manual</title>
+<title>Chirp v3.4.0 — User Manual</title>
 <style>
   :root {
     --base: #1e1e2e;
@@ -304,7 +304,7 @@
 <nav class="sidebar">
   <div class="logo">
     <h1>Chirp</h1>
-    <span>User Manual &mdash; v3.3.0</span>
+    <span>User Manual &mdash; v3.4.0</span>
   </div>
   <ul>
     <li><a href="#overview">Overview</a></li>
@@ -365,7 +365,7 @@
 <header class="hero">
   <h1>Chirp</h1>
   <p class="subtitle">Real-Time Audio Monitoring, Visualization &amp; Triggered Recording</p>
-  <span class="version">v3.3.0</span>
+  <span class="version">v3.4.0</span>
 </header>
 
 <!-- ── 1. Overview ── -->
@@ -455,6 +455,13 @@ python chirp.py</code></pre>
     <li><strong>Mini amplitude preview</strong> &mdash; a small real-time level meter</li>
     <li><strong>Reorder buttons</strong> &mdash; move streams up or down in the list</li>
     <li><strong>Delete button</strong> &mdash; remove a stream</li>
+    <li><strong>On/Off switch</strong> &mdash; per-stream enable. A disabled stream (greyed-out,
+      struck-through name) keeps its full configuration but is <em>skipped by Start All Acq and
+      Start All Rec</em> &mdash; useful for keeping a stream defined without it participating in
+      bulk operations. Disabling also stops the stream immediately if it was running; its own
+      per-stream Start buttons still work for deliberate one-off use, and Stop All always stops
+      every stream. The switch is persisted in the config file and also editable in the
+      All-Streams Table ("Enabled" row).</li>
   </ul>
   <p>
     Click <strong>Add Recording</strong> at the bottom of the sidebar to create a new stream.
@@ -961,7 +968,9 @@ python chirp.py</code></pre>
     output stream but keeps both the source and output device selections, so re-enabling restores
     the exact same routing. The <strong>Follow</strong> checkbox makes the monitor track your
     selection: selecting a stream in the sidebar (Config mode) or clicking a tile (View mode)
-    routes that stream to the speakers.
+    routes that stream to the speakers. A <strong>Gain</strong> slider (0&ndash;200%, default
+    100% = unity) scales the loopback playback volume &mdash; recordings are never affected;
+    output boosted past full scale is clipped, not wrapped.
   </p>
   <h3>Reference Date &amp; Subfolder Naming</h3>
   <p>
@@ -1233,7 +1242,7 @@ python chirp.py</code></pre>
 
 <!-- Footer -->
 <footer style="margin-top:3rem; padding-top:1.5rem; border-top:1px solid var(--surface0); text-align:center; color:var(--overlay0); font-size:0.82rem;">
-  <p>Chirp v3.3.0 &mdash; User Manual</p>
+  <p>Chirp v3.4.0 &mdash; User Manual</p>
   <p>Designed for bioacoustics research. Built with Python, PyQt5, and pyqtgraph.</p>
 </footer>
 

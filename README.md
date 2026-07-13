@@ -4,7 +4,7 @@
 
 Chirp is a desktop application for multi-stream audio monitoring, visualization, and threshold-triggered recording. It was designed with bioacoustics research in mind but works for any audio analysis task.
 
-![Version](https://img.shields.io/badge/Version-v3.3.0-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5%20%2B%20pyqtgraph-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
+![Version](https://img.shields.io/badge/Version-v3.4.0-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5%20%2B%20pyqtgraph-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 ---
 
@@ -109,6 +109,22 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 
 ### WAV File Replay (Testing)
 - Swap the live capture for a WAV file (`WavFileCapture`) to feed a reproducible signal through the full pipeline — trigger, writer, spectrogram, entropy — for regression testing and offline analysis
+
+---
+
+## What's New in v3.4.0
+
+Field-driven fixes and controls.
+
+- **Remote-desktop freeze fixed for real** — the v3.3.0 capture watchdog ran its recovery on the GUI thread, freezing the app the moment AnyDesk/RDP churned the audio endpoints; recovery now runs on a background worker with backoff, transient stalls un-latch when frames resume by themselves, and a global PortAudio refresh only happens with the monitor's output stream closed. The *actual* RDP display hang (RDP swaps the display driver, killing OpenGL contexts) is handled too: Chirp renders raster inside a remote session and swaps every live viewport on a mid-run `WM_WTSSESSION_CHANGE`, restoring OpenGL at console login. AnyDesk-style screen mirroring is unaffected.
+- **Split-boundary corruption fixed** — finalizing a finished `max_rec` part (fsync + rename of a multi-MB WAV) ran synchronously on the audio ingest thread, stalling capture mid-event and corrupting the start of the next part (WASAPI silence-fills glitched packets → the observed zero-amplitude samples). Publishes now run on the writer pool; the ingest thread never blocks on disk at a part boundary.
+- **Split naming reworked** — the `_partNN` suffix is gone: every file, split or not, shares one name format. Each part's filename timestamp is its own capture time (part 2 = part 1 onset + part 1 duration), so a long event reads as consecutively-timestamped WAVs.
+- **Min Total Cross filter** — new per-stream trigger parameter: an event whose *accumulated* above-threshold duration (across all bursts bridged by Hold) never reaches the minimum is discarded just before finalize (streamed events delete their `.tmp`; nothing is published). 0 disables. Split parts are judged on the whole event's running total.
+- **Monitor gain** — a 0–200% gain slider in the monitor bar (100% = unity), applied to loopback playback only; boosts past full scale clip instead of wrapping.
+- **Per-stream enable switch** — an On/Off button on each sidebar entry (persisted, also editable in the All-Streams Table): a disabled stream keeps its full configuration but is skipped by *Start All Acq* / *Start All Rec*; disabling stops it immediately, and its own buttons still work for deliberate one-off use.
+- **Apply All fix** — `entropy_min_cross_sec` and `rec_mode` were silently skipped when copying settings to all streams.
+
+Tests: 317 passed.
 
 ---
 

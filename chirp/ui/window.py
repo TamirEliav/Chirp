@@ -28,7 +28,7 @@ from PyQt5.QtWidgets import (
     QGridLayout, QGroupBox, QPushButton, QLabel, QLineEdit,
     QFileDialog, QFrame, QSizePolicy, QDoubleSpinBox, QComboBox, QCheckBox,
     QScrollArea, QStackedLayout, QDialog, QCalendarWidget, QMessageBox, QSpinBox,
-    QMenu, QAction, QActionGroup,
+    QMenu, QAction, QActionGroup, QSlider,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QSize, QDate, QPointF
 from PyQt5.QtGui import QFont, QPainter, QColor, QPainterPath, QPen, QPolygonF, QCursor
@@ -570,6 +570,29 @@ class ChirpWindow(QMainWindow):
         btn_refresh.clicked.connect(self._on_refresh_monitor_outputs)
         h.addWidget(btn_refresh)
 
+        h.addSpacing(8)
+
+        # Output gain: 0\u2013200%, unity at 100%. Session-scoped like the
+        # rest of the monitor bar (source/output are not persisted).
+        lbl_gain = QLabel('Gain:')
+        lbl_gain.setStyleSheet(f'color: {C["subtext"]}; font-size: 9pt;')
+        h.addWidget(lbl_gain)
+        self._monitor_gain_slider = QSlider(Qt.Horizontal)
+        self._monitor_gain_slider.setRange(0, 200)
+        self._monitor_gain_slider.setValue(100)
+        self._monitor_gain_slider.setFixedWidth(110)
+        self._monitor_gain_slider.setToolTip(
+            'Monitor output gain (0\u2013200%, 100% = unity). Applied to the '
+            'loopback playback only \u2014 recordings are unaffected. Boosted '
+            'output above full scale is clipped.')
+        self._monitor_gain_slider.valueChanged.connect(
+            self._on_monitor_gain_changed)
+        h.addWidget(self._monitor_gain_slider)
+        self._monitor_gain_label = QLabel('100%')
+        self._monitor_gain_label.setStyleSheet(
+            f'color: {C["subtext"]}; font-size: 9pt; min-width: 34px;')
+        h.addWidget(self._monitor_gain_label)
+
         self._monitor_status = QLabel('')
         self._monitor_status.setStyleSheet(
             f'color: {C["subtext"]}; font-size: 9pt; min-width: 40px;')
@@ -734,6 +757,10 @@ class ChirpWindow(QMainWindow):
 
     def _on_refresh_monitor_outputs(self):
         self._populate_monitor_output_combo()
+
+    def _on_monitor_gain_changed(self, value: int):
+        self._monitor.set_gain(value / 100.0)
+        self._monitor_gain_label.setText(f'{value}%')
 
     def _update_monitor_status(self):
         """Reflect backend state on the little status label."""
@@ -1527,6 +1554,9 @@ class ChirpWindow(QMainWindow):
         self._sidebar.clear_drops_requested.connect(self._on_clear_drops)
         # #43 / #44 / #48: sticky error-flag reset.
         self._sidebar.clear_errors_requested.connect(self._on_clear_errors)
+        # Per-stream enable switch.
+        self._sidebar.toggle_enabled_requested.connect(
+            self._on_toggle_stream_enabled)
 
     # ──────────────────────────────────────────────────────────────────────
     # Write-through: widgets → selected entity
@@ -1931,26 +1961,46 @@ class ChirpWindow(QMainWindow):
             self._refresh_transport_ui()
 
     def _on_start_all_acq(self):
-        for e in self._entities:
+        # Disabled streams are skipped by the bulk START actions (their
+        # per-stream buttons still work for deliberate one-off use).
+        active = [e for e in self._entities if e.stream_enabled]
+        for e in active:
             e.reset_display()
-        for e in self._entities:
+        for e in active:
             e.start_acq()
         self._refresh_transport_ui()
 
     def _on_stop_all_acq(self):
+        # Stop applies to every stream — including a disabled one the
+        # user started manually; stopping is always safe.
         for e in self._entities:
             e.stop_acq()
         self._refresh_transport_ui()
 
     def _on_start_all_rec(self):
         for e in self._entities:
-            e.start_rec()
+            if e.stream_enabled:
+                e.start_rec()
         self._refresh_transport_ui()
 
     def _on_stop_all_rec(self):
         for e in self._entities:
             e.stop_rec()
         self._refresh_transport_ui()
+
+    def _on_toggle_stream_enabled(self, idx: int):
+        """Flip a stream's enable switch. Disabling also stops the
+        stream immediately (acquisition + recording) so one click
+        silences it; the configuration is fully preserved."""
+        if not (0 <= idx < len(self._entities)):
+            return
+        e = self._entities[idx]
+        e.stream_enabled = not e.stream_enabled
+        if not e.stream_enabled:
+            e.stop_acq()
+        self._sidebar.set_item_stream_enabled(idx, e.stream_enabled)
+        self._refresh_transport_ui()
+        self._mark_dirty()
 
     def _on_reset_params(self):
         e = self._sel
@@ -2134,7 +2184,8 @@ class ChirpWindow(QMainWindow):
             # #7: re-wire the monitor on every freshly-loaded entity.
             ent.set_monitor(self._monitor)
             self._entities.append(ent)
-            self._sidebar.add_item(ent.name)
+            idx = self._sidebar.add_item(ent.name)
+            self._sidebar.set_item_stream_enabled(idx, ent.stream_enabled)
         # Rebuild monitor-source combo from the loaded entities.
         self._refresh_monitor_source_combo()
 
@@ -2410,6 +2461,13 @@ class ChirpWindow(QMainWindow):
             if key in ('freq_filter_enabled', 'freq_lo', 'freq_hi'):
                 e.bpf.reset()
                 e.bpf_r.reset()
+            if key == 'stream_enabled':
+                # Same semantics as the sidebar On/Off button:
+                # disabling stops the stream immediately.
+                if not value:
+                    e.stop_acq()
+                self._sidebar.set_item_stream_enabled(idx, bool(value))
+                self._refresh_transport_ui()
         self._mark_dirty()
         # Keep the per-stream panel in sync when the edited stream is
         # the selected one.

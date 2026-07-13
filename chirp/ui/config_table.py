@@ -36,6 +36,7 @@ _ROWS: list = [
     ('channel_mode',  'Channels',     'readonly', None),
     ('input_source',  'Input Source', 'readonly', None),
     (None, '— Recording —', None, None),
+    ('stream_enabled', 'Enabled', 'bool', None),
     ('rec_mode',      'Rec Mode',     'choice', ('Triggered', 'Continuous')),
     ('threshold',     'Threshold',    'float', (0.0, 1.0)),
     ('min_cross_sec', 'Min Cross (s)', 'float', (0.0, 60.0)),

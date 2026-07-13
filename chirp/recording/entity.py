@@ -108,6 +108,12 @@ class RecordingEntity:
         self._analysis_acc: SpectrogramAccumulator | None = None
         self._analysis_acc_r: SpectrogramAccumulator | None = None
 
+        # Per-stream enable switch: a disabled stream stays fully
+        # configured but is skipped by the bulk transport actions
+        # (Start All Acq / Start All Rec) — the individual per-stream
+        # buttons still work for deliberate one-off use. Persisted.
+        self.stream_enabled = True
+
         # Trigger params
         self.threshold     = DEFAULT_THRESHOLD
         self.min_cross_sec = DEFAULT_MIN_CROSS
@@ -1509,6 +1515,7 @@ class RecordingEntity:
             'input_source':        self.input_source,
             'wav_file_path':       self.wav_file_path,
             'wav_loop':            self.wav_loop,
+            'stream_enabled':      self.stream_enabled,
         }
 
     @classmethod
@@ -1538,7 +1545,8 @@ class RecordingEntity:
                      'spectral_trigger_mode', 'spectral_threshold',
                      'entropy_min_cross_sec', 'rec_mode',
                      'display_mode',
-                     'input_source', 'wav_file_path', 'wav_loop'):
+                     'input_source', 'wav_file_path', 'wav_loop',
+                     'stream_enabled'):
             if attr in d:
                 setattr(e, attr, d[attr])
 
