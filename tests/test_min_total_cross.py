@@ -20,8 +20,18 @@ import pytest
 
 from chirp.constants import CHUNK_FRAMES
 from chirp.recording.trigger import ThresholdRecorder
+from chirp.recording import writer as writer_mod
 
 SR = 44100
+
+
+@pytest.fixture(autouse=True)
+def _shutdown_writer_pool():
+    """The streaming tests exercise the real writer pool (publishes are
+    deferred to it); shut it down so its non-daemon workers can't keep
+    the pytest process alive."""
+    yield
+    writer_mod.shutdown(timeout=10.0)
 
 
 @pytest.fixture
@@ -138,8 +148,10 @@ def test_force_split_parts_exempt_and_total_inherited(captured_flushes):
                 max_rec_sec=CHUNK_FRAMES / SR)
     for _ in range(3):
         rec.process_chunk(loud, trigger_mask=all_above, **p)
-    part_suffixes = [f["suffix"] for f in captured_flushes]
-    assert part_suffixes == ["part01", "part02", "part03"]
+    # Three split-part flushes happened despite the huge minimum
+    # (split flushes are exempt); no partNN token in the suffix.
+    assert len(captured_flushes) == 3
+    assert all(f["suffix"] == "" for f in captured_flushes)
 
 
 def test_streaming_discard_deletes_tmp(tmp_path):
@@ -163,6 +175,8 @@ def test_streaming_discard_deletes_tmp(tmp_path):
     rec2.process_chunk(loud, trigger_mask=all_above, **p2)
     rec2.process_chunk(np.zeros(CHUNK_FRAMES, dtype=np.float32),
                        trigger_mask=none_above, **p2)
+    # The publish (fsync + rename) is deferred to the writer pool.
+    assert writer_mod.drain(timeout=10.0)
     names = os.listdir(out)
     assert len(names) == 1 and names[0].endswith(".wav")
 

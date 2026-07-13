@@ -24,6 +24,7 @@ def flushes(monkeypatch):
         out.append({
             'audio': np.concatenate(buf_snapshot),
             'suffix': suffix,
+            'onset_time': onset_time,
         })
 
     monkeypatch.setattr(ThresholdRecorder, '_start_flush',
@@ -64,8 +65,12 @@ def test_continuous_records_silence_and_splits_at_max_rec(flushes):
         assert len(flushes) == 2
         for f in flushes:
             assert f['audio'].size == 4 * CHUNK_FRAMES
-        assert 'part01' in flushes[0]['suffix']
-        assert 'part02' in flushes[1]['suffix']
+        # Parts share the plain name format (no partNN token); their
+        # onsets advance by one part duration each.
+        assert flushes[0]['suffix'] == flushes[1]['suffix'] == ''
+        delta = (flushes[1]['onset_time']
+                 - flushes[0]['onset_time']).total_seconds()
+        assert abs(delta - (4 * CHUNK_FRAMES) / e.sample_rate) < 1e-6
         # Stop REC → the pending tail flushes too (gapless total).
         e.rec_enabled = False
         _feed(e, [_quiet()])

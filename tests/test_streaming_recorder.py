@@ -1,5 +1,5 @@
 """Streaming-mode ThresholdRecorder (H1) — on-disk equivalence with the
-buffered path, bounded pending RAM, force-split part naming, and
+buffered path, bounded pending RAM, force-split naming/timestamps, and
 flush-on-disable behavior.
 
 The buffered path is the long-pinned reference (see
@@ -89,7 +89,7 @@ def test_streaming_matches_buffered_single_event(tmp_path):
     assert not glob.glob(os.path.join(str(str_dir), '*.tmp'))
 
 
-def test_streaming_matches_buffered_force_split_with_part_names(tmp_path):
+def test_streaming_matches_buffered_force_split_with_distinct_names(tmp_path):
     # Continuous loud signal long enough to force one split.
     rng = np.random.default_rng(7)
     n_chunks = 12
@@ -110,9 +110,17 @@ def test_streaming_matches_buffered_force_split_with_part_names(tmp_path):
     assert len(buffered) == len(streamed) >= 2
     for (bn, bd), (sn, sd) in zip(buffered, streamed):
         np.testing.assert_array_equal(bd, sd)
-    # Split parts carry partNN tokens in both modes.
-    assert any('part01' in n for n, _ in streamed)
-    assert any('part02' in n for n, _ in streamed)
+    # Split parts share the plain name format (no partNN token) and
+    # are distinguished by their own onset timestamps: each part's
+    # epoch_ms token advances by the duration of the previous part.
+    assert not any('part' in n for n, _ in streamed)
+    epochs = [int(n.split('_')[0]) for n, _ in streamed]
+    assert len(set(epochs)) == len(epochs), 'part timestamps must differ'
+    for (pn, pd), e0, e1 in zip(streamed, epochs, epochs[1:]):
+        expected_ms = 1000.0 * pd.shape[0] / SR
+        assert abs((e1 - e0) - expected_ms) <= 1, (
+            f'onset must advance by the previous part duration '
+            f'(got {e1 - e0} ms, expected {expected_ms} ms)')
 
 
 def test_streaming_flush_on_disable_matches_buffered(tmp_path):

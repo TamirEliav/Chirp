@@ -708,8 +708,12 @@ python chirp.py</code></pre>
     <summary>Max Rec</summary>
     <div>
       <p>The maximum allowed duration (in seconds) of a single recording segment. If a continuous
-      sound exceeds this limit, the current file is closed and a new one is started immediately.
-      This prevents runaway recordings from filling disk space.</p>
+      sound exceeds this limit, the current file is closed and a new one is started immediately
+      &mdash; sample-accurately, with no gap. Split files share the same name format as every
+      other recording; each carries its own capture-time timestamp (the second file's time =
+      the first file's time + its duration), so a long event appears as a series of
+      consecutively-timestamped WAVs. This prevents runaway recordings from filling disk
+      space.</p>
     </div>
   </details>
 
@@ -722,9 +726,10 @@ python chirp.py</code></pre>
     <li><strong>Triggered</strong> (default) &mdash; the threshold state machine described above.</li>
     <li><strong>Continuous</strong> &mdash; while REC is on, everything is recorded: a file opens on
       the first sample after <em>Start Rec</em> and a new file starts every <strong>Max Rec</strong>
-      seconds (named <code>part01</code>, <code>part02</code>, &hellip; with no gap between them).
-      All other trigger parameters are ignored and greyed out. Memory stays flat regardless of
-      duration &mdash; audio streams to disk as it arrives.</li>
+      seconds with no gap between them. Every file shares the same name format; each one's
+      timestamp is its own capture time, so consecutive files of one take differ by exactly
+      Max Rec. All other trigger parameters are ignored and greyed out. Memory stays flat
+      regardless of duration &mdash; audio streams to disk as it arrives.</li>
   </ul>
   <p>
     In Triggered mode, the <strong>&#9679; Force Trigger</strong> button (enabled while REC is on)

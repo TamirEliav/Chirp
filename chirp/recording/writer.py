@@ -277,10 +277,9 @@ class StreamingWavWriter:
                  onset_time=None, filename_stream: str = '') -> None:
         """Recompute the canonical publish path from fresh tokens.
 
-        Used by the streaming recorder at flush time: the final filename
-        may carry tokens unknown at open time (the ``partNN`` suffix of a
-        force-split event) and the day-subfolder output dir may have
-        rolled over mid-event. Only ``self.path`` changes — the tmp file
+        Used by the streaming recorder at flush time: the day-subfolder
+        output dir may have rolled over mid-event and the suffix may
+        have changed since open. Only ``self.path`` changes — the tmp file
         keeps accumulating where it is and :meth:`close` publishes to the
         new target via the same fsync + ``os.replace``."""
         if self._closed:
@@ -422,7 +421,18 @@ class _WriterPool:
             # only needs to arrange the respawn.
             try:
                 try:
-                    write_wav_sync(*job[0], **job[1])
+                    # Two job shapes share the pool: the classic
+                    # buffered write ``((buf, out_dir, prefix, suffix),
+                    # kwargs)`` and a finalize call ``((callable,
+                    # out_dir), kwargs)`` used to fsync + publish a
+                    # StreamingWavWriter off the ingest thread (the
+                    # synchronous close of a multi-MB part file at a
+                    # force-split boundary stalled ingestion mid-event
+                    # — the zero-sample corruption seen in the field).
+                    if callable(job[0][0]):
+                        job[0][0]()
+                    else:
+                        write_wav_sync(*job[0], **job[1])
                 except Exception as exc:
                     # #44: ordinary Exception path — log + bump counters,
                     # keep the worker alive for the next job.
@@ -601,6 +611,23 @@ def submit(buf_snapshot: list, output_dir: str,
         kwargs=dict(sample_rate=sample_rate, onset_time=onset_time,
                     filename_stream=filename_stream),
     )
+
+
+def submit_close(writer: 'StreamingWavWriter', filename_stream: str = '',
+                 out_dir: str = '') -> None:
+    """Enqueue the finalize/publish of a StreamingWavWriter on the pool.
+
+    ``close()`` fsyncs the whole tmp file and atomically renames it —
+    potentially seconds of blocking I/O for a long high-sample-rate
+    part. Running it on a pool worker keeps the ingest thread realtime:
+    a force-split boundary must never stall audio consumption mid-event
+    (the capture pipeline glitches under that stall, corrupting the
+    beginning of the next part). Failures surface through the same
+    pool error stats / ``chirp_errors.log`` path as buffered writes;
+    ``drain()``/``shutdown()`` wait for queued closes like any write.
+    """
+    _get_pool().submit(args=(writer.close, out_dir),
+                       kwargs=dict(filename_stream=filename_stream))
 
 
 def pending() -> int:

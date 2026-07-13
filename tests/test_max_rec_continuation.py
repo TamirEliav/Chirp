@@ -15,8 +15,9 @@ Post-fix:
     ``max_samps`` samples (clean sample-accurate boundary).
   - A continuation event opens immediately at that boundary, with no
     ``min_cross`` requirement and no pre-trigger lookback.
-  - Both halves are tagged with a ``split_index`` (1, 2, 3, ...) and
-    the recorder injects a ``partNN`` token into the filename suffix
+  - Both halves are tagged with a ``split_index`` (1, 2, 3, ...)
+    internally; filenames carry NO part token — each part's own
+    onset timestamp distinguishes the series
     so the WAVs are unambiguously a contiguous series.
   - A standalone (non-split) event has ``split_index = None`` and no
     ``partNN`` token in its filename — false positives would be
@@ -116,9 +117,10 @@ def test_continuation_butt_joins_at_boundary(captured_flushes):
     assert cont['split_index'] == 2
 
 
-def test_continuation_filename_suffix_carries_part_token(captured_flushes):
-    """Filenames must reflect the part index so the researcher sees
-    the WAV series belongs together."""
+def test_split_parts_keep_plain_user_suffix(captured_flushes):
+    """Split parts share the SAME name format as unsplit files — no
+    ``partNN`` token; each part is distinguished by its own onset
+    timestamp instead."""
     rec = ThresholdRecorder()
     max_rec = 3.0 * CHUNK_FRAMES / 44100
     p = _params(max_rec_sec=max_rec, hold_sec=0.0,
@@ -130,14 +132,16 @@ def test_continuation_filename_suffix_carries_part_token(captured_flushes):
     rec.process_chunk(_silent(), trigger_peak=0.0, **p)
 
     assert len(captured_flushes) == 2
-    # part01 keeps the user suffix and gets a ``_part01`` extension.
-    assert captured_flushes[0]['suffix'] == 'song_part01'
-    assert captured_flushes[1]['suffix'] == 'song_part02'
+    assert captured_flushes[0]['suffix'] == 'song'
+    assert captured_flushes[1]['suffix'] == 'song'
+    # The parts stay distinguishable: onsets differ by part1's duration.
+    assert (captured_flushes[1]['onset_time']
+            > captured_flushes[0]['onset_time'])
 
 
-def test_part_token_with_empty_user_suffix(captured_flushes):
-    """When the user has no suffix, the part token stands alone — no
-    leading underscore."""
+def test_split_parts_with_empty_user_suffix(captured_flushes):
+    """With no user suffix the split parts have no suffix at all —
+    identical format to a standalone file."""
     rec = ThresholdRecorder()
     max_rec = 3.0 * CHUNK_FRAMES / 44100
     p = _params(max_rec_sec=max_rec, filename_suffix='')
@@ -147,13 +151,14 @@ def test_part_token_with_empty_user_suffix(captured_flushes):
     rec.process_chunk(_silent(), trigger_peak=0.0, **p)
 
     assert len(captured_flushes) == 2
-    assert captured_flushes[0]['suffix'] == 'part01'
-    assert captured_flushes[1]['suffix'] == 'part02'
+    assert captured_flushes[0]['suffix'] == ''
+    assert captured_flushes[1]['suffix'] == ''
 
 
-def test_three_way_split_increments_part_index(captured_flushes):
+def test_three_way_split_advances_onsets(captured_flushes):
     """A signal that runs long enough to hit max_rec twice should
-    produce part01, part02, part03 in order."""
+    produce three parts whose onset timestamps advance by exactly the
+    duration of the preceding part."""
     rec = ThresholdRecorder()
     max_rec = 2.0 * CHUNK_FRAMES / 44100  # cap at 2 chunks
     p = _params(max_rec_sec=max_rec)
@@ -164,10 +169,13 @@ def test_three_way_split_increments_part_index(captured_flushes):
         rec.process_chunk(_loud(0.5), trigger_peak=0.5, **p)
     rec.process_chunk(_silent(), trigger_peak=0.0, **p)
 
-    suffixes = [f['suffix'] for f in captured_flushes]
-    assert 'part01' in suffixes
-    assert 'part02' in suffixes
-    assert 'part03' in suffixes
+    assert len(captured_flushes) >= 3
+    for prev, cur in zip(captured_flushes, captured_flushes[1:]):
+        delta = (cur['onset_time'] - prev['onset_time']).total_seconds()
+        expected = prev['audio'].size / 44100
+        assert abs(delta - expected) < 1e-6, (
+            f'part onset must advance by the previous part duration '
+            f'(got {delta}, expected {expected})')
     # And every flush is exactly 2 chunks except possibly the final
     # part which carries whatever was left.
     for i, f in enumerate(captured_flushes[:-1]):
@@ -231,8 +239,8 @@ def test_continuation_onset_time_advances_by_first_half_duration(captured_flushe
 
 def test_no_part_token_when_event_did_not_split(captured_flushes):
     """A standalone event that closes naturally (never trips
-    max_rec) must NOT get a partNN suffix — false positives would
-    confuse downstream tooling that scans filenames."""
+    max_rec) keeps the user suffix verbatim — same contract as split
+    parts now that the partNN token is gone."""
     rec = ThresholdRecorder()
     p = _params(max_rec_sec=10.0, filename_suffix='song')
 

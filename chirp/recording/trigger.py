@@ -329,9 +329,9 @@ class ThresholdRecorder:
             # ``max_samps`` for a clean sample-accurate boundary and a
             # butt-joined continuation event opens immediately at that
             # boundary (no min_cross gate, no pre-trigger lookback).
-            # Both halves are tagged with ``split_index`` so writer
-            # composes ``..._part01.wav`` / ``..._part02.wav`` and the
-            # researcher sees the WAVs are a contiguous series.
+            # Both halves are tagged with ``split_index`` (internal
+            # bookkeeping); each half's filename carries its own
+            # onset timestamp, so the series is contiguous by time.
             if ev['samples_kept'] >= max_samps:
                 overshoot = ev['samples_kept'] - max_samps
                 ev['target_kept'] = max_samps
@@ -683,9 +683,11 @@ class ThresholdRecorder:
                          filename_prefix: str, eff_suffix: str,
                          filename_stream: str) -> bool:
         """Flush a streamed event: append the remaining committed range,
-        retarget the final filename (it may have grown a ``partNN``
-        token), and publish. Returns True when the event was handled on
-        the streaming path (i.e. the buffered fallback must not run)."""
+        retarget the final filename (the day-subfolder output dir may
+        have rolled over mid-event), and hand the publish (fsync +
+        rename) to the writer pool. Returns True when the event was
+        handled on the streaming path (i.e. the buffered fallback must
+        not run)."""
         if not ev.get('stream'):
             return False
         if ev.get('stream_failed'):
@@ -709,7 +711,15 @@ class ThresholdRecorder:
             w.retarget(output_dir, prefix=filename_prefix,
                        suffix=eff_suffix, onset_time=ev['onset_time'],
                        filename_stream=filename_stream)
-            w.close()
+            # Publish (fsync + atomic rename) on the writer pool, NOT
+            # here: this runs on the ingest thread, and fsyncing a
+            # multi-MB part file synchronously at a force-split
+            # boundary stalls audio consumption mid-event — the
+            # capture pipeline glitches under that stall and corrupts
+            # the start of the next part. The tmp already holds every
+            # committed sample, so deferring the close loses nothing.
+            _writer.submit_close(w, filename_stream=filename_stream,
+                                 out_dir=output_dir)
         except Exception as exc:
             try:
                 w.abort()
@@ -799,19 +809,13 @@ class ThresholdRecorder:
                 and ev.get('above_total', min_samps) < min_samps):
             self._discard_event(ev, filename_stream, min_samps)
             return
-        # #57: tag halves of a force-split event with a ``partNN`` token
-        # in the filename so the researcher sees they belong to one
-        # contiguous capture. The token is injected into the suffix so
-        # the writer's existing filename composition handles it without
-        # special casing — the sanitizer accepts ``part01`` as-is and
-        # the parts list filters empties, so a blank user suffix is
-        # fine.
+        # Force-split halves used to carry a ``partNN`` filename token;
+        # that is gone — every file (split or not) now shares one name
+        # format, and each part's onset_time is its own capture time
+        # (part2 = part1 onset + part1 duration, see
+        # ``_open_continuation``), so the series stays unambiguous by
+        # timestamp alone. ``split_index`` is still tracked internally.
         eff_suffix = filename_suffix
-        si = ev.get('split_index')
-        if si:
-            part_tok = f'part{si:02d}'
-            eff_suffix = (f'{filename_suffix}_{part_tok}'
-                          if filename_suffix else part_tok)
         # H1: streamed events publish their incrementally-written file;
         # buffered events go through the writer pool as before.
         if self._stream_finalize(ev, output_dir, filename_prefix,
