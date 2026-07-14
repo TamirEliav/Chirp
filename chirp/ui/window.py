@@ -31,7 +31,10 @@ from PyQt5.QtWidgets import (
     QMenu, QAction, QActionGroup, QSlider,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QSize, QDate, QPointF
-from PyQt5.QtGui import QFont, QPainter, QColor, QPainterPath, QPen, QPolygonF, QCursor
+from PyQt5.QtGui import (
+    QFont, QFontMetrics, QPainter, QColor, QPainterPath, QPen, QPolygonF,
+    QCursor,
+)
 
 # Re-exports used throughout the window code. The star-import brings in
 # all the module-level constants and the palette (C, QSS) so the class
@@ -151,6 +154,18 @@ class ChirpWindow(QMainWindow):
         # so a mid-run RDP attach/detach can swap the render backend.
         self._register_session_notification()
 
+        # Display-change resilience: when the desktop resolution / DPI
+        # changes under a maximized window (RDP connect/disconnect,
+        # monitor hot-plug, docking), Windows can leave the window at
+        # its stale pre-change frame so the right/bottom edges hang off
+        # the new screen until the user minimizes and re-maximizes.
+        # WM_DISPLAYCHANGE arrives in a burst while the new mode
+        # settles, so the fix is debounced.
+        self._remax_timer = QTimer(self)
+        self._remax_timer.setSingleShot(True)
+        self._remax_timer.setInterval(500)
+        self._remax_timer.timeout.connect(self._remaximize_after_display_change)
+
     # ──────────────────────────────────────────────────────────────────────
     # Remote-desktop rendering resilience
     # ──────────────────────────────────────────────────────────────────────
@@ -159,6 +174,8 @@ class ChirpWindow(QMainWindow):
     _WM_WTSSESSION_CHANGE = 0x02B1
     _WTS_CONSOLE_CONNECT  = 0x1
     _WTS_REMOTE_CONNECT   = 0x3
+    #: Broadcast when the desktop resolution / color depth changes.
+    _WM_DISPLAYCHANGE = 0x007E
 
     @property
     def _gl_effective(self) -> bool:
@@ -183,6 +200,9 @@ class ChirpWindow(QMainWindow):
                 msg = ctypes.wintypes.MSG.from_address(int(message))
                 if msg.message == self._WM_WTSSESSION_CHANGE:
                     self._on_wts_session_change(int(msg.wParam))
+                elif msg.message == self._WM_DISPLAYCHANGE:
+                    if self.isMaximized() and not self.isMinimized():
+                        self._remax_timer.start()
             except Exception:
                 pass
         return super().nativeEvent(event_type, message)
@@ -224,6 +244,38 @@ class ChirpWindow(QMainWindow):
         except Exception:
             # Best-effort — partially-constructed windows (test stubs)
             # and headless environments must not crash here.
+            pass
+
+    def _remaximize_after_display_change(self) -> None:
+        """Re-fit a maximized window after the desktop mode changed.
+
+        Windows does not reliably re-maximize an already-maximized
+        window when the resolution/DPI changes, leaving it framed for
+        the OLD screen (right side cut off). The manual workaround is
+        minimize + maximize; this performs the equivalent
+        showNormal/showMaximized round-trip automatically, and only
+        when the frame is actually stale."""
+        try:
+            if not self.isMaximized() or self.isMinimized():
+                return
+            handle = self.windowHandle()
+            screen = handle.screen() if handle else None
+            if screen is None:
+                return
+            avail = screen.availableGeometry()
+            geo = self.geometry()
+            # A correctly maximized window fills the available area
+            # (give or take the hidden resize borders). If it already
+            # does, don't flicker the window for nothing.
+            if (abs(geo.width() - avail.width()) <= 24
+                    and abs(geo.height() - avail.height()) <= 24):
+                return
+            print('[Chirp] display mode changed — re-fitting maximized '
+                  f'window ({geo.width()}x{geo.height()} → '
+                  f'{avail.width()}x{avail.height()})')
+            self.showNormal()
+            self.showMaximized()
+        except Exception:
             pass
 
     # ──────────────────────────────────────────────────────────────────────
@@ -559,6 +611,11 @@ class ChirpWindow(QMainWindow):
             'Output audio device (speakers/headphones) used for monitor loopback')
         self._monitor_out_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self._monitor_out_combo.setMinimumWidth(200)
+        # Same guard as the input-device combo: long output device
+        # names must not inflate the window's minimum width.
+        self._monitor_out_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self._monitor_out_combo.setMinimumContentsLength(20)
         self._populate_monitor_output_combo()
         self._monitor_out_combo.currentIndexChanged.connect(self._on_monitor_output_changed)
         h.addWidget(self._monitor_out_combo, stretch=1)
@@ -859,6 +916,18 @@ class ChirpWindow(QMainWindow):
         for btn in (self._btn_save, self._btn_save_as, self._btn_load):
             btn.setObjectName('btn_browse')
 
+        # Width diet: the global QSS gives every button min-width 120px
+        # + 20px side padding; across the two grid columns that made
+        # CONTROLS one of the widest panels and helped push the config
+        # row past a laptop screen. These buttons render fine narrower —
+        # relax the floor and let the grid distribute the width.
+        for btn in (self._btn_start_acq, self._btn_stop_acq,
+                    self._btn_start_rec, self._btn_stop_rec,
+                    self._btn_save, self._btn_save_as,
+                    self._btn_load, self._btn_reset):
+            btn.setStyleSheet(btn.styleSheet()
+                              + 'min-width: 0px; padding: 6px 10px;')
+
         btn_g.addWidget(self._btn_start_acq, 0, 0)
         btn_g.addWidget(self._btn_stop_acq,  0, 1)
         btn_g.addWidget(self._btn_start_rec, 1, 0)
@@ -884,9 +953,24 @@ class ChirpWindow(QMainWindow):
         self._lbl_trig_status.setObjectName('trig_idle')
         self._lbl_entropy    .setObjectName('trig_idle')
         mono = QFont('Consolas', 9)
+        # These labels change text at runtime (STOPPED→RUNNING, live
+        # entropy value, blink glyphs, error notes). A QLabel's minimum
+        # width follows its text, so without a guard every text change
+        # re-negotiates the whole config row's width — and growth past
+        # the fixed width of a maximized window clips the right-hand
+        # panels. Reserve the widest normal state up front (QSS renders
+        # them at 10pt) and ignore the live text's size hint; anything
+        # longer (e.g. the display-halted note) is clipped, not
+        # propagated into the layout.
+        fm = QFontMetrics(QFont('Consolas', 10))
+        reserve = max(fm.horizontalAdvance(s) for s in (
+            'ACQ  ●  RUNNING', 'REC  ●  RUNNING',
+            'TRIG ●  IDLE', 'ENT  0.943 ▼')) + 16
         for lbl in (self._lbl_acq_status, self._lbl_rec_status, self._lbl_trig_status,
                      self._lbl_entropy):
             lbl.setFont(mono)
+            lbl.setMinimumWidth(reserve)
+            lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         status_v.addWidget(self._lbl_acq_status)
         status_v.addWidget(self._lbl_rec_status)
         status_v.addWidget(self._lbl_trig_status)
@@ -1078,6 +1162,10 @@ class ChirpWindow(QMainWindow):
             'Measure ambient noise for 3 seconds and set threshold automatically')
         self._lbl_calib_status = QLabel('')
         self._lbl_calib_status.setObjectName('param_label')
+        # Result text ('Threshold set to …') can be long — never let it
+        # widen the TRIGGER panel; clip instead.
+        self._lbl_calib_status.setSizePolicy(
+            QSizePolicy.Ignored, QSizePolicy.Preferred)
 
         self._sb_calib_dur = QDoubleSpinBox()
         self._sb_calib_dur.setRange(1.0, 10.0)
@@ -1302,6 +1390,8 @@ class ChirpWindow(QMainWindow):
         self._folder_edit.setToolTip('Output folder where triggered WAV files are saved')
         btn_browse = QPushButton('Browse...')
         btn_browse.setObjectName('btn_browse')
+        # QSS min-width would defeat the fixed width — clear it.
+        btn_browse.setStyleSheet('min-width: 0px; padding: 6px 6px;')
         btn_browse.setFixedWidth(70)
         btn_browse.setToolTip('Browse for the output folder')
         btn_browse.clicked.connect(self._on_browse)
@@ -1333,10 +1423,21 @@ class ChirpWindow(QMainWindow):
         dev_row1.setSpacing(4)
         self._device_combo = QComboBox()
         self._device_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        # Long WASAPI device names must NOT dictate the layout's minimum
+        # width: by default a combo's minimum tracks its longest item,
+        # which let this one demand >1500px, overflow the fixed width of
+        # a maximized window, and push the right-hand config panels off
+        # screen. Cap the minimum at ~20 chars; the Expanding policy
+        # still lets it use all the width actually available.
+        self._device_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self._device_combo.setMinimumContentsLength(16)
         self._device_combo.setToolTip('Audio input device used by this recording')
         self._populate_device_combo()
         btn_refresh = QPushButton('Refresh')
         btn_refresh.setObjectName('btn_browse')
+        # QSS min-width would defeat the fixed width — clear it.
+        btn_refresh.setStyleSheet('min-width: 0px; padding: 6px 6px;')
         btn_refresh.setFixedWidth(60)
         btn_refresh.setToolTip('Rescan available audio devices')
         btn_refresh.clicked.connect(self._on_refresh_devices)
@@ -1355,6 +1456,12 @@ class ChirpWindow(QMainWindow):
         self._trig_combo.setCurrentIndex(0)
         self._trig_combo.setEnabled(False)
         self._trig_combo.setToolTip('How the stereo trigger is computed (only used in Stereo mode)')
+        # Same minimum-width cap as the device combo: 'Both Channels'
+        # etc. must not set the floor for the whole INPUT DEVICE panel.
+        for combo in (self._chan_combo, self._trig_combo):
+            combo.setSizeAdjustPolicy(
+                QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(5)
         lbl_sr = QLabel('Rate')
         self._sr_combo = QComboBox()
         for r in RecordingEntity.SUPPORTED_RATES:
@@ -3105,6 +3212,21 @@ class ChirpWindow(QMainWindow):
             self._restore_config_canvas()
             if self._sel:
                 self._load_params_from_entity(self._selected_idx)
+            # A maximized window sometimes fails to re-lay-out the batch
+            # of just-re-shown config widgets at full width (symptom:
+            # right-hand panels clipped until a manual minimize +
+            # maximize). Kick an explicit layout pass once the show
+            # events have settled.
+            QTimer.singleShot(0, self._force_full_relayout)
+
+    def _force_full_relayout(self) -> None:
+        """Invalidate and re-activate the top-level layout so every
+        re-shown widget is measured at the window's current size."""
+        root = self.centralWidget()
+        if root is None or root.layout() is None:
+            return
+        root.layout().invalidate()
+        root.layout().activate()
 
     def _visible_view_entities(self) -> tuple[list, list[int]]:
         """3c: the (entities, indices) shown in the view grid — filtered
