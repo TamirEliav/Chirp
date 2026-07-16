@@ -13,6 +13,8 @@ off the realtime path, when the UI polls ``consume_drop_count`` /
 ``consume_os_drop_count``.
 """
 
+import time
+
 import sounddevice as sd
 
 from chirp.audio.ringbuffer import AudioRing
@@ -22,10 +24,16 @@ from chirp.error_log import log as _err_log
 
 class AudioCapture:
     def __init__(self, audio_ring: AudioRing, device=None, channels=1,
-                 samplerate=SAMPLE_RATE, name: str = ''):
+                 samplerate=SAMPLE_RATE, name: str = '', clock=None):
         self._ring     = audio_ring
         self._channels = channels
         self._stream   = None
+        # Disciplined timestamp clock (chirp.audio.clock). When wired,
+        # the callback records one (write_total, time.time()) pair per
+        # buffer — the raw observations the ingest thread's clock servo
+        # filters into filename timestamps. Optional so tests and the
+        # WAV-playback capture (whose pacing is synthetic) skip it.
+        self._clock    = clock
         # Stream label included in error-log entries so the user can
         # tell which entity dropped chunks / overflowed.
         self._name     = name
@@ -133,6 +141,12 @@ class AudioCapture:
             self.drop_count += 1
             self.drop_count_total += 1
             self.has_ever_dropped = True
+        # Timestamp-clock observation: the only point where a sample
+        # index and the wall clock meet with no queue backlog between
+        # them. A bounded-deque append — realtime-safe.
+        clk = self._clock
+        if clk is not None:
+            clk.observe(self._ring.write_total, time.time())
 
     def consume_drop_count(self) -> int:
         """Return the drop count and reset it to zero. Intended to be

@@ -31,6 +31,7 @@ import itertools
 import os
 import queue
 import threading
+import time
 
 import numpy as np
 import scipy.io.wavfile
@@ -102,8 +103,14 @@ def _compose_filename(prefix: str, suffix: str, onset, filename_stream: str) -> 
     ``write_wav_sync`` and ``StreamingWavWriter`` so the naming contract
     can't drift between the two write paths.
     """
+    # Timezone handling: aware onsets (the disciplined-clock path,
+    # internally UTC) are converted to the system local zone HERE, at
+    # composition time — so the local token is DST-correct even when a
+    # transition happened mid-session. Naive onsets (legacy fallbacks,
+    # tests) keep their historical treatment as local time.
     epoch_ms = int(onset.timestamp() * 1000)
-    local_ts = onset.strftime('%Y%m%d_%H%M%S_%f')[:-3]
+    local = onset.astimezone() if onset.tzinfo is not None else onset
+    local_ts = local.strftime('%Y%m%d_%H%M%S_%f')[:-3]
     parts = [p for p in [_sanitize_token(prefix), str(epoch_ms), local_ts,
                          _sanitize_token(filename_stream),
                          _sanitize_token(suffix)] if p]
@@ -140,6 +147,52 @@ def _dedup_target(path: str) -> str:
         if not os.path.exists(cand):
             return cand
     return path  # 98 collisions — give up and overwrite
+
+
+# Publish-time timestamp sanity check: when a finalized file's
+# ``onset + duration`` disagrees with the wall clock by more than this
+# many seconds, flag it via the pool error stats (sidebar badge) and
+# ``chirp_errors.log`` — an end-of-pipeline watchdog for the class of
+# bug where filename timestamps silently detach from reality (the
+# 2026-07 ~1-day-backwards jump). Generous enough to tolerate the
+# legitimate lag between a file's last sample and its publish: hold +
+# post-trigger tail, writer-pool backlog on a slow disk, the fsync of
+# a long part. ``None`` disables the check (the test-suite default —
+# many tests write WAVs with fixed historical onsets; see
+# tests/conftest.py).
+TIMESTAMP_DIVERGENCE_SEC: float | None = 10.0
+
+
+def _check_timestamp_divergence(onset, duration_sec: float, path: str,
+                                stream: str) -> None:
+    """Flag a published file whose derived end time (onset + duration)
+    disagrees with the wall clock beyond ``TIMESTAMP_DIVERGENCE_SEC``.
+
+    Naive onsets are interpreted as local time (the convention under
+    which every naive onset in this codebase is created); aware onsets
+    (the disciplined-clock path) are exact. Never raises — a watchdog
+    must not be able to fail a write.
+    """
+    limit = TIMESTAMP_DIVERGENCE_SEC
+    if limit is None or onset is None:
+        return
+    try:
+        delta = time.time() - (onset.timestamp() + float(duration_sec))
+        if abs(delta) <= limit:
+            return
+        msg = (f'published file timestamp diverges from wall clock by '
+               f'{delta:+.1f}s (onset + duration vs now) — filename '
+               f'timestamps may be wrong')
+        p = _get_pool()
+        with p._lock:
+            p._err_count       += 1
+            p._err_count_total += 1
+            p._has_ever_errored = True
+            p._last_error = msg[:200]
+        _err_log('timestamp_divergence', stream or 'global', msg,
+                 wav_path=path)
+    except Exception:
+        pass
 
 
 def write_wav_sync(buf_snapshot: list, output_dir: str,
@@ -209,6 +262,11 @@ def write_wav_sync(buf_snapshot: list, output_dir: str,
         pass
     path = _dedup_target(path)
     os.replace(tmp_path, path)
+    # Only when the caller supplied the onset — the fallback above is
+    # now-derived, so its divergence is zero by construction.
+    if onset_time is not None:
+        _check_timestamp_divergence(onset_time, audio_dur, path,
+                                    filename_stream)
     ch_str = 'stereo' if audio.ndim == 2 else 'mono'
     print(f'[REC] saved {path}  ({n_samples/sample_rate:.2f} s, {ch_str})')
     if saturated:
@@ -254,6 +312,8 @@ class StreamingWavWriter:
                  channels: int = 1, filename_stream: str = ''):
         if onset_time is None:
             onset_time = datetime.datetime.now()
+        # Kept for the publish-time timestamp sanity check in close().
+        self._onset = onset_time
         os.makedirs(output_dir, exist_ok=True)
         fname = _compose_filename(prefix, suffix, onset_time, filename_stream)
         self.path = _resolve_safe_path(output_dir, fname)
@@ -286,6 +346,12 @@ class StreamingWavWriter:
             return
         if onset_time is None:
             onset_time = datetime.datetime.now()
+        else:
+            # An explicit onset is the event's real one — remember it
+            # for the close()-time timestamp sanity check. (The
+            # now-default above is only a path-composition fallback and
+            # must not overwrite a real onset from open time.)
+            self._onset = onset_time
         os.makedirs(output_dir, exist_ok=True)
         fname = _compose_filename(prefix, suffix, onset_time, filename_stream)
         self.path = _resolve_safe_path(output_dir, fname)
@@ -324,6 +390,8 @@ class StreamingWavWriter:
         self.path = _dedup_target(self.path)
         os.replace(self._tmp, self.path)
         dur = self.frames_written / self.sample_rate if self.sample_rate else 0.0
+        _check_timestamp_divergence(self._onset, dur, self.path,
+                                    self.filename_stream)
         ch_str = 'stereo' if self.channels == 2 else 'mono'
         print(f'[REC] saved {self.path}  ({dur:.2f} s, {ch_str}, streamed)')
         if self.saturated:
@@ -627,6 +695,18 @@ def submit_close(writer: 'StreamingWavWriter', filename_stream: str = '',
     ``drain()``/``shutdown()`` wait for queued closes like any write.
     """
     _get_pool().submit(args=(writer.close, out_dir),
+                       kwargs=dict(filename_stream=filename_stream))
+
+
+def submit_call(fn, filename_stream: str = '', out_dir: str = '') -> None:
+    """Enqueue a small arbitrary callable on the writer pool.
+
+    Same error accounting / ``drain()`` semantics as WAV jobs (the pool
+    already dispatches callable-shaped jobs — see the worker loop).
+    Used for off-thread bookkeeping I/O such as the sidecar clock log,
+    so the ingest thread never touches disk.
+    """
+    _get_pool().submit(args=(fn, out_dir),
                        kwargs=dict(filename_stream=filename_stream))
 
 

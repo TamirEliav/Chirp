@@ -72,6 +72,12 @@ class ThresholdRecorder:
         # on every process_chunk call so flush_all sees the last value.
         self._min_total_samps = 0
 
+    def has_active_events(self) -> bool:
+        """True while any event is open (recording or draining its
+        post-trigger tail). The entity gates disciplined-clock STEPs on
+        this so a timestamp discontinuity never lands inside a file."""
+        return bool(self._active_events)
+
     def _streaming_active(self) -> bool:
         """True when this recorder should stream events to disk.
 

@@ -20,3 +20,17 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _disable_timestamp_divergence_check(monkeypatch):
+    """Disable the publish-time timestamp sanity check by default.
+
+    Many tests write WAVs with fixed historical onsets (e.g.
+    2024-01-01); the watchdog would flag every one of them and pollute
+    the singleton writer pool's error stats across tests.
+    tests/test_timestamp_divergence.py re-enables it locally."""
+    from chirp.recording import writer
+    monkeypatch.setattr(writer, 'TIMESTAMP_DIVERGENCE_SEC', None)

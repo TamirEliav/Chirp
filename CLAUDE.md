@@ -35,6 +35,10 @@ The app is distributed as `dist/Chirp.exe` via PyInstaller. Entry point is `chir
 - `tests/test_trigger.py` + `tests/test_trigger_characterization.py` — full ThresholdRecorder state-machine pinning (single event, pre-trigger lookback, post-trigger tail, hold, min_cross, max_rec split, onset time, sample-accurate trigger_mask).
 - `tests/test_min_total_cross.py` — min-total-crossing file filter (accumulation across bursts, discard on all final-flush paths, split-part exemption + inheritance, streaming `.tmp` deletion, serialization round-trip).
 - `tests/test_config_schema.py` — settings-file round-trip (build → json → load), versioning, unknown-key warnings.
+- `tests/test_timestamp_clock.py` — filename-timestamp sample clock: display resets/rebuilds must not move `_samples_total`; sample-rate change invalidates the wall anchor.
+- `tests/test_disciplined_clock.py` — DisciplinedClock servo (windowed-min jitter rejection, slew limiting, drift tracking, gated forward-only steps, monotonicity) + entity integration and aware-UTC filename tokens.
+- `tests/test_timestamp_divergence.py` — publish-time timestamp sanity check (stale/future/fresh onsets, naive + aware, streaming close + retarget, None-threshold disable).
+- `tests/test_clock_log.py` — sidecar clock log (row cadence, anchor vs clock source tagging, acq gating, single header).
 - `tests/test_entity.py` — saturation detection, ring-buffer cursor coherence, analysis FFT decoupling.
 - `tests/test_writer.py` — WAV filename composition, sanitizer, writer pool drain.
 - `tests/test_devices.py` — multi-tier device name matching (exact, prefix, substring).
@@ -55,6 +59,7 @@ chirp/
 │   └── entropy.py       normalized_spectral_entropy
 ├── audio/
 │   ├── capture.py       AudioCapture (sounddevice.InputStream wrapper)
+│   ├── clock.py         DisciplinedClock — sample-index → UTC wall-time servo
 │   └── devices.py       device enumeration + robust name matching (#21)
 ├── recording/
 │   ├── trigger.py       ThresholdRecorder — sample-accurate state machine (#15)
@@ -99,6 +104,8 @@ AudioCapture callback → queue → [ingestion thread] RecordingEntity.ingest_ch
 - **Display modes**: `display_mode` on RecordingEntity controls subplot layout — 'Spectrogram' (default), 'Waveform' (raw signed audio in teal), or 'Both'. The subplot grid is rebuilt dynamically in `_rebuild_axes()`.
 - **Config format**: JSON with a `recordings` array and `view_mode` object. Also reads legacy `.chirp` files. v1.1.0 added `spectral_trigger_mode`, `spectral_threshold`, and `display_mode` to serialization.
 - **Styling**: Catppuccin Mocha dark theme via embedded QSS; Consolas monospace font for labels. Teal (`#94e2d5`) for waveform, peach (`#fab387`) for entropy threshold.
+- **Filename timestamps (disciplined clock)**: WAV onsets derive from `DisciplinedClock` (`chirp/audio/clock.py`) — a free-running sample clock (ring-absolute frame index / rate) steered onto wall time, NTP-style. The PortAudio callback records one `(ring.write_total, time.time())` observation per buffer; the ingest thread filters them with a windowed MINIMUM (callback delivery noise is one-sided late) and slews the correction at ≤1 ms per second of audio (1000 ppm ≫ any crystal error, so drift is tracked with no explicit rate term and adjacent/split files stay sample-aligned). Forward STEPs (capture holes > 2 s: device stall, drop burst) happen only when no recording event is open (`ThresholdRecorder.has_active_events`) and are logged as `clock_step`; backward steps never happen. The clock is UTC-aware internally; the filename's local token is converted in `writer._compose_filename` (DST-safe mid-session). Fallback when no observations exist (WAV playback, tests): the M5 anchor stamped at `start_acq` plus the cumulative sample counter. INVARIANT: `_samples_total` is monotonic while acquisition runs; display-only operations (`reset_display`, `change_display_seconds`) clear buffer contents but never touch the counter or cursors. Anything that legitimately zeroes the counter (sample-rate change) must invalidate the wall anchor in the same breath; the clock+ring pair is recreated together in `_make_capture`. See `tests/test_disciplined_clock.py`, `tests/test_timestamp_clock.py`.
+- **Timestamp watchdog + audit trail**: `writer.TIMESTAMP_DIVERGENCE_SEC` (10 s; `None` disables — the test-suite default via conftest) — at every WAV publish, `onset + duration` is compared against the wall clock; divergence flags the pool error stats (sidebar badge) and logs `timestamp_divergence`. `chirp_clock_log.csv` (in each stream's base output dir, one row/min/stream via `RecordingEntity._queue_clock_log_row` → writer pool) records ring sample index, derived capture epoch + source (`clock`/`anchor`), and raw wall epoch, so filename timestamps of long runs can be verified or corrected offline. Capped at 64 MB; appends run on writer-pool workers, never the ingest thread.
 - **Sample rate changes** require full pipeline rebuild (capture, filters, buffers, display).
 - **Saturation detection**: clips at ≥ 0.99 of full scale, turns amplitude plot red.
 - **Scroll-wheel zoom**: Mouse-centered zoom on entropy, waveform, and spectrogram axes.

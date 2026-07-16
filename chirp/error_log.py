@@ -39,6 +39,14 @@ Categories
 ``saturation``  — A successfully-written WAV contained clipped samples
                   (peak >= 0.99 of full scale). Logged once per file;
                   ``wav_path`` carries the full path of the recording.
+``clock_step``  — The disciplined timestamp clock detected a capture
+                  hole (device stall / drop burst) and stepped forward
+                  across it between recording events. Logged per step.
+``timestamp_divergence`` — A published WAV's ``onset + duration``
+                  disagrees with the wall clock beyond the sanity
+                  threshold (writer.TIMESTAMP_DIVERGENCE_SEC) — the
+                  filename timestamps may be wrong. Logged per file;
+                  ``wav_path`` carries the recording's full path.
 
 Throttling
 ----------

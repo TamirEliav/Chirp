@@ -24,6 +24,7 @@ import sounddevice as sd
 import time
 
 from chirp.audio import AudioCapture, WavFileCapture
+from chirp.audio.clock import DisciplinedClock
 from chirp.audio.devices import find_device_by_name, host_api_name
 from chirp.audio.ringbuffer import AudioRing
 from chirp.error_log import log as _err_log
@@ -51,6 +52,39 @@ from chirp.dsp import BandpassFilter, SpectrogramAccumulator
 from chirp.dsp import analytic_envelope as _envelope
 from chirp.dsp import normalized_spectral_entropy as _spectral_entropy
 from chirp.recording.trigger import ThresholdRecorder
+from chirp.recording import writer as _wav_writer
+
+
+# ── Sidecar clock log ──────────────────────────────────────────────────────
+# One CSV row per stream per ``clock_log_interval_sec`` (default 60 s):
+# the capture-ring sample index, the derived capture time (and which
+# clock derived it), and the raw wall clock. The audit trail for
+# multi-week runs — any filename timestamp can be verified, or
+# corrected, offline against this, whatever happens to the in-app
+# clocks. ~80 bytes/min/stream ≈ 10 MB over 90 days.
+CLOCK_LOG_FILENAME = 'chirp_clock_log.csv'
+CLOCK_LOG_MAX_BYTES = 64 * 1024 * 1024   # hard cap; appends stop past this
+_CLOCK_LOG_HEADER = ('utc_iso,stream,ring_sample_index,'
+                     'derived_epoch,derived_source,wall_epoch\n')
+# Serialises appends across writer-pool workers: two streams that share
+# an output dir share one log file.
+_clock_log_lock = threading.Lock()
+
+
+def _append_clock_log_row(out_dir: str, row: str) -> None:
+    """Append one audit row (runs on a writer-pool worker, never on the
+    ingest thread). Creates the file with a header line; silently stops
+    appending once ``CLOCK_LOG_MAX_BYTES`` is reached."""
+    path = os.path.join(out_dir, CLOCK_LOG_FILENAME)
+    with _clock_log_lock:
+        os.makedirs(out_dir, exist_ok=True)
+        exists = os.path.exists(path)
+        if exists and os.path.getsize(path) > CLOCK_LOG_MAX_BYTES:
+            return
+        with open(path, 'a', encoding='utf-8', newline='') as f:
+            if not exists:
+                f.write(_CLOCK_LOG_HEADER)
+            f.write(row)
 
 
 class RecordingEntity:
@@ -256,6 +290,11 @@ class RecordingEntity:
         # each ingested chunk for the recorder's onset timestamps.
         self._wall_anchor_time: datetime.datetime | None = None
         self._wall_anchor_samples = 0
+        # Sidecar clock-log cadence (see module docs above). The 0.0
+        # deadline means the first chunk of a session logs immediately;
+        # ``start_acq`` re-zeroes it so every session opens with a row.
+        self.clock_log_interval_sec = 60.0
+        self._clock_log_next_t = 0.0
         # M8: running max of the per-chunk trigger ENVELOPE peak — the
         # exact signal ``ingest_chunk`` compares against the threshold.
         # Auto-calibrate polls this via ``consume_env_peak`` so the
@@ -282,7 +321,18 @@ class RecordingEntity:
     # ── Display reset ────────────────────────────────────────────────────
 
     def reset_display(self):
-        """Clear display buffers and reset write heads. Does NOT affect recording/triggering."""
+        """Clear display buffer CONTENTS only.
+
+        Must never touch ``_samples_total`` or the ring cursors: the
+        sample counter is the timestamp clock — ``chunk_end_wall`` (and
+        every WAV filename onset) is derived as ``_wall_anchor_time +
+        (_samples_total - _wall_anchor_samples) / sample_rate``. Zeroing
+        it mid-acquisition snapped all subsequent filename timestamps
+        back to the start_acq anchor (observed in the field as a
+        consistent ~1-day-backwards jump after a Start Acq click on an
+        already-running session). The cursors are re-derived from the
+        counter on every ingest, so leaving them alone stays coherent.
+        """
         self.amp_buffer[:]    = 0.0
         self.amp_buffer_r[:]  = 0.0
         self.spec_buffer[:]   = SPEC_DB_MIN
@@ -290,9 +340,6 @@ class RecordingEntity:
         self.entropy_buffer[:] = 1.0
         self.detect_mask_buffer[:] = False
         self.record_mask_buffer[:] = False
-        self._samples_total = 0
-        self.write_head = 0
-        self.col_head   = 0
 
     # ── #45: safe teardown helpers ─────────────────────────────────────
 
@@ -671,6 +718,12 @@ class RecordingEntity:
         # source switch.
         cap_frames = max(CHUNK_FRAMES * 8, int(RING_SECONDS * self.sample_rate))
         self.ring = AudioRing(cap_frames, channels=channels)
+        # Disciplined timestamp clock, born with the ring so its sample
+        # coordinates are the ring's absolute frame counts. Only the
+        # live-device capture feeds it observations; WAV playback keeps
+        # the coarse start_acq-anchor fallback (its pacing is synthetic).
+        self.clock = DisciplinedClock(self.sample_rate)
+        self._clock_steps_seen = 0
         if self.input_source == 'wav_file' and self.wav_file_path:
             cap = WavFileCapture(self.ring, self.wav_file_path,
                                  channels=channels, loop=self.wav_loop,
@@ -678,7 +731,7 @@ class RecordingEntity:
         else:
             cap = AudioCapture(self.ring, device=self.device_id,
                                channels=channels, samplerate=self.sample_rate,
-                               name=self.name)
+                               name=self.name, clock=self.clock)
             # TODO#1: remember the device NAME so the RDP-recovery
             # watchdog can re-resolve it after an endpoint churn
             # (PortAudio indices are not stable across churn).
@@ -865,6 +918,14 @@ class RecordingEntity:
         self._samples_total = 0
         self.write_head = 0
         self.col_head   = 0
+        # The counter reset above is legitimate here (sample counts at
+        # the old rate are dimensionally wrong at the new one), but the
+        # wall anchor must die with it — a stale anchor paired with a
+        # zeroed counter is exactly the backwards-timestamp bug. start_acq
+        # (called below when was_running, or later by the user) stamps a
+        # fresh pair before any chunk is ingested.
+        self._wall_anchor_time = None
+        self._wall_anchor_samples = 0
 
         # Rebuild filters and capture
         self.bpf   = BandpassFilter(sample_rate=new_rate)
@@ -914,9 +975,12 @@ class RecordingEntity:
             self.entropy_buffer = np.ones(self._n_cols, dtype=np.float32)
             self.detect_mask_buffer = np.zeros(self._total_samples, dtype=bool)
             self.record_mask_buffer = np.zeros(self._total_samples, dtype=bool)
-            self._samples_total = 0
-            self.write_head = 0
-            self.col_head   = 0
+            # Preserve the sample clock — it anchors filename timestamps
+            # (see reset_display). Re-derive the cursors for the NEW
+            # ring geometry with the same modulo rule ingest_chunk uses,
+            # so readers between now and the next chunk stay in bounds.
+            self.write_head = self._samples_total % self._total_samples
+            self.col_head   = (self._samples_total // CHUNK_FRAMES) % self._n_cols
 
     # ── Transport ─────────────────────────────────────────────────────────
 
@@ -949,9 +1013,15 @@ class RecordingEntity:
             self.acq_running = True
             # M5: anchor the capture wall clock to the sample counter.
             # The ring was drained at the last stop, so the next sample
-            # ingested was captured essentially "now".
-            self._wall_anchor_time = datetime.datetime.now()
+            # ingested was captured essentially "now". Aware-UTC so a
+            # DST transition mid-run can't skew the filename's local
+            # token — conversion to local time happens once, at
+            # filename-composition time (writer._compose_filename).
+            self._wall_anchor_time = datetime.datetime.now(
+                datetime.timezone.utc)
             self._wall_anchor_samples = self._samples_total
+            # Open every acquisition session with a clock-log row.
+            self._clock_log_next_t = 0.0
             # Start ingestion thread (#19 / c21).
             self._ingest_dead_latched = False
             self._ingest_stop.clear()
@@ -1000,13 +1070,19 @@ class RecordingEntity:
                     break
                 continue
             n_whole = (avail // CHUNK_FRAMES) * CHUNK_FRAMES
-            _start, block = ring.read(n_whole)
+            start_abs, block = ring.read(n_whole)
             for off in range(0, n_whole, CHUNK_FRAMES):
                 if self._ingest_stop.is_set():
                     break
                 chunk = block[off:off + CHUNK_FRAMES]
                 try:
-                    self.ingest_chunk(chunk)
+                    # abs_end: this chunk's last-sample index in ring
+                    # coordinates — the disciplined clock's timebase.
+                    # read() clamps start_abs forward over evicted
+                    # (overrun) regions, so drops shift abs_end rather
+                    # than silently freezing the timestamp clock.
+                    self.ingest_chunk(chunk,
+                                      abs_end=start_abs + off + CHUNK_FRAMES)
                 except Exception as exc:
                     # #44: don't let a processing error crash the ingest
                     # thread — bump counters so the sidebar can surface a
@@ -1057,17 +1133,23 @@ class RecordingEntity:
 
     # ── Chunk ingestion ───────────────────────────────────────────────────
 
-    def ingest_chunk(self, raw_chunk: np.ndarray):
+    def ingest_chunk(self, raw_chunk: np.ndarray, abs_end: int | None = None):
         """#53: public entry point — holds the DSP lock for the
         duration of one chunk so buffer / filter / accumulator
         mutations from UI-thread rebuild paths cannot race the
         ingestion pipeline. The lock is per-chunk (not per-session) so
         rebuild paths get a turn between chunks.
+
+        ``abs_end`` is the chunk's last-sample index in capture-ring
+        coordinates (passed by ``_ingest_loop``); it keys the
+        disciplined timestamp clock. Callers without ring coordinates
+        (tests, direct feeds) omit it and get the coarse anchor clock.
         """
         with self._dsp_lock:
-            self._ingest_chunk_locked(raw_chunk)
+            self._ingest_chunk_locked(raw_chunk, abs_end)
 
-    def _ingest_chunk_locked(self, raw_chunk: np.ndarray):
+    def _ingest_chunk_locked(self, raw_chunk: np.ndarray,
+                             abs_end: int | None = None):
         # 2b: force-trigger toggled OFF — flush the manual segment
         # immediately (no hold / post-trigger tail). Consumed here, on
         # the ingest thread, so the recorder is never touched from the
@@ -1341,14 +1423,46 @@ class RecordingEntity:
         # raw ``dph_folder_prefix``, susceptible to path-traversal.
         out_dir = self._effective_output_dir()
 
-        # M5: capture-time wall clock of this chunk's last sample,
-        # derived from the start_acq anchor + the sample counter (which
-        # was just advanced past this chunk). Immune to ingest backlog.
+        # Capture-time wall clock of this chunk's last sample.
+        # Primary: the disciplined clock — sample-smooth, steered onto
+        # wall time by callback observations (immune to crystal drift,
+        # ingest backlog, and capture holes; see chirp/audio/clock.py).
+        # Steps are deferred while a recording event is open so no file
+        # spans a discontinuity. Fallback (no observations yet, WAV
+        # playback, tests): the M5 start_acq anchor + sample counter.
         chunk_end_wall = None
-        if self._wall_anchor_time is not None:
+        epoch = None
+        clock = self.clock
+        if clock is not None and abs_end is not None:
+            epoch = clock.wall_at(
+                abs_end,
+                allow_step=not self.recorder.has_active_events())
+        if epoch is not None:
+            chunk_end_wall = datetime.datetime.fromtimestamp(
+                epoch, tz=datetime.timezone.utc)
+            if clock.step_count != self._clock_steps_seen:
+                self._clock_steps_seen = clock.step_count
+                _err_log('clock_step', self.name,
+                         f'timestamp clock stepped forward '
+                         f'{clock.last_step_sec:.3f}s (capture hole: '
+                         f'device stall / dropped samples); step '
+                         f'#{clock.step_count}')
+        elif self._wall_anchor_time is not None:
             chunk_end_wall = self._wall_anchor_time + datetime.timedelta(
                 seconds=(self._samples_total - self._wall_anchor_samples)
                 / self.sample_rate)
+
+        # Sidecar clock log: one audit row per interval while acquiring
+        # (direct test feeds never set acq_running, so they don't log).
+        if self.acq_running:
+            now_m = time.monotonic()
+            if now_m >= self._clock_log_next_t:
+                self._clock_log_next_t = (
+                    now_m + max(0.0, self.clock_log_interval_sec))
+                self._queue_clock_log_row(
+                    abs_end, chunk_end_wall,
+                    'clock' if epoch is not None else
+                    ('anchor' if chunk_end_wall is not None else ''))
 
         # 2a / 2b: effective open-gating params. Continuous mode records
         # from the first sample after Start Rec (no qualification run,
@@ -1388,6 +1502,36 @@ class RecordingEntity:
         # painted above from the SAME trigger_mask array the state
         # machine walked — 1:1 with detection, by construction.
         self._paint_record_buffer(report, n)
+
+    # ── Sidecar clock log ─────────────────────────────────────────────────
+
+    def _queue_clock_log_row(self, abs_end, chunk_end_wall, source) -> None:
+        """Build one clock-audit CSV row and hand the append to the
+        writer pool — the ingest thread never touches disk. The row
+        pairs the capture-side sample index with the derived capture
+        time (``source``: 'clock' = disciplined, 'anchor' = M5
+        fallback, '' = none) and the raw wall clock, so any filename
+        timestamp can be audited or corrected offline. Never raises."""
+        try:
+            from chirp.recording.writer import _sanitize_token
+            wall = time.time()
+            iso = datetime.datetime.fromtimestamp(
+                wall, tz=datetime.timezone.utc).isoformat(
+                timespec='milliseconds')
+            derived = ('' if chunk_end_wall is None
+                       else f'{chunk_end_wall.timestamp():.6f}')
+            sample_idx = self._samples_total if abs_end is None else abs_end
+            stream = _sanitize_token(self.name) or 'stream'
+            row = (f'{iso},{stream},{sample_idx},{derived},{source},'
+                   f'{wall:.6f}\n')
+            # Base output_dir, NOT the day-subfolder: the audit trail
+            # must stay one continuous file across day rollovers.
+            out_dir = self.output_dir
+            _wav_writer.submit_call(
+                lambda: _append_clock_log_row(out_dir, row),
+                filename_stream=self.name, out_dir=out_dir)
+        except Exception:
+            pass
 
     # ── #32: indicator buffer painting ───────────────────────────────────
 

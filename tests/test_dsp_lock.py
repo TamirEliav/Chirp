@@ -47,7 +47,7 @@ def test_ingest_chunk_holds_dsp_lock():
     # from inside the body.
     seen_held = {'ok': False}
     real_impl = e._ingest_chunk_locked
-    def _spy(raw):
+    def _spy(raw, abs_end=None):
         # If the lock is correctly held by the caller, trying to
         # acquire it non-blocking from the same thread will fail
         # (Lock, not RLock — that's the point).
@@ -55,7 +55,7 @@ def test_ingest_chunk_holds_dsp_lock():
             'ingest_chunk entered _ingest_chunk_locked without '
             'holding _dsp_lock — DSP state is unprotected')
         seen_held['ok'] = True
-        return real_impl(raw)
+        return real_impl(raw, abs_end)
     e._ingest_chunk_locked = _spy
 
     chunk = np.zeros(1024, dtype=np.float32)
