@@ -1142,13 +1142,36 @@ python chirp.py</code></pre>
   <h2>Recording over Remote Desktop (RDP)</h2>
   <p>
     Connecting to (or disconnecting from) the recording machine via Windows Remote Desktop can
-    interrupt an ongoing recording: RDP's <em>audio redirection</em> tears down or re-routes the
-    host's audio endpoints when the session state changes, which silently kills the open capture
-    streams. Chirp defends against this in two layers &mdash; but the best fix is to prevent the
-    redirection in the first place.
+    interrupt an ongoing recording: a session change tears down or re-routes the host's audio
+    endpoints, which silently kills the open capture streams. Chirp defends against this with an
+    auto-reconnect watchdog &mdash; but the best fix is to pick an input device that the session
+    change cannot touch, and to prevent RDP's audio redirection in the first place.
   </p>
 
-  <h3>Prevention (recommended)</h3>
+  <h3>Choose the WDM-KS input device (recommended)</h3>
+  <p>
+    The same physical device usually appears several times in the Input Device list, once per
+    Windows audio API &mdash; e.g. <code>Microphone (MyCard) [MME]</code>,
+    <code>[Windows DirectSound]</code>, <code>[Windows WASAPI]</code>, and
+    <code>[Windows WDM-KS]</code>. These are different doorways into the same hardware: MME and
+    DirectSound are legacy shims layered on top of WASAPI, and WASAPI endpoints belong to the
+    <em>per-session</em> Windows audio engine &mdash; exactly the layer an RDP session switch
+    tears down and renames. <strong>WDM-KS</strong> (kernel streaming) binds the driver directly,
+    <em>below</em> the endpoint layer: its device name is stable across session changes and an
+    open capture stream survives an RDP connect/disconnect untouched. For a machine you reach
+    over RDP, always select the <code>[Windows WDM-KS]</code> entry.
+  </p>
+  <p>
+    As a bonus, WDM-KS bypasses the audio engine's mixer/resampler, so capture is bit-exact at
+    the card's native rate with the lowest overhead of the four APIs. Two caveats: access is
+    <em>exclusive</em> (one Chirp stream per WDM-KS device &mdash; on multichannel interfaces
+    each stereo pair is a separate device, so use one stream per pair &mdash; and other
+    applications cannot use the device while Chirp holds it), and the stream's sample rate must
+    be natively supported by the card &mdash; there is no hidden resampler to absorb a mismatch,
+    an unsupported rate simply fails to open.
+  </p>
+
+  <h3>Prevention: disable RDP audio redirection</h3>
   <p>On the machine you connect <em>from</em>, in the Remote Desktop client (<code>mstsc</code>):</p>
   <ul>
     <li>Open <strong>Show Options &rarr; Local Resources &rarr; Remote audio &rarr; Settings&hellip;</strong></li>
