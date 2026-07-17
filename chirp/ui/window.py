@@ -2046,7 +2046,15 @@ class ChirpWindow(QMainWindow):
         if e:
             for ent in self._entities:
                 ent.reset_display()
-            e.start_acq()
+            with self._busy_cursor():
+                e.start_acq()
+            # L6: a failed (re)open used to be a silently dead button —
+            # the entity now latches the reason in last_ingest_error.
+            if not e.acq_running:
+                QMessageBox.warning(
+                    self, 'Acquisition Error',
+                    f'Could not start acquisition:\n'
+                    f'{e.last_ingest_error or "unknown error"}')
             self._refresh_transport_ui()
 
     def _on_stop_acq(self):

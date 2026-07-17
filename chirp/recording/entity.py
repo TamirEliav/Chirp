@@ -984,52 +984,109 @@ class RecordingEntity:
 
     # ── Transport ─────────────────────────────────────────────────────────
 
+    def _latch_start_failure(self, detail: str | None = None) -> None:
+        """Surface a failed acquisition start on the sidebar `!` badge
+        and in chirp_errors.log. Before this, a device that refused to
+        (re)open made Start Acq silently do nothing — no badge, no log,
+        no dialog (the classic symptom: Stop Acq inside an RDP session,
+        then Start Acq is dead until the device is reselected)."""
+        msg = (detail or getattr(self.capture, 'open_error', None)
+               or 'unknown error')
+        self.has_ever_ingest_errored = True
+        self.ingest_error_count_total += 1
+        self.last_ingest_error = f'could not start acquisition — {msg}'
+        print(f'[Chirp] {self.name}: could not start acquisition — {msg}')
+        _err_log('open', self.name, f'could not start acquisition — {msg}')
+
+    def _reopen_capture(self):
+        """Close the current capture and open a fresh one for the
+        current device / channel mode. Returns the new capture."""
+        try:
+            self.capture.close()
+        except Exception:
+            pass
+        need_ch = 2 if self.channel_mode != 'Mono' else 1
+        self.capture = self._make_capture(channels=need_ch)
+        return self.capture
+
     def start_acq(self):
-        if not self.acq_running and self.capture.valid:
-            # #53: refuse to start if a prior ingest thread got stuck
-            # and a stop attempt couldn't join it. Without this guard
-            # we would silently double-spawn — both threads draining
-            # the same queue, ring-buffer writes racing, chunks
-            # arbitrarily split between two pipelines.
-            if (self._ingest_thread is not None
-                    and self._ingest_thread.is_alive()):
-                self._ingest_join_failed   = True
-                self.has_ever_ingest_errored = True
-                self.last_ingest_error = (
-                    'cannot start acquisition — previous ingest thread '
-                    'is still alive (restart the app)')
-                print(f'[Chirp] {self.name}: refusing to double-spawn '
-                      f'ingest thread; prior thread still alive')
-                return
-            # Clear stale overlap so the first few FFT columns after a
-            # restart don't mix zero-padding into the spectrum (#14).
-            self.spec_acc.reset()
-            self.spec_acc_r.reset()
-            if self._analysis_acc is not None:
-                self._analysis_acc.reset()
-            if self._analysis_acc_r is not None:
-                self._analysis_acc_r.reset()
+        if self.acq_running:
+            return
+        # #53: refuse to start if a prior ingest thread got stuck
+        # and a stop attempt couldn't join it. Without this guard
+        # we would silently double-spawn — both threads draining
+        # the same queue, ring-buffer writes racing, chunks
+        # arbitrarily split between two pipelines.
+        if (self._ingest_thread is not None
+                and self._ingest_thread.is_alive()):
+            self._ingest_join_failed   = True
+            self.has_ever_ingest_errored = True
+            self.last_ingest_error = (
+                'cannot start acquisition — previous ingest thread '
+                'is still alive (restart the app)')
+            print(f'[Chirp] {self.name}: refusing to double-spawn '
+                  f'ingest thread; prior thread still alive')
+            return
+        # L6 (RDP / WDM-KS): stop_acq CLOSES a live-device capture, so
+        # a restart opens a fresh stream here. Resuming a paused stream
+        # is not reliable: a stopped-but-open WDM-KS pin that idled
+        # through an RDP session switch (endpoint churn, device power
+        # management) can refuse to restart or restart as a zombie that
+        # never delivers frames — a fresh open renegotiates the pin
+        # from scratch. Callers that just built a valid capture
+        # (change_device, attempt_capture_recovery, change_sample_rate)
+        # skip the rebuild and go straight to resume below.
+        if self.input_source == 'device' and not self.capture.valid:
+            self._reopen_capture()
+        if not self.capture.valid:
+            self._latch_start_failure()
+            return
+        # Clear stale overlap so the first few FFT columns after a
+        # restart don't mix zero-padding into the spectrum (#14).
+        self.spec_acc.reset()
+        self.spec_acc_r.reset()
+        if self._analysis_acc is not None:
+            self._analysis_acc.reset()
+        if self._analysis_acc_r is not None:
+            self._analysis_acc_r.reset()
+        try:
             self.capture.resume()
-            self.acq_running = True
-            # M5: anchor the capture wall clock to the sample counter.
-            # The ring was drained at the last stop, so the next sample
-            # ingested was captured essentially "now". Aware-UTC so a
-            # DST transition mid-run can't skew the filename's local
-            # token — conversion to local time happens once, at
-            # filename-composition time (writer._compose_filename).
-            self._wall_anchor_time = datetime.datetime.now(
-                datetime.timezone.utc)
-            self._wall_anchor_samples = self._samples_total
-            # Open every acquisition session with a clock-log row.
-            self._clock_log_next_t = 0.0
-            # Start ingestion thread (#19 / c21).
-            self._ingest_dead_latched = False
-            self._ingest_stop.clear()
-            t = threading.Thread(target=self._ingest_loop,
-                                 name=f'chirp-ingest-{self.name}',
-                                 daemon=True)
-            self._ingest_thread = t
-            t.start()
+        except Exception as exc:
+            # A previously-paused stream can refuse to restart after
+            # audio-endpoint churn. For live devices, fall back to one
+            # full close + reopen before giving up.
+            detail = f'{type(exc).__name__}: {exc}'
+            if self.input_source != 'device':
+                self._latch_start_failure(detail)
+                return
+            if not self._reopen_capture().valid:
+                self._latch_start_failure()
+                return
+            try:
+                self.capture.resume()
+            except Exception as exc2:
+                self._latch_start_failure(f'{type(exc2).__name__}: {exc2}')
+                return
+        self.acq_running = True
+        # M5: anchor the capture wall clock to the sample counter.
+        # The ring was drained at the last stop, so the next sample
+        # ingested was captured essentially "now". Aware-UTC so a
+        # DST transition mid-run can't skew the filename's local
+        # token — conversion to local time happens once, at
+        # filename-composition time (writer._compose_filename).
+        self._wall_anchor_time = datetime.datetime.now(
+            datetime.timezone.utc)
+        self._wall_anchor_samples = self._samples_total
+        # Open every acquisition session with a clock-log row.
+        self._clock_log_next_t = 0.0
+        # Start ingestion thread (#19 / c21).
+        self._ingest_dead_latched = False
+        self._ingest_stop.clear()
+        t = threading.Thread(target=self._ingest_loop,
+                             name=f'chirp-ingest-{self.name}',
+                             daemon=True)
+        self._ingest_thread = t
+        t.start()
 
     def stop_acq(self):
         if self.acq_running:
@@ -1041,6 +1098,17 @@ class RecordingEntity:
             # drains the queue, and calls ``recorder.flush_all`` so any
             # event still mid-recording or mid-tail lands on disk.
             self._stop_ingest_and_flush(reason='stop_acq')
+            # L6 (RDP / WDM-KS): release the device while idle. A
+            # paused-but-open stream still holds the device (exclusively
+            # so under WDM-KS), and its kernel state can be invalidated
+            # by RDP session churn or power management while idle — a
+            # later stream.start() then fails on the stale handle.
+            # start_acq opens a fresh stream instead of resuming.
+            if self.input_source == 'device':
+                try:
+                    self.capture.close()
+                except Exception:
+                    pass
             self.bpf.reset()
             self.bpf_r.reset()
             self.spec_acc.reset()
