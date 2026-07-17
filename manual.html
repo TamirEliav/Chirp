@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Chirp v3.4.0 — User Manual</title>
+<title>Chirp v3.5.0 — User Manual</title>
 <style>
   :root {
     --base: #1e1e2e;
@@ -304,7 +304,7 @@
 <nav class="sidebar">
   <div class="logo">
     <h1>Chirp</h1>
-    <span>User Manual &mdash; v3.4.0</span>
+    <span>User Manual &mdash; v3.5.0</span>
   </div>
   <ul>
     <li><a href="#overview">Overview</a></li>
@@ -365,7 +365,7 @@
 <header class="hero">
   <h1>Chirp</h1>
   <p class="subtitle">Real-Time Audio Monitoring, Visualization &amp; Triggered Recording</p>
-  <span class="version">v3.4.0</span>
+  <span class="version">v3.5.0</span>
 </header>
 
 <!-- ── 1. Overview ── -->
@@ -390,8 +390,9 @@
     <li>Save and load full session configurations as JSON</li>
   </ul>
   <p>
-    The entire application is contained in a single Python file (<code>chirp.py</code>), making
-    deployment and modification straightforward.
+    The application ships as the <code>chirp</code> Python package (run with
+    <code>python -m chirp</code>) and is also distributed as a standalone
+    <code>Chirp.exe</code> built with PyInstaller.
   </p>
 </section>
 
@@ -443,7 +444,7 @@ python chirp.py</code></pre>
       <span style="color:var(--green)">ACQ</span> (acquiring, green),
       <span style="color:var(--green)">REC</span> (recording, green),
       <span style="color:var(--red)">TRIG</span> (triggered, red)</li>
-    <li><strong>Sticky health badges</strong> (v2.1) &mdash;
+    <li><strong>Sticky health badges</strong> &mdash;
       <span style="color:var(--red); font-weight:bold">S</span> latches when this stream has saturated
       (clipped) at any point during the session;
       <span style="color:var(--red); font-weight:bold">D</span> latches when the audio capture has
@@ -475,7 +476,7 @@ python chirp.py</code></pre>
     write position in the circular buffer.
   </p>
   <p>
-    A thin <strong>detect / record events strip</strong> (v2.1) sits directly beneath the amplitude
+    A thin <strong>detect / record events strip</strong> sits directly beneath the amplitude
     plot with two rows: a yellow bar lights up for every sample the trigger condition is met
     (<em>detect</em>), and a green bar lights up for every sample the writer is actually capturing
     (<em>record</em>). The detect row is driven by the same per-sample trigger mask the recording
@@ -598,7 +599,7 @@ python chirp.py</code></pre>
     <li><strong>Saturation warning</strong> &mdash; the waveform and amplitude lines turn red when
         the signal reaches 99% of full scale or higher. The transient red tint clears as soon as a
         clean chunk arrives; the <strong>sticky
-        <span style="color:var(--red); font-weight:bold">S</span> badge</strong> (v2.1) on the
+        <span style="color:var(--red); font-weight:bold">S</span> badge</strong> on the
         sidebar entry latches until you click it, so a brief clip is never missed.</li>
     <li><strong>Drop warning</strong> &mdash; raw audio lands in a preallocated per-stream ring
         buffer straight from the realtime callback, so capture cannot be stalled by DSP or the
@@ -724,7 +725,7 @@ python chirp.py</code></pre>
     </div>
   </details>
 
-  <h3 id="rec-modes">Recording Modes &amp; Force Trigger <em>(v3.3.0)</em></h3>
+  <h3 id="rec-modes">Recording Modes &amp; Force Trigger</h3>
   <p>
     The <strong>Rec Mode</strong> selector at the top of the Trigger panel picks how recording is
     driven, per stream:
@@ -750,20 +751,61 @@ python chirp.py</code></pre>
   <pre><code>&lt;prefix&gt;_&lt;epochMs&gt;_YYYYMMDD_HHMMSS_mmm_&lt;suffix&gt;.wav</code></pre>
   <p>
     Where <code>epochMs</code> is the Unix epoch in milliseconds, and the timestamp reflects local
-    time down to the millisecond. Files are written in a background thread to avoid blocking the
-    audio processing pipeline.
+    time down to the millisecond. Both fields encode the same instant &mdash; the onset of the
+    recorded event (including the pre-trigger lookback). Files are written in a background thread
+    to avoid blocking the audio processing pipeline.
   </p>
   <div class="callout tip">
     <strong>Tip:</strong> The epoch timestamp ensures filenames are unique even if the system clock
     is adjusted during a recording session.
   </div>
+
+  <h3 id="timestamps">Timestamp Reliability</h3>
+  <p>
+    Filename timestamps come from a <strong>disciplined capture clock</strong>: a sample-accurate
+    clock driven by the audio stream itself, continuously steered onto the system wall clock. This
+    gives the best of both worlds for long recording campaigns:
+  </p>
+  <ul>
+    <li><strong>Local precision</strong> &mdash; adjacent, overlapping, and Max-Rec&ndash;split
+      files tile at sample accuracy (part 2's timestamp = part 1's onset + part 1's duration,
+      exactly), because timestamps derive from the sample counter, not from when the file happened
+      to be written.</li>
+    <li><strong>Long-run accuracy</strong> &mdash; sound-card crystals drift by seconds per day
+      (minutes over a multi-week experiment). The clock measures its offset against the system
+      wall clock on every audio buffer and corrects it smoothly (&le;&nbsp;1&nbsp;ms per second of
+      audio), so the drift never accumulates. Timestamps are computed in UTC internally and
+      rendered to local time only in the filename, so a daylight-saving transition mid-run does
+      not skew the readable timestamp.</li>
+    <li><strong>Capture holes</strong> &mdash; if the device stalls or samples are dropped, the
+      clock detects the hole and jumps forward across it <em>between</em> recordings (never inside
+      a file), logging a <code>clock_step</code> entry to <code>chirp_errors.log</code>.</li>
+  </ul>
+  <p>
+    Two independent safety nets watch the timestamps:
+  </p>
+  <ul>
+    <li><strong>Publish-time watchdog</strong> &mdash; every finalized WAV's
+      <em>onset&nbsp;+&nbsp;duration</em> is checked against the wall clock; a divergence beyond
+      10&nbsp;seconds lights the sidebar
+      <span style="color:var(--peach); font-weight:bold">!</span> badge and logs a
+      <code>timestamp_divergence</code> entry with the exact delta and file path.</li>
+    <li><strong>Clock audit log</strong> &mdash; once per minute, each acquiring stream appends a
+      row to <code>chirp_clock_log.csv</code> in its output folder pairing the capture sample
+      index with the derived capture time and the raw system clock
+      (<code>utc_iso, stream, ring_sample_index, derived_epoch, derived_source, wall_epoch</code>).
+      After a long run, comparing <code>derived_epoch</code> and <code>wall_epoch</code> bounds the
+      clock error at any point in the session &mdash; and lets you verify (or correct) any
+      filename's timestamp offline. The file is capped at 64&nbsp;MB (&asymp;10&nbsp;MB per stream
+      over 90 days in practice).</li>
+  </ul>
 </section>
 
 <!-- ── 6. Spectral Entropy ── -->
 <section id="spectral-entropy">
   <h2>Spectral Entropy Trigger</h2>
   <p>
-    Introduced in v2.0, the spectral entropy trigger provides a frequency-domain criterion for
+    The spectral entropy trigger provides a frequency-domain criterion for
     identifying sounds of interest. It computes the normalized Shannon entropy of the FFT magnitude
     spectrum, producing a value between 0 and 1:
   </p>
@@ -795,14 +837,14 @@ python chirp.py</code></pre>
     condition.
   </div>
 
-  <h3 id="entropy-min-dur">Entropy Min Duration <em>(v3.3.0)</em></h3>
+  <h3 id="entropy-min-dur">Entropy Min Duration</h3>
   <p>
     The <strong>Entropy Min Dur</strong> parameter debounces the spectral gate: entropy must stay
     below the threshold <em>continuously</em> for at least this long (evaluated per FFT chunk,
     &asymp;23&nbsp;ms at 44.1&nbsp;kHz) before the spectral condition turns ON. It turns OFF again
     on the first chunk back above the threshold. This filters out momentary tonal blips without
     touching the amplitude <em>Min Cross</em>, which still applies to the combined detection mask.
-    Set to <code>0</code> for the instantaneous (pre-v3.3) behavior.
+    Set to <code>0</code> for instantaneous behavior.
   </p>
 
   <h3 id="entropy-plot">Entropy Trace Plot</h3>
@@ -902,9 +944,9 @@ python chirp.py</code></pre>
         <strong>Columns</strong> control in the view toolbar to set the number of columns (e.g. 2
         columns &times; 4 rows for 8 streams).</li>
     <li>Each cell shows a compact spectrogram or waveform, amplitude plot, threshold line,
-        detect / record events strip (v2.1), and status text.</li>
+        detect / record events strip, and status text.</li>
     <li>The sidebar and configuration panels are hidden to maximize display area.</li>
-    <li><strong>Per-tile header</strong> (v3.3.0): each tile shows the stream name,
+    <li><strong>Per-tile header</strong>: each tile shows the stream name,
       <strong>acq / rec / trig status dots</strong> (blue / green / red — same vocabulary as the
       sidebar), and the sticky health badges
       <span style="color:var(--red); font-weight:bold">S</span> (saturation),
@@ -914,7 +956,7 @@ python chirp.py</code></pre>
       &#127911; marker shows which stream feeds the audio monitor.</li>
     <li>Each tile also includes the <strong>detect / record events strip</strong> (yellow = trigger
       condition met, green = written to WAV), so trigger activity is visible while monitoring.</li>
-    <li><strong>Active only</strong> (v3.3.0): a toolbar checkbox that hides streams whose
+    <li><strong>Active only</strong>: a toolbar checkbox that hides streams whose
       acquisition is stopped. The setting is saved with the configuration.</li>
     <li>Per-tile <strong>Height</strong> is adjustable, or click <strong>Fit to screen</strong> to
         size every tile so all streams are visible at once without scrolling (based on the current
@@ -951,7 +993,7 @@ python chirp.py</code></pre>
     found, it attempts a partial string match. This allows configurations to be portable across
     systems where devices may have slightly different names.
   </p>
-  <h3 id="config-table">All-Streams Table <em>(v3.3.0)</em></h3>
+  <h3 id="config-table">All-Streams Table</h3>
   <p>
     The <strong>All Streams Table&hellip;</strong> button (next to <em>Apply All Settings</em>)
     opens a side-by-side table of every parameter of every stream — rows are parameters, columns
@@ -962,7 +1004,7 @@ python chirp.py</code></pre>
     panel. This replaces the live-sync checkboxes from earlier versions; for one-shot copying of
     everything from one stream to all others, use <em>Apply All Settings</em>.
   </p>
-  <h3 id="monitor-controls">Audio Monitor Controls <em>(v3.3.0)</em></h3>
+  <h3 id="monitor-controls">Audio Monitor Controls</h3>
   <p>
     The monitor bar gained a <strong>&#128266; enable/disable toggle</strong> — muting closes the
     output stream but keeps both the source and output device selections, so re-enabling restores
@@ -1047,6 +1089,21 @@ python chirp.py</code></pre>
             and review every recording that clipped without flooding the log.</td>
         <td>Full path of the WAV that clipped.</td>
       </tr>
+      <tr>
+        <td><code>clock_step</code></td>
+        <td>The disciplined timestamp clock detected a capture hole (device stall / drop burst)
+            and stepped forward across it, between recording events. The message carries the size
+            of the jump. See <a href="#timestamps">Timestamp Reliability</a>.</td>
+        <td>&mdash;</td>
+      </tr>
+      <tr>
+        <td><code>timestamp_divergence</code></td>
+        <td>A published WAV's <em>onset&nbsp;+&nbsp;duration</em> disagrees with the wall clock by
+            more than 10&nbsp;seconds &mdash; the filename timestamps may be wrong. Logged once per
+            affected file with the exact delta; also lights the sidebar
+            <span style="color:var(--peach); font-weight:bold">!</span> badge.</td>
+        <td>Full path of the affected WAV.</td>
+      </tr>
     </tbody>
   </table>
 
@@ -1061,7 +1118,8 @@ python chirp.py</code></pre>
   </p>
   <p>
     All other categories &mdash; <code>ingest</code>, <code>open</code>, <code>wav_writer</code>,
-    <code>saturation</code> &mdash; are not throttled; every event produces a line.
+    <code>saturation</code>, <code>clock_step</code>, <code>timestamp_divergence</code> &mdash;
+    are not throttled; every event produces a line.
   </p>
 
   <h3>Reliability</h3>
@@ -1242,7 +1300,7 @@ python chirp.py</code></pre>
 
 <!-- Footer -->
 <footer style="margin-top:3rem; padding-top:1.5rem; border-top:1px solid var(--surface0); text-align:center; color:var(--overlay0); font-size:0.82rem;">
-  <p>Chirp v3.4.0 &mdash; User Manual</p>
+  <p>Chirp v3.5.0 &mdash; User Manual</p>
   <p>Designed for bioacoustics research. Built with Python, PyQt5, and pyqtgraph.</p>
 </footer>
 

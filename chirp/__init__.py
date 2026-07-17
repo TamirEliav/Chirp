@@ -16,7 +16,7 @@ Subpackage layout:
 Refactor plan: ~/.claude/plans/robust-yawning-spring.md
 """
 
-__version__ = "3.4.0"
+__version__ = "3.5.0"
 
 # Re-exports for backward-compatible `from chirp import X` callers and
 # for tests that monkeypatch via `chirp.<Class>`. Keep this list in sync
