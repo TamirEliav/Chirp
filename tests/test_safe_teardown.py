@@ -130,8 +130,8 @@ def test_flush_active_events_uses_ref_date_subfolder(captured_flushes, tmp_path)
     e._flush_active_events(reason='unit-test')
 
     assert len(captured_flushes) == 1
-    # e.g. <tmp>/dph5
-    assert captured_flushes[0]['output_dir'].endswith('dph5')
+    # e.g. <tmp>/dph_5 — prefix and day number joined by an underscore.
+    assert captured_flushes[0]['output_dir'].endswith('dph_5')
 
 
 # ── stop_acq flushes ─────────────────────────────────────────────────

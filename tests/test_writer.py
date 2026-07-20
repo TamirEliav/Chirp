@@ -1,8 +1,9 @@
 """Tests for `chirp.recording.writer`.
 
-Pin the file naming contract — particularly the c13 (#23) addition
-of a sanitized stream-name token, which prevents two streams with
-events at the same millisecond from clobbering each other's WAVs.
+Pin the file naming contract. The stream name is deliberately NOT part
+of the filename — only the user's prefix/suffix fields decorate it (a
+same-millisecond collision between two streams is resolved downstream by
+``_dedup_target``'s ``_rNN`` token, not by embedding the stream name).
 """
 
 import datetime
@@ -19,24 +20,24 @@ def test_sanitize_token_strips_separators():
     assert _sanitize_token("///") == ""
 
 
-def test_filename_includes_sanitized_stream_name(tmp_path):
-    """#51: ``filename_stream`` must appear in the filename — it is
-    the ONLY disambiguator between two streams that trigger on the
-    same physical event at the same ms timestamp. The old
-    test_filename_excludes_stream_name pinned the buggy behavior
-    (clobber!) — this replaces it."""
+def test_filename_excludes_stream_name(tmp_path):
+    """The stream name must NOT appear in the filename — only the
+    user-controlled prefix/suffix fields decorate the name. ``prefix``
+    leads and ``suffix`` trails; the stream name is dropped even when
+    passed as ``filename_stream`` (that token is retained only for error
+    logging / the timestamp-divergence watchdog)."""
     onset = datetime.datetime(2024, 1, 2, 3, 4, 5, 678000)
     audio = np.zeros(1024, dtype=np.float32)
     path = write_wav_sync([audio], str(tmp_path),
-                          prefix='bird', suffix='',
+                          prefix='bird', suffix='call',
                           sample_rate=44100,
                           onset_time=onset,
                           filename_stream='Channel 1')
     name = os.path.basename(path)
-    # Sanitized stream name is present and disambiguates streams.
-    assert "Channel_1" in name
+    # Stream name never leaks into the filename.
+    assert "Channel" not in name
     assert name.startswith("bird_")
-    assert name.endswith(".wav")
+    assert name.endswith("_call.wav")
 
 
 def test_writer_pool_drains_pending_writes(tmp_path):

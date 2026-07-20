@@ -92,16 +92,18 @@ def _sanitize_token(s: str) -> str:
     return cleaned
 
 
-def _compose_filename(prefix: str, suffix: str, onset, filename_stream: str) -> str:
+def _compose_filename(prefix: str, suffix: str, onset) -> str:
     """Compose the WAV filename from sanitized tokens (#51 / #23).
 
-    Layout: ``<prefix>_<epoch_ms>_<localts>_<stream>_<suffix>.wav`` with
-    blank tokens dropped (no stray ``__``). ``epoch_ms`` + the
-    ms-precision local timestamp come from ``onset``; the
-    ``filename_stream`` token disambiguates two streams that trigger on
-    the same physical event at the same millisecond. Shared by
-    ``write_wav_sync`` and ``StreamingWavWriter`` so the naming contract
-    can't drift between the two write paths.
+    Layout: ``<prefix>_<epoch_ms>_<localts>_<suffix>.wav`` with blank
+    tokens dropped (no stray ``__``). ``epoch_ms`` + the ms-precision
+    local timestamp come from ``onset``. Only the user-controlled
+    ``prefix`` / ``suffix`` fields decorate the name — the stream name is
+    deliberately NOT included (the user asked for prefix/suffix to be the
+    sole naming controls). Same-millisecond collisions between two
+    streams are handled downstream by ``_dedup_target`` (the ``_rNN``
+    token). Shared by ``write_wav_sync`` and ``StreamingWavWriter`` so
+    the naming contract can't drift between the two write paths.
     """
     # Timezone handling: aware onsets (the disciplined-clock path,
     # internally UTC) are converted to the system local zone HERE, at
@@ -112,7 +114,6 @@ def _compose_filename(prefix: str, suffix: str, onset, filename_stream: str) -> 
     local = onset.astimezone() if onset.tzinfo is not None else onset
     local_ts = local.strftime('%Y%m%d_%H%M%S_%f')[:-3]
     parts = [p for p in [_sanitize_token(prefix), str(epoch_ms), local_ts,
-                         _sanitize_token(filename_stream),
                          _sanitize_token(suffix)] if p]
     return '_'.join(parts) + '.wav'
 
@@ -241,7 +242,7 @@ def write_wav_sync(buf_snapshot: list, output_dir: str,
     # #51: every user-controlled token that lands in the filename is
     # sanitized; the final path is verified to stay inside output_dir.
     # Shared with StreamingWavWriter via the module helpers.
-    fname = _compose_filename(prefix, suffix, onset, filename_stream)
+    fname = _compose_filename(prefix, suffix, onset)
     path  = _resolve_safe_path(output_dir, fname)
     # #52: write to a sibling tmp file then rename atomically. Keep the
     # tmp file on the SAME directory as the target so ``os.replace``
@@ -315,7 +316,7 @@ class StreamingWavWriter:
         # Kept for the publish-time timestamp sanity check in close().
         self._onset = onset_time
         os.makedirs(output_dir, exist_ok=True)
-        fname = _compose_filename(prefix, suffix, onset_time, filename_stream)
+        fname = _compose_filename(prefix, suffix, onset_time)
         self.path = _resolve_safe_path(output_dir, fname)
         self._tmp = f'{self.path}.{next(_tmp_counter)}.tmp'
         self.sample_rate = int(sample_rate)
@@ -353,7 +354,7 @@ class StreamingWavWriter:
             # must not overwrite a real onset from open time.)
             self._onset = onset_time
         os.makedirs(output_dir, exist_ok=True)
-        fname = _compose_filename(prefix, suffix, onset_time, filename_stream)
+        fname = _compose_filename(prefix, suffix, onset_time)
         self.path = _resolve_safe_path(output_dir, fname)
 
     def append(self, frames: np.ndarray) -> None:

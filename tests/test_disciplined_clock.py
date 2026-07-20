@@ -216,15 +216,15 @@ def test_compose_filename_aware_utc_onset_renders_local_token():
     from chirp.recording.writer import _compose_filename
     onset = datetime.datetime(2026, 7, 16, 10, 30, 15, 123000,
                               tzinfo=datetime.timezone.utc)
-    fname = _compose_filename('pre', 'suf', onset, 'S1')
+    fname = _compose_filename('pre', 'suf', onset)
     epoch_ms = int(onset.timestamp() * 1000)
     local_ts = onset.astimezone().strftime('%Y%m%d_%H%M%S_%f')[:-3]
-    assert fname == f'pre_{epoch_ms}_{local_ts}_S1_suf.wav'
+    assert fname == f'pre_{epoch_ms}_{local_ts}_suf.wav'
 
 
 def test_compose_filename_naive_onset_unchanged():
     from chirp.recording.writer import _compose_filename
     onset = datetime.datetime(2026, 7, 16, 10, 30, 15, 123000)
-    fname = _compose_filename('pre', 'suf', onset, 'S1')
+    fname = _compose_filename('pre', 'suf', onset)
     epoch_ms = int(onset.timestamp() * 1000)
-    assert fname == f'pre_{epoch_ms}_20260716_103015_123_S1_suf.wav'
+    assert fname == f'pre_{epoch_ms}_20260716_103015_123_suf.wav'

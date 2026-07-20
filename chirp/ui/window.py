@@ -29,6 +29,7 @@ from PyQt5.QtWidgets import (
     QFileDialog, QFrame, QSizePolicy, QDoubleSpinBox, QComboBox, QCheckBox,
     QScrollArea, QStackedLayout, QDialog, QCalendarWidget, QMessageBox, QSpinBox,
     QMenu, QAction, QActionGroup, QSlider,
+    QRadioButton, QButtonGroup, QDialogButtonBox,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QSize, QDate, QPointF
 from PyQt5.QtGui import (
@@ -139,13 +140,16 @@ class ChirpWindow(QMainWindow):
         self._build_ui()
         self._connect_signals()
 
-        # Create first recording entity
-        self._add_recording()
-
         self._timer = QTimer(self)
         self._timer.setInterval(ANIMATION_INTERVAL)
         self._timer.timeout.connect(self._update_plot)
         self._timer.start()
+
+        # Seed the initial state from the startup preference (empty /
+        # last / pinned file). Runs after the timer exists because a
+        # config load stops and restarts it. Always leaves at least one
+        # recording present.
+        self._apply_startup_config()
 
         self._update_title()
         self.resize(1400, 850)
@@ -910,10 +914,14 @@ class ChirpWindow(QMainWindow):
         self._btn_save    = QPushButton('\U0001f4be Save')
         self._btn_save_as = QPushButton('\U0001f4be Save As')
         self._btn_load    = QPushButton('\U0001f4c2 Load')
+        self._btn_startup = QPushButton('⚙ Startup')
         self._btn_save   .setToolTip('Save configuration to the current file')
         self._btn_save_as.setToolTip('Save configuration to a new file')
         self._btn_load   .setToolTip('Load configuration from a file (.json or legacy .chirp)')
-        for btn in (self._btn_save, self._btn_save_as, self._btn_load):
+        self._btn_startup.setToolTip('Choose which configuration Chirp loads at startup '
+                                     '(empty / last used / a specific file)')
+        for btn in (self._btn_save, self._btn_save_as, self._btn_load,
+                    self._btn_startup):
             btn.setObjectName('btn_browse')
 
         # Width diet: the global QSS gives every button min-width 120px
@@ -924,7 +932,7 @@ class ChirpWindow(QMainWindow):
         for btn in (self._btn_start_acq, self._btn_stop_acq,
                     self._btn_start_rec, self._btn_stop_rec,
                     self._btn_save, self._btn_save_as,
-                    self._btn_load, self._btn_reset):
+                    self._btn_load, self._btn_reset, self._btn_startup):
             btn.setStyleSheet(btn.styleSheet()
                               + 'min-width: 0px; padding: 6px 10px;')
 
@@ -937,7 +945,8 @@ class ChirpWindow(QMainWindow):
         btn_g.addWidget(self._btn_save_as,   3, 1)
         btn_g.addWidget(self._btn_load,      4, 0)
         btn_g.addWidget(self._btn_reset,     4, 1)
-        btn_g.addWidget(self._btn_view_mode, 5, 0, 1, 2)
+        btn_g.addWidget(self._btn_startup,   5, 0, 1, 2)
+        btn_g.addWidget(self._btn_view_mode, 6, 0, 1, 2)
 
         # Right column: status labels
         status_box = QGroupBox('STATUS')
@@ -1583,6 +1592,7 @@ class ChirpWindow(QMainWindow):
         self._btn_save    .clicked.connect(self._save_settings)
         self._btn_save_as .clicked.connect(self._save_settings_as)
         self._btn_load    .clicked.connect(self._load_settings)
+        self._btn_startup .clicked.connect(self._open_startup_prefs)
         self._btn_view_mode.clicked.connect(self._toggle_view_mode)
 
         # Threshold (hidden spinbox, synced from amplitude graph drag)
@@ -2192,6 +2202,7 @@ class ChirpWindow(QMainWindow):
                     pass
             os.replace(tmp_path, path)
             self._current_config_path = path
+            self._remember_last_config(path)
             self._mark_clean()  # #11 / c22
             return True
         except Exception as exc:
@@ -2223,17 +2234,125 @@ class ChirpWindow(QMainWindow):
             path += '.json'
         self._write_settings_to_path(path, data)
 
+    # ── Startup configuration preference ───────────────────────────────
+
+    @staticmethod
+    def _remember_last_config(path: str) -> None:
+        """Record ``path`` as the most-recently used config so the
+        'last configuration' startup mode can reload it next launch.
+        Best-effort — never raises (QSettings access is guarded)."""
+        from chirp.config import startup as _startup
+        _startup.set_last_config(path)
+
+    def _apply_startup_config(self) -> None:
+        """Decide what to load at launch based on the persisted startup
+        preference (empty / last / pinned file). Falls back to a single
+        fresh recording whenever the chosen source is unset, missing, or
+        fails to load — the app must always come up usable."""
+        from chirp.config import startup as _startup
+        path = _startup.resolve_startup_path()
+        loaded = False
+        if path:
+            if os.path.exists(path):
+                loaded = self._load_settings_from_path(path, silent=True)
+            else:
+                print(f'[Chirp] startup config not found, starting empty: '
+                      f'{path!r}')
+        if not loaded:
+            # Empty config (historical default) or fallback.
+            self._add_recording()
+
+    def _open_startup_prefs(self):
+        """Modal to choose what Chirp loads on startup."""
+        from chirp.config import startup as _startup
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Startup Configuration')
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel('When Chirp starts, load:'))
+
+        rb_empty = QRadioButton('Empty configuration (one fresh recording)')
+        rb_last  = QRadioButton('Last used configuration')
+        rb_file  = QRadioButton('A specific configuration file:')
+        grp = QButtonGroup(dlg)
+        for rb in (rb_empty, rb_last, rb_file):
+            grp.addButton(rb)
+            v.addWidget(rb)
+
+        file_row = QHBoxLayout()
+        file_edit = QLineEdit(_startup.get_startup_file())
+        file_btn  = QPushButton('Browse…')
+        file_row.addWidget(file_edit, 1)
+        file_row.addWidget(file_btn)
+        v.addLayout(file_row)
+
+        last = _startup.get_last_config()
+        lbl_last = QLabel(f'Last used: {last or "(none yet)"}')
+        lbl_last.setStyleSheet(f'color: {C["subtext"]};')
+        v.addWidget(lbl_last)
+
+        {_startup.MODE_EMPTY: rb_empty,
+         _startup.MODE_LAST:  rb_last,
+         _startup.MODE_FILE:  rb_file}[_startup.get_startup_mode()].setChecked(True)
+
+        def _sync_enabled():
+            on = rb_file.isChecked()
+            file_edit.setEnabled(on)
+            file_btn.setEnabled(on)
+        for rb in (rb_empty, rb_last, rb_file):
+            rb.toggled.connect(_sync_enabled)
+        _sync_enabled()
+
+        def _browse():
+            p, _ = QFileDialog.getOpenFileName(
+                dlg, 'Choose Startup Configuration', file_edit.text(),
+                'Chirp Settings (*.json *.chirp);;All Files (*)')
+            if p:
+                file_edit.setText(p)
+        file_btn.clicked.connect(_browse)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        if rb_file.isChecked():
+            mode = _startup.MODE_FILE
+        elif rb_last.isChecked():
+            mode = _startup.MODE_LAST
+        else:
+            mode = _startup.MODE_EMPTY
+        _startup.set_startup_mode(mode)
+        _startup.set_startup_file(file_edit.text().strip())
+
     def _load_settings(self):
         path, _ = QFileDialog.getOpenFileName(
             self, 'Load Settings', '', 'Chirp Settings (*.json *.chirp);;All Files (*)')
         if not path:
             return
+        self._load_settings_from_path(path)
+
+    def _load_settings_from_path(self, path: str, *, silent: bool = False) -> bool:
+        """Read + apply a settings file at ``path``. Returns True on a
+        successful load, False if the file could not be read/parsed or
+        the schema rejected it.
+
+        Split out from ``_load_settings`` so the startup path (see
+        ``_apply_startup_config``) can reuse the exact same load/rebuild
+        logic. ``silent`` suppresses the hard-error modals (used at
+        startup, where a missing last/pinned config falls back to an
+        empty config rather than nagging with a dialog); the
+        load-with-warnings info modal is always shown."""
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
         except Exception as exc:
-            QMessageBox.warning(self, 'Load Error', f'Could not read file:\n{exc}')
-            return
+            if not silent:
+                QMessageBox.warning(self, 'Load Error', f'Could not read file:\n{exc}')
+            else:
+                print(f'[Chirp] could not read startup config {path!r}: {exc}')
+            return False
 
         # #55: route through ``load_settings_dict`` so version /
         # migration / unknown-key warnings actually run on real loads.
@@ -2249,10 +2368,13 @@ class ChirpWindow(QMainWindow):
             # error. Leave the existing UI state intact — bailing here
             # is safer than half-loading a config that the schema
             # already rejected.
-            QMessageBox.warning(
-                self, 'Load Error',
-                f'Could not load settings:\n{exc}')
-            return
+            if not silent:
+                QMessageBox.warning(
+                    self, 'Load Error',
+                    f'Could not load settings:\n{exc}')
+            else:
+                print(f'[Chirp] startup config {path!r} rejected: {exc}')
+            return False
 
         # Stop timer while rebuilding
         self._timer.stop()
@@ -2328,6 +2450,7 @@ class ChirpWindow(QMainWindow):
             self._rebuild_view()
 
         self._current_config_path = path
+        self._remember_last_config(path)
         self._mark_clean()  # #11 / c22
         self._timer.start()
 
@@ -2344,6 +2467,7 @@ class ChirpWindow(QMainWindow):
             QMessageBox.information(
                 self, 'Settings Loaded with Warnings',
                 f'Settings loaded with {len(warnings)} warning(s):\n\n{body}')
+        return True
 
     def _refresh_transport_ui(self):
         e = self._sel

@@ -351,13 +351,21 @@ class RecordingEntity:
 
         #51: ``dph_folder_prefix`` is user-editable — sanitize it so a
         prefix of ``../../escape`` can't walk outside ``output_dir``.
+
+        The day-subfolder is ``<prefix>_<days>`` — the prefix and the
+        day number are always joined by a single underscore separator
+        (added here, not typed by the user). ``_sanitize_token`` already
+        trims any trailing underscore, so a prefix of ``day`` or ``day_``
+        both yield ``day_0``, ``day_1``, …; an empty prefix yields the
+        bare day number (``0``, ``1``, …).
         """
         out_dir = self.output_dir
         if self.ref_date is not None:
             from chirp.recording.writer import _sanitize_token
             days = (datetime.date.today() - self.ref_date).days
             prefix_s = _sanitize_token(self.dph_folder_prefix)
-            out_dir = os.path.join(out_dir, f'{prefix_s}{days}')
+            sub = f'{prefix_s}_{days}' if prefix_s else f'{days}'
+            out_dir = os.path.join(out_dir, sub)
         return out_dir
 
     def _flush_active_events(self, reason: str = '') -> int:

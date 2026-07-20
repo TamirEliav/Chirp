@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Chirp v3.5.1 — User Manual</title>
+<title>Chirp v3.6.0 — User Manual</title>
 <style>
   :root {
     --base: #1e1e2e;
@@ -304,7 +304,7 @@
 <nav class="sidebar">
   <div class="logo">
     <h1>Chirp</h1>
-    <span>User Manual &mdash; v3.5.1</span>
+    <span>User Manual &mdash; v3.6.0</span>
   </div>
   <ul>
     <li><a href="#overview">Overview</a></li>
@@ -365,7 +365,7 @@
 <header class="hero">
   <h1>Chirp</h1>
   <p class="subtitle">Real-Time Audio Monitoring, Visualization &amp; Triggered Recording</p>
-  <span class="version">v3.5.1</span>
+  <span class="version">v3.6.0</span>
 </header>
 
 <!-- ── 1. Overview ── -->
@@ -495,6 +495,7 @@ python chirp.py</code></pre>
       <tr><td>Reset Params</td><td>Restore all parameters to defaults</td></tr>
       <tr><td>Save / Save As</td><td>Save current configuration to JSON</td></tr>
       <tr><td>Load</td><td>Load a previously saved configuration</td></tr>
+      <tr><td>Startup</td><td>Choose what configuration Chirp loads on launch (empty / last used / a specific file)</td></tr>
       <tr><td>View Mode</td><td>Switch to multi-stream grid view</td></tr>
     </tbody>
   </table>
@@ -987,6 +988,22 @@ python chirp.py</code></pre>
     <li>Channel and trigger mode selections</li>
     <li>Output folder, prefix, suffix, and reference date</li>
   </ul>
+  <h3 id="startup-config">Startup Configuration</h3>
+  <p>
+    The <strong>Startup</strong> button chooses what Chirp loads each time it launches:
+  </p>
+  <ul>
+    <li><strong>Empty configuration</strong> &mdash; start with a single fresh recording (the default).</li>
+    <li><strong>Last used configuration</strong> &mdash; automatically reload whichever config file
+      you most recently saved or loaded.</li>
+    <li><strong>A specific configuration file</strong> &mdash; always load a fixed file you pick,
+      regardless of what you worked on last.</li>
+  </ul>
+  <p>
+    The choice is stored per-user (independent of any config file), so it persists across sessions.
+    If the chosen file is missing or fails to load, Chirp falls back to an empty configuration so
+    the app always comes up usable.
+  </p>
   <h3>Device Resolution</h3>
   <p>
     When loading a configuration, Chirp resolves audio devices by name. If an exact match is not
@@ -1018,8 +1035,11 @@ python chirp.py</code></pre>
   <p>
     The <strong>Reference Date</strong> field enables automatic subfolder naming based on the number
     of days elapsed since a reference event. For example, in bird vocalization studies, you can set
-    the hatch date. Recordings are then saved into subfolders named by the day count (e.g.,
-    <code>day_042/</code>), simplifying longitudinal data organization.
+    the hatch date. Recordings are then saved into subfolders named by the day count, simplifying
+    longitudinal data organization. The subfolder is <code>&lt;prefix&gt;_&lt;days&gt;</code> &mdash;
+    the <strong>Folder Prefix</strong> you set plus an automatically inserted underscore and the day
+    number (e.g. a prefix of <code>day</code> gives <code>day_0/</code>, <code>day_1/</code>, …). A
+    trailing underscore in the prefix is not doubled, and an empty prefix yields just the day number.
   </p>
 </section>
 
@@ -1323,7 +1343,7 @@ python chirp.py</code></pre>
 
 <!-- Footer -->
 <footer style="margin-top:3rem; padding-top:1.5rem; border-top:1px solid var(--surface0); text-align:center; color:var(--overlay0); font-size:0.82rem;">
-  <p>Chirp v3.5.1 &mdash; User Manual</p>
+  <p>Chirp v3.6.0 &mdash; User Manual</p>
   <p>Designed for bioacoustics research. Built with Python, PyQt5, and pyqtgraph.</p>
 </footer>
 

@@ -7,11 +7,12 @@ Three pre-fix failure modes:
      landed a WAV outside ``output_dir``; a prefix of ``CON`` opened
      the Windows console device instead of a file.
 
-  2. ``filename_stream`` was plumbed through but dropped on the
-     filename side. Two streams that triggered on the same physical
-     event produced identical ms-precision timestamps, so
-     ``scipy.io.wavfile.write`` silently overwrote the first with the
-     second.
+  2. Two streams that triggered on the same physical event produced
+     identical ms-precision timestamps, so ``scipy.io.wavfile.write``
+     silently overwrote the first with the second. The filename no
+     longer embeds the stream name (only the user's prefix/suffix
+     decorate it), so this collision is now resolved by
+     ``_dedup_target``'s ``_rNN`` token instead.
 
   3. ``_on_folder_changed`` / ``_on_browse`` didn't validate the
      folder. The first sanity check was inside the writer worker —
@@ -23,10 +24,10 @@ Covered here:
 
   - Sanitizer hardening: path separators, ``..``, Windows reserved
     names, Unicode, length cap.
-  - ``write_wav_sync`` sanitizes prefix + suffix + filename_stream and
-    refuses to write outside ``output_dir``.
+  - ``write_wav_sync`` sanitizes prefix + suffix and refuses to write
+    outside ``output_dir``.
   - Two simultaneous events with the same prefix + timestamp produce
-    DIFFERENT filenames thanks to ``filename_stream``.
+    DIFFERENT filenames thanks to ``_dedup_target``'s ``_rNN`` token.
   - ``dph_folder_prefix`` is sanitized in
     ``RecordingEntity._effective_output_dir``.
   - ``ChirpWindow._probe_output_dir`` returns the right ``(ok, reason)``
@@ -114,12 +115,14 @@ def test_write_wav_sync_rejects_blank_output_dir():
                        onset_time=datetime.datetime(2024, 1, 1))
 
 
-# ── filename_stream disambiguates collisions ─────────────────────────
+# ── same-ms collisions are de-duplicated ─────────────────────────────
 
 def test_two_streams_same_ms_do_not_collide(tmp_path):
     """Two events with IDENTICAL timestamp + prefix + suffix must
-    produce DIFFERENT filenames when ``filename_stream`` differs —
-    this was the data-loss bug."""
+    produce DIFFERENT filenames — this was the data-loss bug. The
+    filename no longer embeds the stream name, so the second write is
+    disambiguated by ``_dedup_target`` (``_rNN`` before the extension)
+    rather than by a stream token."""
     onset = datetime.datetime(2024, 1, 2, 3, 4, 5, 678000)
     audio = np.zeros(512, dtype=np.float32)
     p1 = write_wav_sync([audio], str(tmp_path),
@@ -131,8 +134,11 @@ def test_two_streams_same_ms_do_not_collide(tmp_path):
                         sample_rate=44100, onset_time=onset,
                         filename_stream='mic-B')
     assert os.path.basename(p1) != os.path.basename(p2)
-    assert 'mic-A' in os.path.basename(p1)
-    assert 'mic-B' in os.path.basename(p2)
+    # Neither stream name leaks into the filenames.
+    assert 'mic' not in os.path.basename(p1)
+    assert 'mic' not in os.path.basename(p2)
+    # The second file carries the dedup token.
+    assert '_r' in os.path.basename(p2)
 
 
 def test_reserved_windows_prefix_is_rewritten(tmp_path):
@@ -178,6 +184,26 @@ def test_dph_folder_prefix_is_sanitized():
     real_eff = os.path.realpath(out)
     assert os.path.commonpath([real_out, real_eff]) == real_out, (
         f'_effective_output_dir escaped: {out!r}')
+
+
+def test_dph_folder_prefix_underscore_separator():
+    """The day-subfolder joins the prefix and the day number with a
+    single underscore. A prefix of ``day`` OR ``day_`` both produce
+    ``day_<N>`` (the trailing underscore the user typed is not doubled),
+    and an empty prefix produces the bare day number."""
+    from chirp.recording.entity import RecordingEntity
+    e = RecordingEntity(name='t', device_id=None)
+    e.output_dir = '/safe/output'
+    e.ref_date = datetime.date.today() - datetime.timedelta(days=3)
+
+    e.dph_folder_prefix = 'day'
+    assert os.path.basename(e._effective_output_dir()) == 'day_3'
+
+    e.dph_folder_prefix = 'day_'
+    assert os.path.basename(e._effective_output_dir()) == 'day_3'
+
+    e.dph_folder_prefix = ''
+    assert os.path.basename(e._effective_output_dir()) == '3'
 
 
 # ── Output-folder validation (#50) ───────────────────────────────────

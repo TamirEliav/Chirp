@@ -40,7 +40,8 @@ def test_stream_basic_mono(tmp_path):
     assert os.path.exists(path)
     assert not os.path.exists(path + '.tmp')
     assert 'bird_' in os.path.basename(path)
-    assert 'Channel_1' in os.path.basename(path)
+    # The stream name is deliberately NOT part of the filename.
+    assert 'Channel' not in os.path.basename(path)
     sr, data = scipy.io.wavfile.read(path)
     assert sr == 44100
     assert data.dtype == np.int16
