@@ -11,10 +11,14 @@ from chirp.config.schema import (
     build_settings_dict,
     load_settings_dict,
     CONFIG_SCHEMA_VERSION,
+    DEFAULT_VIEW_MODE,
+    DEFAULT_MONITOR,
 )
 
 __all__ = [
     "build_settings_dict",
     "load_settings_dict",
     "CONFIG_SCHEMA_VERSION",
+    "DEFAULT_VIEW_MODE",
+    "DEFAULT_MONITOR",
 ]

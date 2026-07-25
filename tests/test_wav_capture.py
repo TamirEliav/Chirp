@@ -256,7 +256,7 @@ def test_config_persists_wav_sim_fields(tmp_path):
         data = build_settings_dict([e])
         encoded = json.dumps(data)
         decoded = json.loads(encoded)
-        entities, _, warnings = load_settings_dict(decoded)
+        entities, _, _, warnings = load_settings_dict(decoded)
         assert len(entities) == 1
         r = entities[0]
         try:
@@ -276,7 +276,7 @@ def test_config_persists_wav_sim_fields(tmp_path):
 def test_legacy_config_defaults_to_device_source():
     """Configs without the new keys should load as live-device sources."""
     raw = {"version": 1, "recordings": [{"name": "legacy"}]}
-    entities, _, _ = load_settings_dict(raw)
+    entities, _, _, _ = load_settings_dict(raw)
     try:
         assert len(entities) == 1
         assert entities[0].input_source == 'device'

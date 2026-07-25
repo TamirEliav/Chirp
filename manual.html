@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Chirp v3.6.0 — User Manual</title>
+<title>Chirp v3.6.1 — User Manual</title>
 <style>
   :root {
     --base: #1e1e2e;
@@ -304,7 +304,7 @@
 <nav class="sidebar">
   <div class="logo">
     <h1>Chirp</h1>
-    <span>User Manual &mdash; v3.6.0</span>
+    <span>User Manual &mdash; v3.6.1</span>
   </div>
   <ul>
     <li><a href="#overview">Overview</a></li>
@@ -365,7 +365,7 @@
 <header class="hero">
   <h1>Chirp</h1>
   <p class="subtitle">Real-Time Audio Monitoring, Visualization &amp; Triggered Recording</p>
-  <span class="version">v3.6.0</span>
+  <span class="version">v3.6.1</span>
 </header>
 
 <!-- ── 1. Overview ── -->
@@ -454,6 +454,12 @@ python chirp.py</code></pre>
     <li><strong>Transient drop flash</strong> &mdash; a short per-tick indicator that blinks when a
       drop occurs in the current UI tick, alongside the sticky <span style="color:var(--red); font-weight:bold">D</span> badge.</li>
     <li><strong>Mini amplitude preview</strong> &mdash; a small real-time level meter</li>
+    <li><strong>Recognition color</strong> &mdash; each stream carries a color shown as a bar along
+      the item's <em>left edge</em>, so you can tell at a glance which bird/cage/stream a row belongs
+      to. The same color frames the stream's config panel and its View-mode tile. New streams are
+      auto-assigned a distinct color; change it from the Config view (see the
+      <a href="#transport-bar">Color picker</a> in the Status area). The color is persisted in the
+      config file.</li>
     <li><strong>Reorder buttons</strong> &mdash; move streams up or down in the list</li>
     <li><strong>Delete button</strong> &mdash; remove a stream</li>
     <li><strong>On/Off switch</strong> &mdash; per-stream enable. A disabled stream (greyed-out,
@@ -504,6 +510,13 @@ python chirp.py</code></pre>
     <span style="color:var(--green)">ACQ</span>,
     <span style="color:var(--green)">REC</span>, and
     <span style="color:var(--red)">TRIG</span>.
+  </p>
+  <p>
+    The Status area also holds a <strong>Color</strong> swatch button &mdash; click it to choose the
+    <a href="#sidebar-panel">recognition color</a> for the selected stream. The chosen color frames
+    the config plot panel (a colored rectangle around the spectrogram / amplitude / events plots),
+    outlines the stream's View-mode tile, and tints its sidebar left edge, making a specific
+    bird/cage/stream easy to pick out.
   </p>
 
   <h3 id="trigger-panel">Trigger Panel (Bottom Left)</h3>
@@ -944,8 +957,13 @@ python chirp.py</code></pre>
     <li>All active streams are displayed simultaneously in a configurable grid. Use the
         <strong>Columns</strong> control in the view toolbar to set the number of columns (e.g. 2
         columns &times; 4 rows for 8 streams).</li>
+    <li><strong>Order</strong>: choose how tiles fill the grid. <em>Column</em> (default) fills down
+        the first column before the next, so 8 streams in 2 columns land as streams 1&ndash;4 in the
+        left column and 5&ndash;8 in the right; <em>Row</em> fills across the top row first. The
+        setting is saved with the configuration.</li>
     <li>Each cell shows a compact spectrogram or waveform, amplitude plot, threshold line,
-        detect / record events strip, and status text.</li>
+        detect / record events strip, and status text, framed by a rectangle in the stream's
+        <a href="#sidebar-panel">recognition color</a>.</li>
     <li>The sidebar and configuration panels are hidden to maximize display area.</li>
     <li><strong>Per-tile header</strong>: each tile shows the stream name,
       <strong>acq / rec / trig status dots</strong> (blue / green / red — same vocabulary as the
@@ -987,6 +1005,11 @@ python chirp.py</code></pre>
     <li>Display options (FFT size, window, frequency scale, view mode, gain, dB range)</li>
     <li>Channel and trigger mode selections</li>
     <li>Output folder, prefix, suffix, and reference date</li>
+    <li>Per-stream <strong>recognition color</strong></li>
+    <li><strong>View-mode grid settings</strong> &mdash; number of columns, tile height, fill order
+      (column / row), "Active only" filter, and OpenGL rendering</li>
+    <li><strong>Audio-monitor settings</strong> &mdash; output device (by name), gain, mute state,
+      Follow toggle, and which stream is routed to the monitor</li>
   </ul>
   <h3 id="startup-config">Startup Configuration</h3>
   <p>
@@ -1030,6 +1053,12 @@ python chirp.py</code></pre>
     routes that stream to the speakers. A <strong>Gain</strong> slider (0&ndash;200%, default
     100% = unity) scales the loopback playback volume &mdash; recordings are never affected;
     output boosted past full scale is clipped, not wrapped.
+  </p>
+  <p>
+    All of the monitor bar's state &mdash; output device (saved by name and re-resolved on load),
+    gain, mute, Follow, and the selected source stream &mdash; is saved in the configuration file
+    and restored when it is loaded. A configuration saved while muted restores its routing silently
+    (the output stays closed until you un-mute).
   </p>
   <h3>Reference Date &amp; Subfolder Naming</h3>
   <p>
@@ -1343,7 +1372,7 @@ python chirp.py</code></pre>
 
 <!-- Footer -->
 <footer style="margin-top:3rem; padding-top:1.5rem; border-top:1px solid var(--surface0); text-align:center; color:var(--overlay0); font-size:0.82rem;">
-  <p>Chirp v3.6.0 &mdash; User Manual</p>
+  <p>Chirp v3.6.1 &mdash; User Manual</p>
   <p>Designed for bioacoustics research. Built with Python, PyQt5, and pyqtgraph.</p>
 </footer>
 

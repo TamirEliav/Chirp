@@ -99,16 +99,24 @@ class RecordingSidebarItem(QWidget):
         self._index = index
         self._selected = False
         self._editing = False
+        self._color: str | None = None  # recognition color (hex) or None
         self._last_status = None  # cached (acq, rec, trig) to avoid redundant setStyleSheet
 
         self.setFixedHeight(82)
         self.setCursor(Qt.PointingHandCursor)
+        # Honor the type-scoped background/border stylesheet in
+        # ``_apply_item_style`` (a plain QWidget subclass otherwise
+        # ignores stylesheet background/border unless the rule is set
+        # unscoped, which would leak the border into child badges).
+        self.setAttribute(Qt.WA_StyledBackground, True)
 
         vbox = QVBoxLayout(self)
         vbox.setContentsMargins(6, 4, 6, 4)
         vbox.setSpacing(2)
 
-        # Row 1: name + status dots
+        # Row 1: name + status dots. The recognition color shows only on
+        # the item's left edge (see _apply_item_style); the color is
+        # picked from the Config view, not here.
         row1 = QHBoxLayout()
         row1.setSpacing(6)
         self._name_label = QLabel(name)
@@ -213,6 +221,7 @@ class RecordingSidebarItem(QWidget):
         row3.addWidget(self._btn_enable)
         vbox.addLayout(row3)
         self._apply_enabled_style()
+        self.set_color(None)  # neutral swatch until a color is assigned
 
     @property
     def index(self):
@@ -224,16 +233,36 @@ class RecordingSidebarItem(QWidget):
 
     def set_selected(self, sel: bool):
         self._selected = sel
-        if sel:
+        self._apply_item_style()
+        self._refresh_name_style()
+
+    def _apply_item_style(self):
+        """Paint the item frame — a left accent bar in the stream's
+        recognition color (both selected and not), plus a blue selection
+        ring when selected.
+
+        The rules are scoped to ``RecordingSidebarItem`` (the item widget
+        itself). An unscoped ``border`` stylesheet cascades into the
+        child badge labels, painting a stray colored border around each —
+        the type selector confines it to the frame only.
+        """
+        accent = self._color or C['surface1']
+        if self._selected:
             self.setStyleSheet(
-                f'background: {C["surface0"]}; '
+                f'RecordingSidebarItem {{ background: {C["surface0"]}; '
                 f'border: 2px solid {C["blue"]}; border-radius: 6px; '
-                f'border-left: 4px solid {C["blue"]};')
+                f'border-left: 5px solid {accent}; }}')
         else:
             self.setStyleSheet(
-                f'background: {C["mantle"]}; '
-                f'border: 1px solid {C["surface1"]}; border-radius: 6px;')
-        self._refresh_name_style()
+                f'RecordingSidebarItem {{ background: {C["mantle"]}; '
+                f'border: 1px solid {C["surface1"]}; border-radius: 6px; '
+                f'border-left: 5px solid {accent}; }}')
+
+    def set_color(self, color: str | None):
+        """Set the recognition color (hex) for this stream. Shown only as
+        the item's left-edge accent bar. ``None`` falls back to neutral."""
+        self._color = color or None
+        self._apply_item_style()
 
     def set_name(self, name: str):
         self._name_label.setText(name)
@@ -567,6 +596,11 @@ class RecordingSidebar(QWidget):
         """Reflect the per-stream enable switch on one item."""
         if 0 <= idx < len(self._items):
             self._items[idx].set_stream_enabled(enabled)
+
+    def set_item_color(self, idx: int, color: str | None):
+        """Reflect the per-stream recognition color on one item."""
+        if 0 <= idx < len(self._items):
+            self._items[idx].set_color(color)
 
     def clear_all(self):
         for item in self._items:

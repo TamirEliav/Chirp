@@ -103,6 +103,11 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
             except Exception:
                 pass
         self.setBackground(C['base'])
+        # Recognition color — drawn as a rectangle around the whole panel
+        # (spectrogram + amplitude + events) via the QGraphicsView frame.
+        self.setObjectName('config_plot_panel')
+        self._color: str | None = None
+        self._apply_color()
         # Layout signature — rebuild only when it actually changes.
         self._sig = None
         self._amp_scale = 'log'
@@ -149,6 +154,22 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
             return float(vb.viewRange()[1][1])
         except Exception:
             return None
+
+    def set_color(self, color: str | None) -> None:
+        """Set the recognition color drawn as a rectangle around the
+        panel. ``None`` falls back to a neutral frame."""
+        color = color or None
+        if color == self._color:
+            return
+        self._color = color
+        self._apply_color()
+
+    def _apply_color(self) -> None:
+        col = self._color or C['surface1']
+        # objectName selector so the border styles the view frame only.
+        self.setStyleSheet(
+            f'QGraphicsView#config_plot_panel {{ border: 3px solid {col}; '
+            f'border-radius: 4px; }}')
 
     def rebuild_if_needed(self, e) -> None:
         sig = self._signature(e)

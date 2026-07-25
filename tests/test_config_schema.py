@@ -35,10 +35,10 @@ def test_use_opengl_roundtrip_and_default():
     data = build_settings_dict([], view_mode={"columns": 1, "panel_height": 300,
                                               "use_opengl": False})
     assert data["view_mode"]["use_opengl"] is False
-    _, vm, _ = load_settings_dict(json.loads(json.dumps(data)))
+    _, vm, _, _ = load_settings_dict(json.loads(json.dumps(data)))
     assert vm["use_opengl"] is False
     # Legacy file without the key loads with the default (True).
-    _, vm2, _ = load_settings_dict({"version": 1, "recordings": [],
+    _, vm2, _, _ = load_settings_dict({"version": 1, "recordings": [],
                                     "view_mode": {"columns": 2, "panel_height": 200}})
     assert vm2["use_opengl"] is True
 
@@ -49,17 +49,18 @@ def test_empty_config_roundtrip():
     # use_opengl (Phase 4) / active_only (v3.3.0) default True when the
     # caller doesn't set them.
     assert data["view_mode"] == {"columns": 3, "panel_height": 250,
-                                 "use_opengl": True, "active_only": True}
+                                 "use_opengl": True, "active_only": True,
+                                 "fill_order": "column"}
     assert data["recordings"] == []
 
     # JSON round-trip should be lossless
     encoded = json.dumps(data)
     decoded = json.loads(encoded)
 
-    entities, vm, warnings = load_settings_dict(decoded)
+    entities, vm, _, warnings = load_settings_dict(decoded)
     assert entities == []
     assert vm == {"columns": 3, "panel_height": 250, "use_opengl": True,
-                  "active_only": True}
+                  "active_only": True, "fill_order": "column"}
     assert warnings == []
 
 
@@ -71,7 +72,7 @@ def test_view_mode_defaults_applied_on_missing_key():
 def test_view_mode_missing_block_on_load():
     """A file missing the view_mode block should get defaults."""
     raw = {"version": 1, "recordings": []}
-    entities, vm, warnings = load_settings_dict(raw)
+    entities, vm, _, warnings = load_settings_dict(raw)
     assert entities == []
     assert vm == DEFAULT_VIEW_MODE
 
@@ -109,7 +110,7 @@ def test_single_entity_roundtrip_preserves_scalar_params():
     encoded = json.dumps(data)
     decoded = json.loads(encoded)
 
-    entities, vm, warnings = load_settings_dict(decoded)
+    entities, vm, _, warnings = load_settings_dict(decoded)
     assert len(entities) == 1
     r = entities[0]
 
@@ -143,7 +144,7 @@ def test_single_entity_roundtrip_preserves_scalar_params():
 def test_unknown_top_level_key_warns():
     raw = {"version": 1, "recordings": [], "view_mode": {},
            "totally_made_up_key": 42}
-    entities, vm, warnings = load_settings_dict(raw)
+    entities, vm, _, warnings = load_settings_dict(raw)
     assert entities == []
     assert any("totally_made_up_key" in w for w in warnings)
 
@@ -151,7 +152,7 @@ def test_unknown_top_level_key_warns():
 def test_unknown_view_mode_key_warns():
     raw = {"version": 1, "recordings": [],
            "view_mode": {"columns": 2, "panel_height": 100, "weird": "?"}}
-    _, vm, warnings = load_settings_dict(raw)
+    _, vm, _, warnings = load_settings_dict(raw)
     assert vm["columns"] == 2
     assert any("weird" in w for w in warnings)
 
@@ -161,14 +162,14 @@ def test_unknown_recording_key_warns():
         "version": 1,
         "recordings": [{"name": "X", "future_field": 9001}],
     }
-    entities, _, warnings = load_settings_dict(raw)
+    entities, _, _, warnings = load_settings_dict(raw)
     assert len(entities) == 1
     assert any("future_field" in w for w in warnings)
 
 
 def test_missing_version_treated_as_v1_with_warning():
     raw = {"recordings": []}
-    _, _, warnings = load_settings_dict(raw)
+    _, _, _, warnings = load_settings_dict(raw)
     assert any("version" in w for w in warnings)
 
 
@@ -185,7 +186,7 @@ def test_multiple_entities_preserve_order():
 
     data = build_settings_dict([e1, e2, e3])
     decoded = json.loads(json.dumps(data))
-    entities, _, _ = load_settings_dict(decoded)
+    entities, _, _, _ = load_settings_dict(decoded)
 
     assert [r.name for r in entities] == ["First", "Second", "Third"]
 
@@ -213,3 +214,78 @@ def test_stream_enabled_roundtrip_and_default():
             e3.close()
     finally:
         e.close()
+
+
+def test_color_roundtrip_and_default():
+    """Per-stream recognition color: defaults empty, serializes, and
+    survives a to_dict/from_dict round-trip."""
+    e = RecordingEntity(name='c', device_id=None)
+    try:
+        assert e.color == ''
+        e.color = '#ff8800'
+        d = e.to_dict()
+        assert d['color'] == '#ff8800'
+        e2, _warn = RecordingEntity.from_dict(d)
+        try:
+            assert e2.color == '#ff8800'
+        finally:
+            e2.close()
+        # Legacy dict without the key → default empty (window assigns).
+        d.pop('color')
+        e3, _warn = RecordingEntity.from_dict(d)
+        try:
+            assert e3.color == ''
+        finally:
+            e3.close()
+    finally:
+        e.close()
+
+
+def test_fill_order_roundtrip_and_default():
+    """view_mode.fill_order defaults to 'column', normalizes junk, and
+    round-trips a 'row' choice."""
+    # Default when the caller omits it.
+    data = build_settings_dict([])
+    assert data["view_mode"]["fill_order"] == "column"
+    # Explicit 'row' survives.
+    data = build_settings_dict([], view_mode={"fill_order": "row"})
+    _, vm, _, _ = load_settings_dict(json.loads(json.dumps(data)))
+    assert vm["fill_order"] == "row"
+    # Junk / legacy-missing → 'column'.
+    _, vm2, _, _ = load_settings_dict(
+        {"version": 1, "recordings": [], "view_mode": {"fill_order": "bogus"}})
+    assert vm2["fill_order"] == "column"
+    _, vm3, _, _ = load_settings_dict({"version": 1, "recordings": []})
+    assert vm3["fill_order"] == "column"
+
+
+def test_monitor_roundtrip_and_default():
+    """The monitor section serializes and round-trips; older files
+    without it get the defaults."""
+    mon = {
+        "output_device_name": "Speakers (Realtek)",
+        "output_device_hostapi": "Windows WASAPI",
+        "gain_percent": 150,
+        "muted": True,
+        "follow": True,
+        "source_index": 2,
+    }
+    data = build_settings_dict([], monitor=mon)
+    assert data["monitor"] == mon
+    _, _, got, _ = load_settings_dict(json.loads(json.dumps(data)))
+    assert got == mon
+    # Legacy file with no monitor block → defaults.
+    _, _, default_mon, warnings = load_settings_dict(
+        {"version": 1, "recordings": []})
+    assert default_mon["gain_percent"] == 100
+    assert default_mon["muted"] is False
+    assert default_mon["source_index"] == -1
+    assert not any("monitor" in w for w in warnings)
+
+
+def test_unknown_monitor_key_warns():
+    raw = {"version": 1, "recordings": [],
+           "monitor": {"gain_percent": 80, "bogus_key": 1}}
+    _, _, mon, warnings = load_settings_dict(raw)
+    assert mon["gain_percent"] == 80
+    assert any("bogus_key" in w for w in warnings)

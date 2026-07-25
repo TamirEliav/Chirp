@@ -34,3 +34,34 @@ def test_grid_constructs_and_empty_is_safe():
     grid.set_tile_height(180)
     grid.rebuild([], cols=3)
     assert grid._panels == []
+
+
+def test_grid_cell_column_major():
+    """Column-major: 8 tiles / 2 cols → 1–4 in col 0, 5–8 in col 1
+    (the layout the user asked for). Pure function, no widgets."""
+    from chirp.ui.central_plots import grid_cell
+    n, cols = 8, 2
+    pos = [grid_cell(i, n, cols, 'column') for i in range(n)]
+    # rows = ceil(8/2) = 4
+    assert pos == [(0, 0), (1, 0), (2, 0), (3, 0),
+                   (0, 1), (1, 1), (2, 1), (3, 1)]
+    # Column 0 holds tiles 0..3, column 1 holds 4..7.
+    assert [c for _, c in pos] == [0, 0, 0, 0, 1, 1, 1, 1]
+
+
+def test_grid_cell_row_major():
+    """Row-major (legacy): 8 tiles / 2 cols fill across the top row first."""
+    from chirp.ui.central_plots import grid_cell
+    n, cols = 8, 2
+    pos = [grid_cell(i, n, cols, 'row') for i in range(n)]
+    assert pos == [(0, 0), (0, 1), (1, 0), (1, 1),
+                   (2, 0), (2, 1), (3, 0), (3, 1)]
+
+
+def test_grid_cell_uneven_column_major():
+    """Uneven fill: 5 tiles / 2 cols → col 0 gets 3 (ceil), col 1 gets 2."""
+    from chirp.ui.central_plots import grid_cell
+    n, cols = 5, 2
+    pos = [grid_cell(i, n, cols, 'column') for i in range(n)]
+    # rows = ceil(5/2) = 3
+    assert pos == [(0, 0), (1, 0), (2, 0), (0, 1), (1, 1)]

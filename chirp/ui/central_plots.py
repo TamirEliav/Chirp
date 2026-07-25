@@ -27,6 +27,23 @@ from chirp.ui.pg_panel import StreamPlotPanel
 from chirp.ui.status_util import compose_error_state
 
 
+def grid_cell(i: int, n: int, cols: int, fill_order: str = 'column') -> tuple[int, int]:
+    """Return the ``(row, col)`` grid position for the ``i``-th tile.
+
+    ``fill_order='column'`` fills down the first column (tiles 0..rows-1)
+    before moving to the next column — so with 8 streams in 2 columns,
+    streams 1–4 land in column 0 and 5–8 in column 1. ``'row'`` fills
+    across the top row first (the legacy behavior). Pure function so the
+    layout math is unit-testable without building any Qt widgets.
+    """
+    c = max(1, int(cols))
+    n = max(1, int(n))
+    if str(fill_order).lower().startswith('col'):
+        rows = (n + c - 1) // c   # ceil
+        return i % rows, i // rows
+    return i // c, i % c
+
+
 class StreamTile(QWidget):
     """One view-mode tile: header (status + badges) above the plots.
 
@@ -41,17 +58,29 @@ class StreamTile(QWidget):
     clear_errors_requested = pyqtSignal(int)
 
     def __init__(self, entity_idx: int, name: str, *,
-                 use_opengl: bool = True, parent=None):
+                 use_opengl: bool = True, color: str | None = None,
+                 parent=None):
         super().__init__(parent)
         self.entity_idx = entity_idx
+        self._color = color or None
+        # The recognition color is drawn as a rectangle around the whole
+        # tile (see _apply_color). WA_StyledBackground + an objectName
+        # selector confine the border to the tile frame so it does not
+        # cascade into child widgets.
+        self.setObjectName('stream_tile')
+        self.setAttribute(Qt.WA_StyledBackground, True)
         v = QVBoxLayout(self)
-        v.setContentsMargins(0, 0, 0, 0)
+        # Inset the content so the colored frame is fully visible around it.
+        v.setContentsMargins(3, 3, 3, 3)
         v.setSpacing(0)
 
         # ── Header row ────────────────────────────────────────────────
         head = QWidget()
+        head.setObjectName('tile_header')
         head.setFixedHeight(24)
-        head.setStyleSheet(f'background-color: {C["mantle"]};')
+        head.setAttribute(Qt.WA_StyledBackground, True)
+        head.setStyleSheet(
+            f'QWidget#tile_header {{ background-color: {C["mantle"]}; }}')
         h = QHBoxLayout(head)
         h.setContentsMargins(8, 2, 8, 2)
         h.setSpacing(6)
@@ -106,10 +135,30 @@ class StreamTile(QWidget):
                                      show_waveform=False)
         v.addWidget(self.panel, stretch=1)
 
+        self._apply_color()
+
     # ── Header updates (change-detected) ─────────────────────────────
     def set_name(self, name: str) -> None:
         if self._lbl_name.text() != name:
             self._lbl_name.setText(name)
+
+    def set_color(self, color: str | None) -> None:
+        """Update the recognition color (the rectangle around the tile)."""
+        color = color or None
+        if color == self._color:
+            return
+        self._color = color
+        self._apply_color()
+
+    def _apply_color(self) -> None:
+        """Draw a colored rectangle around the whole tile in the stream
+        color. Falls back to a neutral surface color when unset. Scoped
+        by objectName so the border stays on the tile frame and does not
+        cascade into child widgets."""
+        col = self._color or C['surface1']
+        self.setStyleSheet(
+            f'QWidget#stream_tile {{ background-color: {C["base"]}; '
+            f'border: 3px solid {col}; border-radius: 4px; }}')
 
     def update_status(self, acq: bool, rec: bool, trig: bool) -> None:
         key = (acq, rec, trig)
@@ -204,12 +253,18 @@ class MultiStreamGrid(QWidget):
 
     def rebuild(self, entities, cols: int | None = None,
                 indices: list[int] | None = None,
+                fill_order: str = 'column',
                 empty_hint: str = 'No recordings') -> None:
         """(Re)create one tile per entity in a ``cols``-wide grid.
 
         ``indices[i]`` is the position of ``entities[i]`` in the
         window's full entity list (defaults to 0..n-1 when the grid
         shows everything).
+
+        ``fill_order`` controls how tiles map to grid cells:
+          * ``'column'`` — fill down the first column (streams 1..rows)
+            before moving to the next column.
+          * ``'row'`` — fill across the top row first (legacy behavior).
         """
         if cols:
             self._cols = max(1, int(cols))
@@ -231,7 +286,8 @@ class MultiStreamGrid(QWidget):
         self._hint.hide()
         c = max(1, min(self._cols, n))
         for i, (e, idx) in enumerate(zip(entities, indices)):
-            tile = StreamTile(idx, e.name, use_opengl=self._use_opengl)
+            tile = StreamTile(idx, e.name, use_opengl=self._use_opengl,
+                              color=getattr(e, 'color', '') or None)
             tile.panel.set_title('')
             tile.setMinimumHeight(self._tile_min_h)
             tile.clicked.connect(self.tile_clicked.emit)
@@ -239,7 +295,8 @@ class MultiStreamGrid(QWidget):
             tile.clear_drops_requested.connect(self.clear_drops_requested.emit)
             tile.clear_errors_requested.connect(
                 self.clear_errors_requested.emit)
-            self._grid.addWidget(tile, i // c, i % c)
+            r, col = grid_cell(i, n, c, fill_order)
+            self._grid.addWidget(tile, r, col)
             self._tiles.append(tile)
 
     def set_tile_height(self, h: int) -> None:
@@ -253,6 +310,7 @@ class MultiStreamGrid(QWidget):
         skipped)."""
         for tile, e in zip(self._tiles, entities):
             tile.set_name(e.name)
+            tile.set_color(getattr(e, 'color', '') or None)
             tile.update_status(e.acq_running, e.rec_enabled,
                                e.recorder.is_recording)
             tile.update_badges(e)

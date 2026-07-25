@@ -11,6 +11,17 @@ Schema shape (current — version 1):
         "view_mode": {
             "columns": int,
             "panel_height": int,
+            "use_opengl": bool,
+            "active_only": bool,
+            "fill_order": "row" | "column",
+        },
+        "monitor": {
+            "output_device_name": str,
+            "output_device_hostapi": str,
+            "gain_percent": int,
+            "muted": bool,
+            "follow": bool,
+            "source_index": int,
         },
         "recordings": [ RecordingEntity.to_dict(), ... ],
     }
@@ -34,13 +45,28 @@ CONFIG_SCHEMA_VERSION = 1
 # Added as an optional view_mode key; older files simply omit it and get
 # the default, so no schema version bump is needed.
 DEFAULT_VIEW_MODE = {"columns": 1, "panel_height": 300, "use_opengl": True,
-                     "active_only": True}
+                     "active_only": True, "fill_order": "column"}
+
+# Audio-monitor loopback settings (#7). Previously session-scoped and
+# not persisted; now saved so a config restores the monitor routing.
+# ``output_device_name`` / ``output_device_hostapi`` are resolved by name
+# on load (indices shift), matching how input devices are handled.
+# ``source_index`` is the position of the routed stream in ``recordings``
+# (-1 = Off); ``gain_percent`` is the 0–200 slider value.
+DEFAULT_MONITOR = {
+    "output_device_name": "",
+    "output_device_hostapi": "",
+    "gain_percent": 100,
+    "muted": False,
+    "follow": False,
+    "source_index": -1,
+}
 
 
 # Set of top-level keys recognized by the loader. Anything else triggers
 # a warning so users notice typos and forks notice schema drift.
 _KNOWN_TOP_KEYS: frozenset[str] = frozenset({
-    "version", "view_mode", "recordings",
+    "version", "view_mode", "recordings", "monitor",
 })
 
 # Set of keys recognized inside each recording's dict. Mirrors
@@ -68,11 +94,15 @@ _KNOWN_RECORDING_KEYS: frozenset[str] = frozenset({
     "stream_enabled",
     "analysis_nperseg", "analysis_window",
     "input_source", "wav_file_path", "wav_loop",
+    # v3.6.1 additions — per-stream recognition color.
+    "color",
 })
 
 _KNOWN_VIEW_MODE_KEYS: frozenset[str] = frozenset({
-    "columns", "panel_height", "use_opengl", "active_only",
+    "columns", "panel_height", "use_opengl", "active_only", "fill_order",
 })
+
+_KNOWN_MONITOR_KEYS: frozenset[str] = frozenset(DEFAULT_MONITOR.keys())
 
 
 # ── Migration chain ──────────────────────────────────────────────────────────
@@ -109,12 +139,21 @@ def _migrate(data: dict, warnings: list) -> dict:
 
 # ── Public API ───────────────────────────────────────────────────────────────
 
+def _normalize_fill_order(value) -> str:
+    """Coerce a fill-order value to 'row' or 'column' (default)."""
+    return "row" if str(value).lower().startswith("row") else "column"
+
+
 def build_settings_dict(entities: Iterable[RecordingEntity],
-                        view_mode: dict | None = None) -> dict:
-    """Serialize a collection of entities + view-mode to a plain dict."""
+                        view_mode: dict | None = None,
+                        monitor: dict | None = None) -> dict:
+    """Serialize a collection of entities + view-mode + monitor to a plain dict."""
     vm = dict(DEFAULT_VIEW_MODE)
     if view_mode:
         vm.update(view_mode)
+    mon = dict(DEFAULT_MONITOR)
+    if monitor:
+        mon.update(monitor)
     return {
         "version": CONFIG_SCHEMA_VERSION,
         "view_mode": {
@@ -122,13 +161,22 @@ def build_settings_dict(entities: Iterable[RecordingEntity],
             "panel_height": vm.get("panel_height", DEFAULT_VIEW_MODE["panel_height"]),
             "use_opengl":   bool(vm.get("use_opengl", DEFAULT_VIEW_MODE["use_opengl"])),
             "active_only":  bool(vm.get("active_only", DEFAULT_VIEW_MODE["active_only"])),
+            "fill_order":   _normalize_fill_order(vm.get("fill_order", DEFAULT_VIEW_MODE["fill_order"])),
+        },
+        "monitor": {
+            "output_device_name":    str(mon.get("output_device_name", "") or ""),
+            "output_device_hostapi": str(mon.get("output_device_hostapi", "") or ""),
+            "gain_percent":          int(mon.get("gain_percent", DEFAULT_MONITOR["gain_percent"])),
+            "muted":                 bool(mon.get("muted", DEFAULT_MONITOR["muted"])),
+            "follow":                bool(mon.get("follow", DEFAULT_MONITOR["follow"])),
+            "source_index":          int(mon.get("source_index", DEFAULT_MONITOR["source_index"])),
         },
         "recordings": [e.to_dict() for e in entities],
     }
 
 
-def load_settings_dict(data: dict) -> tuple[list[RecordingEntity], dict, list[str]]:
-    """Parse a settings dict into `(entities, view_mode, warnings)`.
+def load_settings_dict(data: dict) -> tuple[list[RecordingEntity], dict, dict, list[str]]:
+    """Parse a settings dict into `(entities, view_mode, monitor, warnings)`.
 
     Raises ValueError if `data` is malformed. Unknown keys at any
     level produce warnings instead of failures so a config file from
@@ -159,6 +207,24 @@ def load_settings_dict(data: dict) -> tuple[list[RecordingEntity], dict, list[st
         "panel_height": vm_raw.get("panel_height", DEFAULT_VIEW_MODE["panel_height"]),
         "use_opengl":   bool(vm_raw.get("use_opengl", DEFAULT_VIEW_MODE["use_opengl"])),
         "active_only":  bool(vm_raw.get("active_only", DEFAULT_VIEW_MODE["active_only"])),
+        "fill_order":   _normalize_fill_order(vm_raw.get("fill_order", DEFAULT_VIEW_MODE["fill_order"])),
+    }
+
+    mon_raw = data.get("monitor") or {}
+    if not isinstance(mon_raw, dict):
+        warnings.append("monitor is not a dict — using defaults")
+        mon_raw = {}
+    unknown_mon = sorted(set(mon_raw.keys()) - _KNOWN_MONITOR_KEYS)
+    if unknown_mon:
+        warnings.append(
+            f"Ignoring unknown monitor key(s): {', '.join(unknown_mon)}")
+    monitor = {
+        "output_device_name":    str(mon_raw.get("output_device_name", "") or ""),
+        "output_device_hostapi": str(mon_raw.get("output_device_hostapi", "") or ""),
+        "gain_percent":          int(mon_raw.get("gain_percent", DEFAULT_MONITOR["gain_percent"])),
+        "muted":                 bool(mon_raw.get("muted", DEFAULT_MONITOR["muted"])),
+        "follow":                bool(mon_raw.get("follow", DEFAULT_MONITOR["follow"])),
+        "source_index":          int(mon_raw.get("source_index", DEFAULT_MONITOR["source_index"])),
     }
 
     entities: list[RecordingEntity] = []
@@ -176,4 +242,4 @@ def load_settings_dict(data: dict) -> tuple[list[RecordingEntity], dict, list[st
         if warn:
             warnings.append(warn)
 
-    return entities, view_mode, warnings
+    return entities, view_mode, monitor, warnings

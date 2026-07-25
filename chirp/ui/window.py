@@ -29,7 +29,7 @@ from PyQt5.QtWidgets import (
     QFileDialog, QFrame, QSizePolicy, QDoubleSpinBox, QComboBox, QCheckBox,
     QScrollArea, QStackedLayout, QDialog, QCalendarWidget, QMessageBox, QSpinBox,
     QMenu, QAction, QActionGroup, QSlider,
-    QRadioButton, QButtonGroup, QDialogButtonBox,
+    QRadioButton, QButtonGroup, QDialogButtonBox, QColorDialog,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QSize, QDate, QPointF
 from PyQt5.QtGui import (
@@ -44,6 +44,7 @@ from chirp import __version__
 from chirp.constants import *  # noqa: F401,F403
 from chirp.audio import AudioCapture, AudioMonitor  # noqa: F401
 from chirp.audio.devices import list_output_devices, host_api_name
+from chirp.config import DEFAULT_VIEW_MODE, DEFAULT_MONITOR  # noqa: F401
 from chirp.dsp import (  # noqa: F401
     BandpassFilter,
     SpectrogramAccumulator,
@@ -78,6 +79,10 @@ class ChirpWindow(QMainWindow):
         self._view_mode = False
         self._vm_n_cols = 1
         self._vm_panel_height = 300
+        # Grid fill order: 'column' fills down the first column (streams
+        # 1..rows) before the next; 'row' fills across the top row first.
+        # Persisted in the view_mode config section.
+        self._vm_fill_order = DEFAULT_VIEW_MODE['fill_order']
         # Phase 4: view-mode grid is rendered by pyqtgraph/OpenGL. Built
         # lazily on first entry; swapped into the central scroll area in
         # place of the config panel. Set to use software rendering in
@@ -495,6 +500,25 @@ class ChirpWindow(QMainWindow):
 
         h.addSpacing(10)
 
+        lbl_o = QLabel('Order:')
+        lbl_o.setStyleSheet(f'color: {C["subtext"]}; font-size: 9pt;')
+        h.addWidget(lbl_o)
+        self._vm_order_combo = QComboBox()
+        self._vm_order_combo.setToolTip(
+            'Panel fill order in the View grid.\n'
+            'Column: fill down the first column (streams 1..N), then the '
+            'next column.\nRow: fill across the top row first.')
+        self._vm_order_combo.addItem('Column', userData='column')
+        self._vm_order_combo.addItem('Row', userData='row')
+        self._vm_order_combo.setCurrentIndex(
+            0 if self._vm_fill_order == 'column' else 1)
+        self._vm_order_combo.setFixedWidth(90)
+        self._vm_order_combo.currentIndexChanged.connect(
+            self._on_vm_fill_order_changed)
+        h.addWidget(self._vm_order_combo)
+
+        h.addSpacing(10)
+
         lbl_h = QLabel('Height:')
         lbl_h.setStyleSheet(f'color: {C["subtext"]}; font-size: 9pt;')
         h.addWidget(lbl_h)
@@ -846,6 +870,142 @@ class ChirpWindow(QMainWindow):
         self._monitor_status.setStyleSheet(
             f'color: {C["green"]}; font-size: 9pt; min-width: 40px; font-weight: bold;')
 
+    # \u2500\u2500 Monitor settings persistence \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+    def _build_monitor_settings(self) -> dict:
+        """Snapshot the audio-monitor UI state for the config file.
+
+        The output device is stored by NAME (indices shift between
+        sessions / machines); the source is stored as its position in
+        the recordings list (-1 = Off) since ``id(entity)`` tokens are
+        not stable across a reload.
+        """
+        out_dev = self._monitor_out_combo.currentData()
+        out_name, out_api = '', ''
+        if out_dev is not None:
+            try:
+                info = sd.query_devices(out_dev)
+                out_name = info.get('name', '') or ''
+                out_api = host_api_name(info)
+            except Exception:
+                pass
+        # Source index from the selected monitor token.
+        src_token = self._monitor_src_combo.currentData()
+        src_index = -1
+        if src_token not in (None, self._MON_OFF):
+            for i, e in enumerate(self._entities):
+                if id(e) == src_token:
+                    src_index = i
+                    break
+        return {
+            'output_device_name':    out_name,
+            'output_device_hostapi': out_api,
+            'gain_percent':          int(self._monitor_gain_slider.value()),
+            'muted':                 bool(self._monitor_muted),
+            'follow':                bool(self._chk_monitor_follow.isChecked()),
+            'source_index':          src_index,
+        }
+
+    def _resolve_output_device(self, name: str, hostapi: str):
+        """Return the output-device combo index whose device matches
+        ``name`` (preferring the same host API), or None if not found."""
+        if not name:
+            return None
+        combo = self._monitor_out_combo
+        fallback = None
+        for i in range(combo.count()):
+            dev_id = combo.itemData(i)
+            if dev_id is None:
+                continue
+            try:
+                info = sd.query_devices(dev_id)
+            except Exception:
+                continue
+            if info.get('name', '') == name:
+                if not hostapi or host_api_name(info) == hostapi:
+                    return i
+                if fallback is None:
+                    fallback = i
+        if fallback is not None:
+            return fallback
+        # Substring fallback (Windows truncation / API-suffix drift).
+        for i in range(combo.count()):
+            dev_id = combo.itemData(i)
+            if dev_id is None:
+                continue
+            try:
+                info = sd.query_devices(dev_id)
+            except Exception:
+                continue
+            if name in info.get('name', '') or info.get('name', '') in name:
+                return i
+        return None
+
+    def _apply_monitor_settings(self, monitor: dict) -> None:
+        """Restore persisted audio-monitor settings after a config load.
+
+        Order matters: gain + mute + follow first, then output device,
+        then source (so the source's apply opens the output at the right
+        SR). All combo writes block signals; the backend is driven
+        explicitly via ``_apply_monitor_source`` / ``set_output_device``.
+        """
+        # Follow toggle.
+        follow = bool(monitor.get('follow', False))
+        self._chk_monitor_follow.blockSignals(True)
+        self._chk_monitor_follow.setChecked(follow)
+        self._chk_monitor_follow.blockSignals(False)
+
+        # Gain.
+        gain = int(monitor.get('gain_percent', 100))
+        gain = max(0, min(200, gain))
+        self._monitor_gain_slider.blockSignals(True)
+        self._monitor_gain_slider.setValue(gain)
+        self._monitor_gain_slider.blockSignals(False)
+        self._monitor.set_gain(gain / 100.0)
+        self._monitor_gain_label.setText(f'{gain}%')
+
+        # Mute state \u2014 set the flag and the button without re-running the
+        # toggle handler (which would try to re-open the output before we
+        # have selected the device below).
+        muted = bool(monitor.get('muted', False))
+        self._monitor_muted = muted
+        self._btn_monitor_mute.blockSignals(True)
+        self._btn_monitor_mute.setChecked(not muted)
+        self._btn_monitor_mute.setText('\U0001F507' if muted else '\U0001F50A')
+        self._btn_monitor_mute.blockSignals(False)
+
+        # Output device (resolved by name).
+        out_idx = self._resolve_output_device(
+            monitor.get('output_device_name', ''),
+            monitor.get('output_device_hostapi', ''))
+        self._monitor_out_combo.blockSignals(True)
+        if out_idx is not None:
+            self._monitor_out_combo.setCurrentIndex(out_idx)
+        self._monitor_out_combo.blockSignals(False)
+
+        # Source (by list position). Point the combo at it, then apply.
+        src_index = int(monitor.get('source_index', -1))
+        self._monitor_src_combo.blockSignals(True)
+        pick = 0
+        if 0 <= src_index < len(self._entities):
+            token = id(self._entities[src_index])
+            for i in range(self._monitor_src_combo.count()):
+                if self._monitor_src_combo.itemData(i) == token:
+                    pick = i
+                    break
+        self._monitor_src_combo.setCurrentIndex(pick)
+        self._monitor_src_combo.blockSignals(False)
+
+        if muted:
+            # Keep selections but stay silent / output closed.
+            self._monitor.set_source(None)
+            self._monitor.set_output_device(None)
+            self._update_monitor_status()
+        else:
+            # Open the output on the chosen device, then route the source.
+            self._on_monitor_output_changed(0)
+            self._apply_monitor_source(self._monitor_src_combo.currentData())
+
     # ── Transport ─────────────────────────────────────────────────────────
 
     def _build_transport(self) -> QWidget:
@@ -984,6 +1144,28 @@ class ChirpWindow(QMainWindow):
         status_v.addWidget(self._lbl_rec_status)
         status_v.addWidget(self._lbl_trig_status)
         status_v.addWidget(self._lbl_entropy)
+
+        # Per-stream recognition color picker — a labeled swatch button.
+        # The chosen color frames this stream's config panel + view tile
+        # and tints its sidebar left edge.
+        color_row = QHBoxLayout()
+        color_row.setSpacing(6)
+        lbl_color = QLabel('Color')
+        lbl_color.setFont(mono)
+        lbl_color.setStyleSheet(f'color: {C["subtext"]};')
+        self._btn_stream_color = QPushButton()
+        self._btn_stream_color.setFixedSize(28, 20)
+        self._btn_stream_color.setCursor(Qt.PointingHandCursor)
+        self._btn_stream_color.setToolTip(
+            'Choose a recognition color for the selected stream — frames '
+            'its config panel and view-mode tile and tints its sidebar '
+            'left edge.')
+        self._btn_stream_color.clicked.connect(
+            lambda: self._on_change_stream_color(self._selected_idx))
+        color_row.addWidget(lbl_color)
+        color_row.addWidget(self._btn_stream_color)
+        color_row.addStretch()
+        status_v.addLayout(color_row)
         self._blink_counter = 0
         # #58: ``_update_plot`` exception bookkeeping. The Qt-timer
         # slot used to swallow exceptions silently — Qt logs the
@@ -1923,6 +2105,11 @@ class ChirpWindow(QMainWindow):
             self._config_panel.set_threshold(e.threshold)
             self._config_panel.set_spectral_threshold(e.spectral_threshold)
 
+        # Reflect this stream's recognition color on the config-mode
+        # swatch button + the config panel's frame.
+        if e is not None:
+            self._refresh_stream_color_ui(e)
+
     # ──────────────────────────────────────────────────────────────────────
     # Selection switching
     # ──────────────────────────────────────────────────────────────────────
@@ -1957,10 +2144,60 @@ class ChirpWindow(QMainWindow):
         e.set_monitor(self._monitor)
         self._entities.append(e)
         idx = self._sidebar.add_item(name)
+        self._sync_stream_colors()
         self._switch_selection(idx)
         self._refresh_monitor_source_combo()
         self._refresh_config_table()
         self._mark_dirty()
+
+    def _next_free_color(self) -> str:
+        """Pick the first palette color not already used by a stream,
+        falling back to a position-based color when all are taken."""
+        used = {e.color for e in self._entities if e.color}
+        for c in STREAM_COLORS:
+            if c not in used:
+                return c
+        return default_stream_color(len(self._entities))
+
+    def _sync_stream_colors(self) -> None:
+        """Assign a default color to any stream that lacks one, then push
+        every stream's color to its sidebar item."""
+        for i, e in enumerate(self._entities):
+            if not getattr(e, 'color', ''):
+                e.color = self._next_free_color()
+            self._sidebar.set_item_color(i, e.color)
+
+    def _on_change_stream_color(self, idx: int) -> None:
+        """Open a color picker for the idx-th stream and apply the pick."""
+        if not (0 <= idx < len(self._entities)):
+            return
+        e = self._entities[idx]
+        initial = QColor(e.color) if e.color else QColor(C['blue'])
+        col = QColorDialog.getColor(initial, self, 'Choose stream color')
+        if not col.isValid():
+            return
+        e.color = col.name()
+        self._sidebar.set_item_color(idx, e.color)
+        # Reflect on the config-mode swatch button + panel frame for the
+        # selected stream. View-mode tiles pull ``e.color`` on every tick
+        # (update_all), so the grid repaints its rectangle on its own.
+        if idx == self._selected_idx:
+            self._refresh_stream_color_ui(e)
+        self._mark_dirty()
+
+    def _refresh_stream_color_ui(self, e) -> None:
+        """Sync the config-mode color swatch button + config-panel frame
+        to entity ``e``'s recognition color."""
+        col = getattr(e, 'color', '') or C['surface1']
+        btn = getattr(self, '_btn_stream_color', None)
+        if btn is not None:
+            btn.setStyleSheet(
+                f'QPushButton {{ background-color: {col}; '
+                f'border: 1px solid {C["surface1"]}; border-radius: 3px; }}'
+                f'QPushButton:hover {{ border: 1px solid {C["text"]}; }}')
+        panel = getattr(self, '_config_panel', None)
+        if panel is not None:
+            panel.set_color(getattr(e, 'color', '') or None)
 
     def _remove_recording(self, idx: int):
         if len(self._entities) <= 1:
@@ -2176,7 +2413,9 @@ class ChirpWindow(QMainWindow):
                 'panel_height': self._vm_panel_height,
                 'use_opengl':   self._pg_use_opengl,
                 'active_only':  self._vm_active_only,
+                'fill_order':   self._vm_fill_order,
             },
+            monitor=self._build_monitor_settings(),
         )
 
     def _write_settings_to_path(self, path: str, data: dict) -> bool:
@@ -2362,7 +2601,7 @@ class ChirpWindow(QMainWindow):
         # warnings as dead code (only exercised by tests).
         from chirp.config import load_settings_dict
         try:
-            entities, view_mode, schema_warnings = load_settings_dict(data)
+            entities, view_mode, monitor, schema_warnings = load_settings_dict(data)
         except ValueError as exc:
             # Invalid format / future-version file / pre-migration
             # error. Leave the existing UI state intact — bailing here
@@ -2397,6 +2636,7 @@ class ChirpWindow(QMainWindow):
         self._vm_panel_height = view_mode['panel_height']
         self._pg_use_opengl = bool(view_mode.get('use_opengl', True))
         self._vm_active_only = bool(view_mode.get('active_only', True))
+        self._vm_fill_order = view_mode.get('fill_order', 'column')
         # Drop any grid built with the previous OpenGL setting so it is
         # recreated with the new one on next view-mode entry, and swap
         # the live config-panel viewport to match (clamped to raster
@@ -2412,6 +2652,10 @@ class ChirpWindow(QMainWindow):
         self._chk_vm_active_only.blockSignals(True)
         self._chk_vm_active_only.setChecked(self._vm_active_only)
         self._chk_vm_active_only.blockSignals(False)
+        self._vm_order_combo.blockSignals(True)
+        self._vm_order_combo.setCurrentIndex(
+            0 if self._vm_fill_order == 'column' else 1)
+        self._vm_order_combo.blockSignals(False)
 
         # Per-entity device warnings come back inside ``schema_warnings``
         # already (load_settings_dict appends RecordingEntity.from_dict's
@@ -2423,8 +2667,14 @@ class ChirpWindow(QMainWindow):
             self._entities.append(ent)
             idx = self._sidebar.add_item(ent.name)
             self._sidebar.set_item_stream_enabled(idx, ent.stream_enabled)
+        # Assign default colors to any stream that lacks one and push
+        # every color to its sidebar item.
+        self._sync_stream_colors()
         # Rebuild monitor-source combo from the loaded entities.
         self._refresh_monitor_source_combo()
+        # Restore the persisted audio-monitor settings now that the
+        # entities exist (source is resolved by list position).
+        self._apply_monitor_settings(monitor)
 
         # Update next recording number
         max_num = 0
@@ -3389,6 +3639,7 @@ class ChirpWindow(QMainWindow):
         self._vm_visible_sig = tuple(id(e) for e in ents)
         self._pg_grid.rebuild(
             ents, cols=self._vm_n_cols, indices=idxs,
+            fill_order=self._vm_fill_order,
             empty_hint=("No active streams — start acquisition or untick "
                         "'Active only'" if self._vm_active_only
                         else 'No recordings'))
@@ -3422,6 +3673,7 @@ class ChirpWindow(QMainWindow):
             self._config_panel.rebuild(e)
             self._config_panel.set_threshold(e.threshold)
             self._config_panel.set_spectral_threshold(e.spectral_threshold)
+            self._refresh_stream_color_ui(e)
 
     def _on_threshold_dragged(self, thr_linear: float) -> None:
         """Phase 4b: the amplitude threshold line was dragged in the config
@@ -3458,6 +3710,13 @@ class ChirpWindow(QMainWindow):
         self._vm_panel_height = val
         if self._view_mode and self._pg_grid is not None:
             self._pg_grid.set_tile_height(val)
+
+    def _on_vm_fill_order_changed(self, _idx):
+        order = self._vm_order_combo.currentData() or 'column'
+        self._vm_fill_order = order
+        self._mark_dirty()
+        if self._view_mode:
+            self._rebuild_view()
 
     def _on_vm_active_only(self, on: bool):
         """3c: 'Active only' toggled — rebuild the grid with the new

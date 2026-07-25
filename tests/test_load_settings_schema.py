@@ -63,8 +63,12 @@ def _make_window():
     win._vm_cols_spin = MagicMock()
     win._vm_height_spin = MagicMock()
     win._chk_vm_active_only = MagicMock()
+    win._vm_order_combo = MagicMock()
+    win._vm_fill_order = 'column'
 
     # Methods invoked at end of load
+    win._sync_stream_colors = MagicMock()
+    win._apply_monitor_settings = MagicMock()
     win._refresh_monitor_source_combo = MagicMock()
     win._load_params_from_entity = MagicMock()
     win._refresh_transport_ui = MagicMock()

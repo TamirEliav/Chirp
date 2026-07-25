@@ -83,6 +83,35 @@ C = {
     'peach':    '#fab387',
 }
 
+# ── Per-stream colors ───────────────────────────────────────────────────────────
+# Each RecordingEntity carries a ``color`` used as a recognition accent
+# wherever the stream appears (sidebar item, view-mode tile header). The
+# spectrogram keeps its fixed inferno colormap regardless. New streams
+# are assigned the next color in this palette (cycled by position); the
+# user can override any stream's color, and the override is persisted.
+# Twelve visually-distinct Catppuccin accents — comfortably more than the
+# 5–8 streams a typical session runs.
+STREAM_COLORS = [
+    '#89b4fa',  # blue
+    '#a6e3a1',  # green
+    '#fab387',  # peach
+    '#cba6f7',  # mauve
+    '#f38ba8',  # red
+    '#94e2d5',  # teal
+    '#f9e2af',  # yellow
+    '#f5c2e7',  # pink
+    '#89dceb',  # sky
+    '#b4befe',  # lavender
+    '#eba0ac',  # maroon
+    '#f2cdcd',  # flamingo
+]
+
+
+def default_stream_color(index: int) -> str:
+    """Return the palette color for a stream at position ``index``
+    (cycles when there are more streams than palette entries)."""
+    return STREAM_COLORS[index % len(STREAM_COLORS)]
+
 QSS = f"""
 QMainWindow, QWidget {{
     background-color: {C['base']};
@@ -198,5 +227,5 @@ __all__ = [
     "DEFAULT_POST_TRIG", "DEFAULT_MAX_REC", "DEFAULT_PRE_TRIG",
     "RECORDINGS_DIR", "DEFAULT_FREQ_LO", "DEFAULT_FREQ_HI",
     # Theme
-    "C", "QSS",
+    "C", "QSS", "STREAM_COLORS", "default_stream_color",
 ]

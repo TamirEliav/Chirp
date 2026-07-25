@@ -148,6 +148,13 @@ class RecordingEntity:
         # buttons still work for deliberate one-off use. Persisted.
         self.stream_enabled = True
 
+        # Recognition color — a per-stream accent shown wherever the
+        # stream appears (sidebar item, view-mode tile header). Empty
+        # means "unassigned"; the UI fills it from the default palette by
+        # list position (see chirp.constants.default_stream_color). A
+        # user-picked color is stored verbatim and persisted.
+        self.color = ''
+
         # Trigger params
         self.threshold     = DEFAULT_THRESHOLD
         self.min_cross_sec = DEFAULT_MIN_CROSS
@@ -1736,6 +1743,7 @@ class RecordingEntity:
             'wav_file_path':       self.wav_file_path,
             'wav_loop':            self.wav_loop,
             'stream_enabled':      self.stream_enabled,
+            'color':               self.color,
         }
 
     @classmethod
@@ -1766,7 +1774,7 @@ class RecordingEntity:
                      'entropy_min_cross_sec', 'rec_mode',
                      'display_mode',
                      'input_source', 'wav_file_path', 'wav_loop',
-                     'stream_enabled'):
+                     'stream_enabled', 'color'):
             if attr in d:
                 setattr(e, attr, d[attr])
 
