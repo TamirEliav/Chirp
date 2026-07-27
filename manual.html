@@ -488,6 +488,10 @@ python chirp.py</code></pre>
     (<em>record</em>). The detect row is driven by the same per-sample trigger mask the recording
     state machine consumes &mdash; there is no second computation, so what you see is exactly what
     the trigger did, including any bandpass filtering and spectral-entropy gating.
+    If an event is later <strong>dropped by the <em>Min Total Cross</em> filter</strong> (its
+    accumulated above-threshold duration fell short of the minimum, so no WAV is written), that
+    event&rsquo;s record bar turns <span style="color:var(--red)"><strong>red</strong></span>
+    instead of green &mdash; so a discarded event is visible at a glance, not just in the terminal log.
   </p>
 
   <h3 id="transport-bar">Transport Bar</h3>
@@ -974,7 +978,8 @@ python chirp.py</code></pre>
       details, <strong>click a lit badge to clear it</strong> right from the grid. A
       &#127911; marker shows which stream feeds the audio monitor.</li>
     <li>Each tile also includes the <strong>detect / record events strip</strong> (yellow = trigger
-      condition met, green = written to WAV), so trigger activity is visible while monitoring.</li>
+      condition met, green = written to WAV, red = event dropped by the Min Total Cross filter), so
+      trigger activity is visible while monitoring.</li>
     <li><strong>Active only</strong>: a toolbar checkbox that hides streams whose
       acquisition is stopped. The setting is saved with the configuration.</li>
     <li>Per-tile <strong>Height</strong> is adjustable, or click <strong>Fit to screen</strong> to
@@ -1035,14 +1040,13 @@ python chirp.py</code></pre>
   </p>
   <h3 id="config-table">All-Streams Table</h3>
   <p>
-    The <strong>All Streams Table&hellip;</strong> button (next to <em>Apply All Settings</em>)
+    The <strong>All Streams Table&hellip;</strong> button
     opens a side-by-side table of every parameter of every stream — rows are parameters, columns
     are streams. <strong>Double-click a cell to edit</strong>; the change applies to that stream
     immediately, exactly as if you had edited it in the per-stream panel. Choice-valued rows list
     their allowed values in the tooltip; invalid input reverts. Structural parameters (device,
     sample rate, channel mode, input source) are shown read-only — change those from the Settings
-    panel. This replaces the live-sync checkboxes from earlier versions; for one-shot copying of
-    everything from one stream to all others, use <em>Apply All Settings</em>.
+    panel. This replaces the live-sync checkboxes from earlier versions.
   </p>
   <h3 id="monitor-controls">Audio Monitor Controls</h3>
   <p>

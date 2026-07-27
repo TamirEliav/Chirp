@@ -2,10 +2,11 @@
 
 Pins the contract of:
   * ``ThresholdRecorder.process_chunk`` returning a report dict with
-    ``detect_mask``, ``active_spans``, and ``flushed_spans``.
-  * ``RecordingEntity.detect_mask_buffer`` / ``record_mask_buffer``
-    being maintained in lockstep with the amplitude ring buffer,
-    including retroactive pre-trigger marking.
+    ``detect_mask``, ``active_spans``, ``flushed_spans``, and
+    ``discarded_spans``.
+  * ``RecordingEntity.detect_mask_buffer`` / ``record_mask_buffer`` /
+    ``discard_mask_buffer`` being maintained in lockstep with the
+    amplitude ring buffer, including retroactive pre-trigger marking.
 
 All tests avoid real WAV writes via the standard ``_start_flush``
 monkeypatch, and avoid opening real audio devices by passing
@@ -58,12 +59,14 @@ def test_report_shape_quiet_chunk(captured_flushes):
     report = rec.process_chunk(np.zeros(1024, dtype=np.float32),
                                trigger_peak=0.0,
                                global_chunk_end=1024, **_p())
-    assert set(report) == {'detect_mask', 'active_spans', 'flushed_spans'}
+    assert set(report) == {'detect_mask', 'active_spans', 'flushed_spans',
+                           'discarded_spans'}
     assert report['detect_mask'].dtype == bool
     assert report['detect_mask'].shape == (1024,)
     assert not report['detect_mask'].any()
     assert report['active_spans'] == []
     assert report['flushed_spans'] == []
+    assert report['discarded_spans'] == []
 
 
 def test_report_detect_mask_follows_trigger_mask_input(captured_flushes):
@@ -131,6 +134,44 @@ def test_report_flushed_span_on_event_close(captured_flushes):
     assert g_hi == 1024
 
 
+def test_report_discarded_span_on_min_total_cross_drop(captured_flushes):
+    """An event dropped by the min-total-crossing filter reports its
+    range in ``discarded_spans`` (red) instead of ``flushed_spans``
+    (green), and publishes no WAV."""
+    rec = ThresholdRecorder()
+    params = _p(hold_sec=0.0, post_trig_sec=0.0,
+                min_total_cross_sec=2048 / 44100)
+    r1 = rec.process_chunk(np.full(1024, 0.9, dtype=np.float32),
+                           trigger_peak=0.9,
+                           global_chunk_end=1024, **params)
+    assert len(r1['active_spans']) == 1
+    # Silence ends the event (hold=0); its 1024 above-samples fall short
+    # of the 2048-sample minimum, so it is discarded.
+    r2 = rec.process_chunk(np.zeros(1024, dtype=np.float32),
+                           trigger_peak=0.0,
+                           global_chunk_end=2048, **params)
+    assert captured_flushes == []
+    assert r2['flushed_spans'] == []
+    assert len(r2['discarded_spans']) == 1
+    assert r2['discarded_spans'][0] == (0, 1024)
+
+
+def test_report_kept_event_reports_flushed_not_discarded(captured_flushes):
+    """The mirror case: an event that clears the minimum reports in
+    ``flushed_spans`` with ``discarded_spans`` empty."""
+    rec = ThresholdRecorder()
+    params = _p(hold_sec=0.0, post_trig_sec=0.0,
+                min_total_cross_sec=1024 / 44100)
+    rec.process_chunk(np.full(1024, 0.9, dtype=np.float32),
+                      trigger_peak=0.9, global_chunk_end=1024, **params)
+    r2 = rec.process_chunk(np.zeros(1024, dtype=np.float32),
+                           trigger_peak=0.0,
+                           global_chunk_end=2048, **params)
+    assert len(captured_flushes) == 1
+    assert len(r2['flushed_spans']) == 1
+    assert r2['discarded_spans'] == []
+
+
 def test_report_spans_include_pre_trigger(captured_flushes):
     """pre_trig_sec pushes the span start into prior history."""
     rec = ThresholdRecorder()
@@ -194,10 +235,50 @@ def test_entity_has_indicator_buffers_matching_amp_size():
     try:
         assert e.detect_mask_buffer.shape == e.amp_buffer.shape
         assert e.record_mask_buffer.shape == e.amp_buffer.shape
+        assert e.discard_mask_buffer.shape == e.amp_buffer.shape
         assert e.detect_mask_buffer.dtype == bool
         assert e.record_mask_buffer.dtype == bool
+        assert e.discard_mask_buffer.dtype == bool
         assert not e.detect_mask_buffer.any()
         assert not e.record_mask_buffer.any()
+        assert not e.discard_mask_buffer.any()
+    finally:
+        e.close()
+
+
+def test_entity_discard_buffer_lights_up_red_on_dropped_event(captured_flushes):
+    """A finished event dropped by the min-total-crossing filter flips
+    the discard mask True over its range AND clears the record mask
+    there — the strip flips from green to red, no green sliver left."""
+    e = _make_entity()
+    e.min_total_cross_sec = 2 * CHUNK_FRAMES / e.sample_rate
+    try:
+        loud = np.full(CHUNK_FRAMES, 0.9, dtype=np.float32)
+        e.ingest_chunk(loud)          # event opens → painted green
+        assert e.record_mask_buffer[:CHUNK_FRAMES].any()
+        assert not e.discard_mask_buffer[:CHUNK_FRAMES].any()
+        silent = np.zeros(CHUNK_FRAMES, dtype=np.float32)
+        e.ingest_chunk(silent)        # event ends, 1024 < 2048 → discarded
+        assert captured_flushes == []
+        assert e.discard_mask_buffer[:CHUNK_FRAMES].all()
+        assert not e.record_mask_buffer[:CHUNK_FRAMES].any()
+    finally:
+        e.close()
+
+
+def test_entity_kept_event_leaves_discard_buffer_clear(captured_flushes):
+    """The mirror case: a saved event keeps the record mask green and
+    never touches the discard mask."""
+    e = _make_entity()
+    e.min_total_cross_sec = CHUNK_FRAMES / e.sample_rate
+    try:
+        loud = np.full(CHUNK_FRAMES, 0.9, dtype=np.float32)
+        e.ingest_chunk(loud)
+        silent = np.zeros(CHUNK_FRAMES, dtype=np.float32)
+        e.ingest_chunk(silent)        # event ends, 1024 >= 1024 → kept
+        assert len(captured_flushes) == 1
+        assert e.record_mask_buffer[:CHUNK_FRAMES].any()
+        assert not e.discard_mask_buffer.any()
     finally:
         e.close()
 
@@ -295,6 +376,7 @@ def test_entity_reset_display_clears_indicator_buffers(captured_flushes):
         e.reset_display()
         assert not e.detect_mask_buffer.any()
         assert not e.record_mask_buffer.any()
+        assert not e.discard_mask_buffer.any()
     finally:
         e.close()
 
@@ -305,8 +387,10 @@ def test_entity_change_sample_rate_rebuilds_indicator_buffers(captured_flushes):
         e.change_sample_rate(22050)
         assert e.detect_mask_buffer.shape == e.amp_buffer.shape
         assert e.record_mask_buffer.shape == e.amp_buffer.shape
+        assert e.discard_mask_buffer.shape == e.amp_buffer.shape
         assert not e.detect_mask_buffer.any()
         assert not e.record_mask_buffer.any()
+        assert not e.discard_mask_buffer.any()
     finally:
         e.close()
 

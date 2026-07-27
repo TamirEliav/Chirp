@@ -106,7 +106,6 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - All parameters preserved including device names, sample rates, trigger settings, and display options
 
 ### Bulk Editing
-- **Apply All Settings** — one-shot copy of every setting from the selected stream to all others
 - **All-Streams Table** — an editable side-by-side table of every parameter of every stream (double-click a cell to edit; structural params like device and sample rate are shown read-only)
 
 ### Audio Monitor Loopback

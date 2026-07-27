@@ -160,8 +160,13 @@ class ThresholdRecorder:
             global-sample coordinates for every event still open after
             this chunk. ``g_end`` is clipped to ``global_chunk_end``.
           * ``flushed_spans`` — list of ``(g_start, g_end)`` for events
-            finalised during this chunk (disable-flush, post-trigger
-            tail complete, or force-split on ``max_rec``).
+            finalised (published) during this chunk (disable-flush,
+            post-trigger tail complete, or force-split on ``max_rec``).
+          * ``discarded_spans`` — list of ``(g_start, g_end)`` for events
+            finalised during this chunk but DROPPED by the
+            min-total-crossing filter (no WAV published). Painted red in
+            the record strip so a below-threshold event is visibly
+            distinct from a saved one.
 
         When ``global_chunk_end`` is None (legacy callers), the spans
         lists are always empty but ``detect_mask`` is still populated.
@@ -169,6 +174,7 @@ class ThresholdRecorder:
         n = len(chunk)
         flushed_spans: list[tuple[int, int]] = []
         active_spans: list[tuple[int, int]]  = []
+        discarded_spans: list[tuple[int, int]] = []
         # M5: capture-time wall clock of this chunk's last sample,
         # supplied by the entity from its sample-clock anchor. When
         # present, event onsets are derived from it instead of "now" —
@@ -194,9 +200,11 @@ class ThresholdRecorder:
         # ── Enable/disable transitions ────────────────────────────────────
         if self._was_enabled and not enabled:
             for ev in self._active_events:
-                flushed_spans.append(self._span_for_flush(ev))
-                self._flush_event(ev, output_dir, filename_prefix,
-                                  filename_suffix, sample_rate, filename_stream)
+                span = self._span_for_flush(ev)
+                discarded = self._flush_event(
+                    ev, output_dir, filename_prefix,
+                    filename_suffix, sample_rate, filename_stream)
+                (discarded_spans if discarded else flushed_spans).append(span)
             self._active_events = []
             self._above_streak  = 0
             self._mono_anchor   = None
@@ -215,6 +223,7 @@ class ThresholdRecorder:
                 'detect_mask':   mask.copy(),
                 'active_spans':  [],
                 'flushed_spans': [s for s in flushed_spans if s[0] >= 0],
+                'discarded_spans': [s for s in discarded_spans if s[0] >= 0],
             }
 
         # Lazily anchor the monotonic + wall clocks (#23 / c13).
@@ -319,9 +328,11 @@ class ThresholdRecorder:
 
             # Flush when the post-trigger tail is fully captured.
             if ev['ended'] and ev['samples_kept'] >= ev['target_kept']:
-                flushed_spans.append(self._span_for_flush(ev))
-                self._flush_event(ev, output_dir, filename_prefix,
-                                  filename_suffix, sample_rate, filename_stream)
+                span = self._span_for_flush(ev)
+                discarded = self._flush_event(
+                    ev, output_dir, filename_prefix,
+                    filename_suffix, sample_rate, filename_stream)
+                (discarded_spans if discarded else flushed_spans).append(span)
                 to_remove.append(ev)
                 continue
 
@@ -397,6 +408,7 @@ class ThresholdRecorder:
             'detect_mask':   mask.copy(),
             'active_spans':  active_spans,
             'flushed_spans': [s for s in flushed_spans if s[0] >= 0],
+            'discarded_spans': [s for s in discarded_spans if s[0] >= 0],
         }
 
     # ── Helpers ──────────────────────────────────────────────────────────
@@ -802,7 +814,11 @@ class ThresholdRecorder:
     def _flush_event(self, ev: dict, output_dir: str,
                      filename_prefix: str, filename_suffix: str,
                      sample_rate: int, filename_stream: str,
-                     *, splitting: bool = False) -> None:
+                     *, splitting: bool = False) -> bool:
+        """Finalise (or discard) one event. Returns True when the event
+        was discarded by the min-total-crossing filter, so the caller can
+        route its span to the ``discarded_spans`` report (painted red)
+        instead of ``flushed_spans`` (painted green)."""
         # Min-total-crossing filter: discard the whole event if its
         # accumulated above-threshold duration never reached the minimum.
         # Assessed only at FINAL flushes — a force-split flush
@@ -814,7 +830,7 @@ class ThresholdRecorder:
         if (min_samps > 0 and not splitting
                 and ev.get('above_total', min_samps) < min_samps):
             self._discard_event(ev, filename_stream, min_samps)
-            return
+            return True
         # Force-split halves used to carry a ``partNN`` filename token;
         # that is gone — every file (split or not) now shares one name
         # format, and each part's onset_time is its own capture time
@@ -826,7 +842,7 @@ class ThresholdRecorder:
         # buffered events go through the writer pool as before.
         if self._stream_finalize(ev, output_dir, filename_prefix,
                                  eff_suffix, filename_stream):
-            return
+            return False
         trimmed = self._trim_event(ev)
         # #46: prefer the SR pinned at event-open time. The caller's
         # ``sample_rate`` is the *current* session rate — if the user
@@ -838,6 +854,7 @@ class ThresholdRecorder:
                           eff_suffix, sample_rate=ev_sr,
                           onset_time=ev['onset_time'],
                           filename_stream=filename_stream)
+        return False
 
     @property
     def is_recording(self) -> bool:

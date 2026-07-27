@@ -1393,15 +1393,9 @@ class ChirpWindow(QMainWindow):
         trig_g.addLayout(calib_row, 11, 0, 1, 3)
 
         # 4a (v3.3.0): the live-sync checkboxes are gone \u2014 bulk editing
-        # is the one-shot Apply All button or the all-streams table.
+        # is the all-streams table.
         sync_row = QHBoxLayout()
         sync_row.setSpacing(10)
-        self._btn_apply_all = QPushButton('Apply All Settings \u2192')
-        self._btn_apply_all.setObjectName('btn_small')
-        self._btn_apply_all.setFixedWidth(150)
-        self._btn_apply_all.setToolTip(
-            'Copy ALL settings (trigger + display + output) from the selected '
-            'recording to every other recording (one-shot)')
         # 4b: side-by-side editable table of every stream's parameters.
         self._btn_config_table = QPushButton('All Streams Table\u2026')
         self._btn_config_table.setObjectName('btn_small')
@@ -1409,7 +1403,6 @@ class ChirpWindow(QMainWindow):
         self._btn_config_table.setToolTip(
             'Open a table showing all parameters of all streams side by '
             'side \u2014 double-click a cell to edit')
-        sync_row.addWidget(self._btn_apply_all)
         sync_row.addWidget(self._btn_config_table)
         sync_row.addStretch()
         trig_g.addLayout(sync_row, 12, 0, 1, 3)
@@ -1833,8 +1826,6 @@ class ChirpWindow(QMainWindow):
         self._sb_disp_freq_hi.valueChanged.connect(self._on_disp_freq_changed)
         self._combo_display_mode.currentTextChanged.connect(self._on_display_mode_changed)
 
-        # One-shot bulk copy (the live-sync checkboxes were removed in 4a).
-        self._btn_apply_all.clicked.connect(self._on_apply_all_settings)
         # 4b: editable all-streams table.
         self._btn_config_table.clicked.connect(self._open_config_table)
 
@@ -2963,53 +2954,6 @@ class ChirpWindow(QMainWindow):
         if idx == self._selected_idx:
             self._load_params_from_entity(idx)
 
-    def _on_apply_all_settings(self):
-        """One-shot: copy ALL user-configurable settings from the selected
-        entity to every other entity (#10 / c24)."""
-        e = self._sel
-        if not e:
-            return
-        self._flush_params_to_entity(self._selected_idx)
-        for ent in self._entities:
-            if ent is not e:
-                # Trigger params
-                ent.threshold     = e.threshold
-                ent.min_cross_sec = e.min_cross_sec
-                ent.min_total_cross_sec = e.min_total_cross_sec
-                ent.hold_sec      = e.hold_sec
-                ent.post_trig_sec = e.post_trig_sec
-                ent.max_rec_sec   = e.max_rec_sec
-                ent.pre_trig_sec  = e.pre_trig_sec
-                ent.freq_filter_enabled = e.freq_filter_enabled
-                ent.freq_lo       = e.freq_lo
-                ent.freq_hi       = e.freq_hi
-                ent.spectral_trigger_mode = e.spectral_trigger_mode
-                ent.spectral_threshold    = e.spectral_threshold
-                ent.entropy_min_cross_sec = e.entropy_min_cross_sec
-                ent.rec_mode      = e.rec_mode
-                # Display params
-                ent.gain_db       = e.gain_db
-                ent.db_floor      = e.db_floor
-                ent.db_ceil       = e.db_ceil
-                ent.freq_scale    = e.freq_scale
-                ent.display_freq_lo = e.display_freq_lo
-                ent.display_freq_hi = e.display_freq_hi
-                ent.rebuild_freq_mapping()
-                ent.change_fft_params(e.spec_nperseg, e.spec_window)
-                ent.change_analysis_fft_params(e.analysis_nperseg, e.analysis_window)
-                ent.display_mode  = e.display_mode
-                # Output params
-                ent.output_dir       = e.output_dir
-                ent.filename_prefix  = e.filename_prefix
-                ent.filename_suffix  = e.filename_suffix
-                ent.dph_folder_prefix = e.dph_folder_prefix
-                ent.ref_date         = e.ref_date
-        self._mark_dirty()
-        # Brief flash to confirm
-        self._btn_apply_all.setText('\u2713 Applied!')
-        from PyQt5.QtCore import QTimer
-        QTimer.singleShot(1500, lambda: self._btn_apply_all.setText('Apply All Settings \u2192'))
-
     def _on_display_mode_changed(self, mode: str):
         e = self._sel
         if not e:
@@ -3518,8 +3462,7 @@ class ChirpWindow(QMainWindow):
         try:
             e.change_sample_rate(new_sr)
             # (4a: the live-sync SR broadcast is gone with the sync
-            # checkboxes — use Apply All / the all-streams table for
-            # bulk changes.)
+            # checkboxes — use the all-streams table for bulk changes.)
             # #7: if this entity is the monitor source, the output stream
             # needs to be reopened at the new SR so playback isn't pitched.
             if self._monitor.source_id == id(e):

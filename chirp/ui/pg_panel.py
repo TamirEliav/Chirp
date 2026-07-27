@@ -93,6 +93,9 @@ def events_rgba(e):
         return None
     det = e.detect_mask_buffer[:need].reshape(nc, CHUNK_FRAMES).any(axis=1)
     rec = e.record_mask_buffer[:need].reshape(nc, CHUNK_FRAMES).any(axis=1)
+    disc_buf = getattr(e, 'discard_mask_buffer', None)
+    disc = (disc_buf[:need].reshape(nc, CHUNK_FRAMES).any(axis=1)
+            if disc_buf is not None else None)
     rgba = np.zeros((2, nc, 4), dtype=np.ubyte)
     # Background (Catppuccin surface0) so empty cells aren't pure black.
     rgba[..., 0] = 49
@@ -102,6 +105,11 @@ def events_rgba(e):
     # Row 0 = detect (yellow), row 1 = record (green).
     rgba[0, det] = (249, 226, 175, 255)
     rgba[1, rec] = (166, 227, 161, 255)
+    # Discarded events (min-total-crossing filter dropped them, no WAV
+    # written) paint red over the record row — applied last so red wins
+    # over any residual green in an overlapping column.
+    if disc is not None:
+        rgba[1, disc] = (243, 139, 168, 255)
     return rgba
 
 

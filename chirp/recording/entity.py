@@ -236,6 +236,11 @@ class RecordingEntity:
         # tail as it fills.
         self.detect_mask_buffer = np.zeros(self._total_samples, dtype=bool)
         self.record_mask_buffer = np.zeros(self._total_samples, dtype=bool)
+        # True wherever a finished event was DISCARDED by the min-total-
+        # crossing filter (no WAV written) — drives the red overlay on the
+        # record strip so a dropped event is visually distinct from a
+        # saved one.
+        self.discard_mask_buffer = np.zeros(self._total_samples, dtype=bool)
         # Single cumulative sample counter — both ring-buffer cursors
         # are derived from it so they cannot drift apart when chunk
         # size differs from CHUNK_FRAMES (#20 / c14).
@@ -347,6 +352,7 @@ class RecordingEntity:
         self.entropy_buffer[:] = 1.0
         self.detect_mask_buffer[:] = False
         self.record_mask_buffer[:] = False
+        self.discard_mask_buffer[:] = False
 
     # ── #45: safe teardown helpers ─────────────────────────────────────
 
@@ -930,6 +936,7 @@ class RecordingEntity:
         self.entropy_buffer = np.ones(self._n_cols, dtype=np.float32)
         self.detect_mask_buffer = np.zeros(self._total_samples, dtype=bool)
         self.record_mask_buffer = np.zeros(self._total_samples, dtype=bool)
+        self.discard_mask_buffer = np.zeros(self._total_samples, dtype=bool)
         self._samples_total = 0
         self.write_head = 0
         self.col_head   = 0
@@ -990,6 +997,7 @@ class RecordingEntity:
             self.entropy_buffer = np.ones(self._n_cols, dtype=np.float32)
             self.detect_mask_buffer = np.zeros(self._total_samples, dtype=bool)
             self.record_mask_buffer = np.zeros(self._total_samples, dtype=bool)
+            self.discard_mask_buffer = np.zeros(self._total_samples, dtype=bool)
             # Preserve the sample clock — it anchors filename timestamps
             # (see reset_display). Re-derive the cursors for the NEW
             # ring geometry with the same modulo rule ingest_chunk uses,
@@ -1642,27 +1650,42 @@ class RecordingEntity:
         g_begin_chunk = g_end - n
         ring_start = g_begin_chunk % total
 
-        # Clear the just-written chunk's range first.
+        # Clear the just-written chunk's range first, in BOTH masks — as
+        # fresh audio overwrites a ring region its stale record/discard
+        # marks must not linger.
         end = ring_start + n
         if end <= total:
             self.record_mask_buffer[ring_start:end] = False
+            self.discard_mask_buffer[ring_start:end] = False
         else:
             self.record_mask_buffer[ring_start:] = False
             self.record_mask_buffer[:end - total] = False
-
-        spans = list(report.get('active_spans') or [])
-        spans.extend(report.get('flushed_spans') or [])
-        if not spans:
-            return
+            self.discard_mask_buffer[ring_start:] = False
+            self.discard_mask_buffer[:end - total] = False
 
         # Visible ring window in global-sample coords.
         ring_window_start = g_end - total
+
+        spans = list(report.get('active_spans') or [])
+        spans.extend(report.get('flushed_spans') or [])
         for g_lo, g_hi in spans:
             lo = max(int(g_lo), ring_window_start)
             hi = min(int(g_hi), g_end)
             if hi <= lo:
                 continue
             self._or_range(self.record_mask_buffer, lo, hi, total)
+
+        # Discarded events: paint them into the discard mask AND clear
+        # them from the record mask — an event that streamed green while
+        # open must flip fully red once the min-total-crossing filter
+        # drops it, with no green sliver left over from earlier ticks.
+        for g_lo, g_hi in (report.get('discarded_spans') or []):
+            lo = max(int(g_lo), ring_window_start)
+            hi = min(int(g_hi), g_end)
+            if hi <= lo:
+                continue
+            self._or_range(self.discard_mask_buffer, lo, hi, total)
+            self._clear_range(self.record_mask_buffer, lo, hi, total)
 
     @staticmethod
     def _or_range(buf: np.ndarray, g_lo: int, g_hi: int, total: int) -> None:
@@ -1677,6 +1700,20 @@ class RecordingEntity:
         else:
             buf[b0:] = True
             buf[:end - total] = True
+
+    @staticmethod
+    def _clear_range(buf: np.ndarray, g_lo: int, g_hi: int, total: int) -> None:
+        """Set False into a circular buffer over global sample range
+        ``[g_lo, g_hi)``. Caller guarantees the range fits in the ring.
+        """
+        b0 = g_lo % total
+        length = g_hi - g_lo
+        end = b0 + length
+        if end <= total:
+            buf[b0:end] = False
+        else:
+            buf[b0:] = False
+            buf[:end - total] = False
 
     # ── Mini amplitude for sidebar ────────────────────────────────────────
 
