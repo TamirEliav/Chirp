@@ -1193,11 +1193,16 @@ class ChirpWindow(QMainWindow):
         outer = QHBoxLayout(w)
         outer.setContentsMargins(6, 2, 6, 2)
 
-        # Hidden threshold spinbox (synced from amplitude graph drag)
+        # Hidden threshold spinbox (synced from amplitude graph drag).
+        # 6 decimals so the linear value carries the full dynamic range:
+        # on the dB scale the floor (-80 dB) is 1e-4 linear, and 3 decimals
+        # gave essentially no resolution below ~-40 dB (0.001 = -60 dB,
+        # 0.000 = unrepresentable). 1e-6 steps keep fine dB resolution
+        # everywhere from the floor to 0 dB.
         self._sb_thr = QDoubleSpinBox()
         self._sb_thr.setRange(0.0, 1.0)
-        self._sb_thr.setSingleStep(0.005)
-        self._sb_thr.setDecimals(3)
+        self._sb_thr.setSingleStep(0.0001)
+        self._sb_thr.setDecimals(6)
         self._sb_thr.setValue(DEFAULT_THRESHOLD)
         self._sb_thr.hide()
 

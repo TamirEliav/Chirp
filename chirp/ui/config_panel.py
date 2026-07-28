@@ -249,7 +249,10 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
                 self._wave_r.setClipToView(True)
 
         # Amplitude row (always present) with draggable threshold.
-        amp_p = add_plot(mouse_y=(self._amp_scale != 'log'))
+        # Mouse-wheel Y zoom is enabled on BOTH scales so the user can zoom
+        # in to refine the threshold line — especially on the dB scale where
+        # the interesting range is often a narrow band near the noise floor.
+        amp_p = add_plot(mouse_y=True)
         amp_p.setLabel('left', 'Amp (dB)' if self._amp_scale == 'log' else 'Amp')
         self._amp = amp_p.plot(pen=pg.mkPen(C['blue'], width=1))
         self._amp.setDownsampling(auto=True, method='peak')
