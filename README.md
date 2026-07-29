@@ -4,7 +4,26 @@
 
 Chirp is a desktop application for multi-stream audio monitoring, visualization, and threshold-triggered recording. It was designed with bioacoustics research in mind but works for any audio analysis task.
 
-![Version](https://img.shields.io/badge/Version-v3.6.0-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5%20%2B%20pyqtgraph-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
+![Version](https://img.shields.io/badge/Version-v3.7.0-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5%20%2B%20pyqtgraph-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
+
+---
+
+## Table of Contents
+
+- [Features](#features)
+- [Release Notes](#release-notes)
+- [Installation](#installation)
+  - [Requirements](#requirements)
+  - [Step 1 — Install Miniconda](#step-1--install-miniconda)
+  - [Step 2 — Get Chirp and create its environment](#step-2--get-chirp-and-create-its-environment)
+  - [Dependencies](#dependencies)
+- [Usage](#usage)
+  - [Quick Start](#quick-start)
+  - [Adding Multiple Streams](#adding-multiple-streams)
+  - [Saving Your Setup](#saving-your-setup)
+- [User Manual](#user-manual)
+- [Supported Sample Rates](#supported-sample-rates)
+- [License](#license)
 
 ---
 
@@ -127,23 +146,54 @@ Per-version release notes (what's new in each version) live on the [GitHub Relea
 ## Installation
 
 ### Requirements
-- Python 3.11+
+- Python 3.11+ (installed for you by Miniconda in Step 1 below)
 - A working audio input device
 
-### Setup
+> **New to Python?** You don't need to install Python yourself or understand how
+> environments work. Just follow the two steps below in order and copy-paste the
+> commands — the whole setup takes a few minutes.
+
+### Step 1 — Install Miniconda
+
+**Miniconda** is a small, free installer for Python and `conda`. `conda` creates
+an isolated "environment" — a self-contained copy of Python and Chirp's
+dependencies that won't interfere with anything else on your computer. This is
+the recommended way to run Chirp because it keeps the exact Python version Chirp
+expects separate from your system.
+
+1. Download the installer for your operating system from the official page:
+   **[Miniconda download page](https://www.anaconda.com/download/success)**
+   (choose the **Miniconda** installer, not the larger Anaconda one).
+2. Run the installer and accept the defaults.
+   - **Windows:** after it finishes, open the **"Anaconda Prompt"** from the Start
+     menu — this is the terminal where the commands below will work.
+   - **macOS / Linux:** open a new Terminal window.
+
+A more detailed walkthrough is in Miniconda's own
+[installation guide](https://www.anaconda.com/docs/getting-started/miniconda/install).
+
+### Step 2 — Get Chirp and create its environment
+
+Run these commands one at a time in the Anaconda Prompt (Windows) or Terminal
+(macOS / Linux):
 
 ```bash
-# Clone the repository
+# Clone the repository (or download it as a ZIP from GitHub and unzip it)
 git clone https://github.com/TamirEliav/Chirp.git
 cd Chirp
 
-# Create a conda environment (recommended)
+# Create an isolated environment named "chirp" with the right Python version
 conda create -n chirp python=3.11
+
+# Activate it — do this every time before running Chirp
 conda activate chirp
 
-# Install dependencies
+# Install Chirp's dependencies into the environment
 pip install -r requirements.txt
 ```
+
+Setup is a one-time step. From now on you only need `conda activate chirp` before
+launching the app (see [Usage](#usage)).
 
 ### Dependencies
 - `sounddevice` — audio capture
@@ -159,7 +209,11 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-python chirp.py
+# Activate the environment first (once per terminal session)
+conda activate chirp
+
+# Launch Chirp
+python -m chirp
 ```
 
 ### Quick Start

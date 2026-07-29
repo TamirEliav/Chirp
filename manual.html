@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Chirp v3.6.1 — User Manual</title>
+<title>Chirp v3.7.0 — User Manual</title>
 <style>
   :root {
     --base: #1e1e2e;
@@ -304,7 +304,7 @@
 <nav class="sidebar">
   <div class="logo">
     <h1>Chirp</h1>
-    <span>User Manual &mdash; v3.6.1</span>
+    <span>User Manual &mdash; v3.7.0</span>
   </div>
   <ul>
     <li><a href="#overview">Overview</a></li>
@@ -365,7 +365,7 @@
 <header class="hero">
   <h1>Chirp</h1>
   <p class="subtitle">Real-Time Audio Monitoring, Visualization &amp; Triggered Recording</p>
-  <span class="version">v3.6.1</span>
+  <span class="version">v3.7.0</span>
 </header>
 
 <!-- ── 1. Overview ── -->
@@ -639,10 +639,17 @@ python chirp.py</code></pre>
   <ul>
     <li><strong>Log (dB)</strong> &mdash; the default. Y axis runs <code>-80 dB</code> to
         <code>0 dB</code> full scale. Best for surfacing quiet signals that compress against
-        zero on the linear scale (faint vocalisations, distant calls).</li>
+        zero on the linear scale (faint vocalisations, distant calls). <strong>Mouse-wheel
+        Y zoom</strong> works here too, so you can zoom into the noise floor to place the
+        threshold line precisely.</li>
     <li><strong>Linear</strong> &mdash; raw envelope, scrollable Y zoom. Best when you care
         about the absolute peak level and want to see the shape of high-amplitude transients.</li>
   </ul>
+  <p>
+    The threshold value is kept at fine resolution across the whole dB range &mdash; even deep near
+    the <code>-80 dB</code> floor the line moves smoothly, so quiet thresholds are no longer forced
+    to snap to coarse steps.
+  </p>
   <p>
     <strong>Right-click</strong> on the amplitude plot (in either Config or View mode) to pick
     Linear or Log (dB) for that stream. The choice is per-stream and is saved to the JSON
@@ -1016,6 +1023,15 @@ python chirp.py</code></pre>
     <li><strong>Audio-monitor settings</strong> &mdash; output device (by name), gain, mute state,
       Follow toggle, and which stream is routed to the monitor</li>
   </ul>
+  <h3 id="unsaved-changes">Unsaved Changes on Quit</h3>
+  <p>
+    If you close Chirp with configuration changes that haven't been saved, a prompt asks whether to
+    <strong>Save</strong>, <strong>Discard</strong>, or <strong>Cancel</strong>. Choosing
+    <em>Save</em> writes to the current configuration file (or asks where to save if the config is
+    new); <em>Discard</em> quits without saving; <em>Cancel</em> returns to the app without closing.
+    A small dot after the file name in the window title marks when there are unsaved changes. If
+    acquisition or recording is still running, that warning appears first, then this save prompt.
+  </p>
   <h3 id="startup-config">Startup Configuration</h3>
   <p>
     The <strong>Startup</strong> button chooses what Chirp loads each time it launches:
@@ -1064,6 +1080,15 @@ python chirp.py</code></pre>
     and restored when it is loaded. A configuration saved while muted restores its routing silently
     (the output stays closed until you un-mute).
   </p>
+  <div class="callout note">
+    <strong>Channel-aware playback:</strong> the monitor plays exactly the channel each stream is
+    analyzing &mdash; a stream set to <strong>Left</strong> or <strong>Right</strong> feeds only
+    that channel, and a <strong>Stereo</strong> stream feeds both. This matters when two streams
+    share one stereo input device (e.g. stream&nbsp;3 = Left, stream&nbsp;4 = Right): each monitors
+    its own channel rather than leaking the other's audio. If you change a stream's
+    <a href="#channels">channel mode</a> while it is the monitor source, re-select it (or toggle the
+    monitor) so the new channel takes effect.
+  </div>
   <h3>Reference Date &amp; Subfolder Naming</h3>
   <p>
     The <strong>Reference Date</strong> field enables automatic subfolder naming based on the number
@@ -1376,7 +1401,7 @@ python chirp.py</code></pre>
 
 <!-- Footer -->
 <footer style="margin-top:3rem; padding-top:1.5rem; border-top:1px solid var(--surface0); text-align:center; color:var(--overlay0); font-size:0.82rem;">
-  <p>Chirp v3.6.1 &mdash; User Manual</p>
+  <p>Chirp v3.7.0 &mdash; User Manual</p>
   <p>Designed for bioacoustics research. Built with Python, PyQt5, and pyqtgraph.</p>
 </footer>
 
