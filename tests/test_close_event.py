@@ -46,6 +46,9 @@ def _make_window_with_entities(n: int):
     # Stub Qt-side attrs touched by closeEvent.
     win._timer = MagicMock()
     win._monitor = MagicMock()
+    # Clean config by default → the unsaved-changes prompt is skipped.
+    win._config_dirty = False
+    win._save_settings = MagicMock(return_value=True)
 
     # Build n fake entities. closeEvent reads: acq_running, rec_enabled,
     # name, output_dir, filename_prefix/suffix, sample_rate, recorder,
@@ -96,6 +99,85 @@ def test_close_event_calls_all_entity_teardown_steps(qapp):
     assert len(stop_acqs) == 3
     assert len(flushes)   == 3
     assert len(closes)    == 3
+
+
+# ── Unsaved-config prompt on quit ────────────────────────────────────
+
+def test_close_event_clean_config_skips_save_prompt(qapp):
+    """No unsaved changes → the save prompt is never shown, teardown
+    runs normally."""
+    from PyQt5.QtGui import QCloseEvent
+
+    win, log = _make_window_with_entities(1)
+    win._config_dirty = False
+    with patch('chirp.ui.window.QMessageBox') as _mb, _patched_close():
+        win.closeEvent(QCloseEvent())
+    _mb.question.assert_not_called()
+    win._save_settings.assert_not_called()
+    assert [l for l in log if l[0] == 'close']  # teardown ran
+
+
+def test_close_event_dirty_save_writes_and_quits(qapp):
+    """Dirty + user picks Save → _save_settings is called and teardown
+    proceeds."""
+    from PyQt5.QtGui import QCloseEvent
+
+    win, log = _make_window_with_entities(1)
+    win._config_dirty = True
+    with patch('chirp.ui.window.QMessageBox') as _mb, _patched_close():
+        _mb.question.return_value = _mb.Save
+        event = QCloseEvent()
+        win.closeEvent(event)
+    win._save_settings.assert_called_once()
+    assert event.isAccepted()
+    assert [l for l in log if l[0] == 'close']  # teardown ran
+
+
+def test_close_event_dirty_discard_quits_without_saving(qapp):
+    """Dirty + user picks Discard → no save, teardown proceeds."""
+    from PyQt5.QtGui import QCloseEvent
+
+    win, log = _make_window_with_entities(1)
+    win._config_dirty = True
+    with patch('chirp.ui.window.QMessageBox') as _mb, _patched_close():
+        _mb.question.return_value = _mb.Discard
+        win.closeEvent(QCloseEvent())
+    win._save_settings.assert_not_called()
+    assert [l for l in log if l[0] == 'close']  # teardown ran
+
+
+def test_close_event_dirty_cancel_aborts_quit(qapp):
+    """Dirty + user picks Cancel → event ignored, NO teardown runs."""
+    from PyQt5.QtGui import QCloseEvent
+
+    win, log = _make_window_with_entities(2)
+    win._config_dirty = True
+    with patch('chirp.ui.window.QMessageBox') as _mb, _patched_close():
+        _mb.question.return_value = _mb.Cancel
+        event = QCloseEvent()
+        win.closeEvent(event)
+    win._save_settings.assert_not_called()
+    assert not event.isAccepted()          # quit vetoed
+    win._timer.stop.assert_not_called()     # teardown never started
+    assert not log                          # no entity stop/flush/close
+
+
+def test_close_event_dirty_save_failure_aborts_quit(qapp):
+    """Dirty + Save chosen but the write fails / user cancels Save-As →
+    quit is aborted so the changes aren't silently dropped."""
+    from PyQt5.QtGui import QCloseEvent
+
+    win, log = _make_window_with_entities(1)
+    win._config_dirty = True
+    win._save_settings = MagicMock(return_value=False)
+    with patch('chirp.ui.window.QMessageBox') as _mb, _patched_close():
+        _mb.question.return_value = _mb.Save
+        event = QCloseEvent()
+        win.closeEvent(event)
+    win._save_settings.assert_called_once()
+    assert not event.isAccepted()
+    win._timer.stop.assert_not_called()
+    assert not log
 
 
 # ── stop_acq failure does not skip subsequent entities ──────────────

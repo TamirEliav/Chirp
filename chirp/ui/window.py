@@ -2451,23 +2451,26 @@ class ChirpWindow(QMainWindow):
             QMessageBox.warning(self, 'Save Error', f'Could not save settings:\n{exc}')
             return False
 
-    def _save_settings(self):
-        """Save to current path if known, otherwise prompt."""
+    def _save_settings(self) -> bool:
+        """Save to current path if known, otherwise prompt. Returns True
+        when the config was written, False if the write failed or the
+        user cancelled the path prompt (used by the quit flow)."""
         if self._current_config_path:
-            self._write_settings_to_path(self._current_config_path, self._build_settings_data())
-        else:
-            self._save_settings_as()
+            return self._write_settings_to_path(
+                self._current_config_path, self._build_settings_data())
+        return self._save_settings_as()
 
-    def _save_settings_as(self):
-        """Always prompt for a save path."""
+    def _save_settings_as(self) -> bool:
+        """Always prompt for a save path. Returns True when written,
+        False if the user cancelled the dialog or the write failed."""
         data = self._build_settings_data()
         path, _ = QFileDialog.getSaveFileName(
             self, 'Save Settings', '', 'Chirp Settings (*.json);;All Files (*)')
         if not path:
-            return
+            return False
         if not path.endswith('.json'):
             path += '.json'
-        self._write_settings_to_path(path, data)
+        return self._write_settings_to_path(path, data)
 
     # ── Startup configuration preference ───────────────────────────────
 
@@ -4030,6 +4033,26 @@ class ChirpWindow(QMainWindow):
             if reply != QMessageBox.Yes:
                 event.ignore()
                 return
+
+        # Offer to persist unsaved configuration changes before quitting.
+        # Shown independently of the acquisition warning above (either,
+        # both, or neither can appear); Cancel aborts the whole quit.
+        if self._config_dirty:
+            reply = QMessageBox.question(
+                self, 'Chirp',
+                'You have unsaved changes to the configuration.\n'
+                'Save them before quitting?',
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save)
+            if reply == QMessageBox.Cancel:
+                event.ignore()
+                return
+            if reply == QMessageBox.Save and not self._save_settings():
+                # Save failed or the user backed out of the Save-As
+                # dialog — don't quit and silently drop the changes.
+                event.ignore()
+                return
+
         self._timer.stop()
 
         # #56: close-event teardown used to run bare `stop_acq` /
