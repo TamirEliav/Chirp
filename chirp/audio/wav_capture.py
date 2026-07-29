@@ -80,6 +80,7 @@ class WavFileCapture:
         # #7: optional monitor loopback — see AudioCapture.set_monitor.
         self._monitor = None
         self._monitor_source_id = None
+        self._monitor_channel = None
         # Playback cursor (frame index). Written by the producer thread,
         # read from the UI thread — a plain int assignment is atomic in
         # CPython so no lock is needed.
@@ -146,10 +147,16 @@ class WavFileCapture:
     def set_loop(self, loop: bool) -> None:
         self._loop = bool(loop)
 
-    def set_monitor(self, monitor, source_id) -> None:
-        """Wire the shared audio monitor (mirror of AudioCapture)."""
+    def set_monitor(self, monitor, source_id, channel=None) -> None:
+        """Wire the shared audio monitor (mirror of AudioCapture).
+
+        ``channel`` selects which column feeds the monitor to match the
+        stream's ``channel_mode`` (0 = left/mono, 1 = right, None =
+        both). See :meth:`AudioCapture.set_monitor`.
+        """
         self._monitor = monitor
         self._monitor_source_id = source_id
+        self._monitor_channel = channel
 
     def reset_position(self) -> None:
         """Rewind playback to the start of the file.
@@ -282,7 +289,16 @@ class WavFileCapture:
                 mon = self._monitor
                 if mon is not None:
                     try:
-                        mon.feed(self._monitor_source_id, emit)
+                        if emit.ndim == 2 and emit.shape[1] >= 2:
+                            chan = self._monitor_channel
+                            if chan == 1:
+                                mon.feed(self._monitor_source_id, emit[:, 1])
+                            elif chan == 0:
+                                mon.feed(self._monitor_source_id, emit[:, 0])
+                            else:
+                                mon.feed(self._monitor_source_id, emit[:, :2])
+                        else:
+                            mon.feed(self._monitor_source_id, emit)
                     except Exception:
                         pass
                 before = self._ring.overrun_count_total

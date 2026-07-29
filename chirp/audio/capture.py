@@ -69,6 +69,10 @@ class AudioCapture:
         # source_id so only the selected stream is actually played.
         self._monitor = None
         self._monitor_source_id = None
+        # Which input column feeds the monitor (honors channel_mode):
+        # 0 = left/mono, 1 = right, None = both (stereo). Without this a
+        # 'Right' stream opened with 2 channels would feed both columns.
+        self._monitor_channel = None
         try:
             self._stream = sd.InputStream(
                 samplerate=samplerate, channels=channels,
@@ -88,10 +92,20 @@ class AudioCapture:
                      f'failed to open device {device}: '
                      f'{type(exc).__name__}: {exc}')
 
-    def set_monitor(self, monitor, source_id) -> None:
-        """Wire the shared audio monitor. Safe to call at any time."""
+    def set_monitor(self, monitor, source_id, channel=None) -> None:
+        """Wire the shared audio monitor. Safe to call at any time.
+
+        ``channel`` selects which input column the monitor loopback
+        plays so it matches the stream's ``channel_mode``: 0 = left /
+        mono, 1 = right, None = feed both columns (stereo). A 'Right'
+        stream is opened with 2 input channels, so without this the
+        callback would feed both columns and the mono monitor would
+        average the left channel back in — audibly a *different* stream
+        when two streams split one stereo input device.
+        """
         self._monitor = monitor
         self._monitor_source_id = source_id
+        self._monitor_channel = channel
 
     @property
     def valid(self):
@@ -124,7 +138,13 @@ class AudioCapture:
                 if self._channels == 1:
                     mon.feed(self._monitor_source_id, indata[:, 0])
                 else:
-                    mon.feed(self._monitor_source_id, indata[:, :2])
+                    chan = self._monitor_channel
+                    if chan == 1:
+                        mon.feed(self._monitor_source_id, indata[:, 1])
+                    elif chan == 0:
+                        mon.feed(self._monitor_source_id, indata[:, 0])
+                    else:
+                        mon.feed(self._monitor_source_id, indata[:, :2])
             except Exception:
                 # Monitor must never break acquisition.
                 pass

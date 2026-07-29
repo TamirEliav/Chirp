@@ -229,6 +229,87 @@ def test_wav_capture_forwards_to_monitor(tmp_path):
         cap.close()
 
 
+# ── Channel selection (stereo-split streams) -----------------------------
+
+def _stereo_indata(frames=CHUNK_FRAMES):
+    """Distinct left/right so channel leakage is detectable: L=+0.5, R=-0.5."""
+    d = np.empty((frames, 2), dtype=np.float32)
+    d[:, 0] = 0.5
+    d[:, 1] = -0.5
+    return d
+
+
+def test_capture_monitor_right_channel_only():
+    """A 'Right' stream (2 input channels) must feed only column 1 — the
+    left column belongs to a *different* stream when two streams split a
+    stereo device (regression: left leaked in via the mono downmix)."""
+    m = AudioMonitor()
+    m._stream = object()
+    m.set_source('r')
+    ring = AudioRing(CHUNK_FRAMES * 8, channels=2)
+    cap = AudioCapture(ring, device=None, channels=2, samplerate=44100)
+    cap.set_monitor(m, 'r', channel=1)
+    cap._callback(_stereo_indata(), CHUNK_FRAMES, None, None)
+    out = np.zeros(CHUNK_FRAMES, dtype=np.float32)
+    m._ring.read(CHUNK_FRAMES, out)
+    np.testing.assert_allclose(out, -0.5, atol=1e-7)  # right only, no left mix
+
+
+def test_capture_monitor_left_channel_only():
+    m = AudioMonitor()
+    m._stream = object()
+    m.set_source('l')
+    ring = AudioRing(CHUNK_FRAMES * 8, channels=2)
+    cap = AudioCapture(ring, device=None, channels=2, samplerate=44100)
+    cap.set_monitor(m, 'l', channel=0)
+    cap._callback(_stereo_indata(), CHUNK_FRAMES, None, None)
+    out = np.zeros(CHUNK_FRAMES, dtype=np.float32)
+    m._ring.read(CHUNK_FRAMES, out)
+    np.testing.assert_allclose(out, 0.5, atol=1e-7)  # left only, no right mix
+
+
+def test_capture_monitor_stereo_feeds_both():
+    m = AudioMonitor()
+    m._stream = object()
+    # Stereo mode opens the output at 2 channels; mirror that so the
+    # monitor ring keeps both columns instead of downmixing to mono.
+    m._channels = 2
+    m._ring = _RingBuffer(capacity_frames=CHUNK_FRAMES * 8, channels=2)
+    m.set_source('s')
+    ring = AudioRing(CHUNK_FRAMES * 8, channels=2)
+    cap = AudioCapture(ring, device=None, channels=2, samplerate=44100)
+    cap.set_monitor(m, 's', channel=None)  # stereo → both columns
+    assert m._ring.channels == 2
+    cap._callback(_stereo_indata(), CHUNK_FRAMES, None, None)
+    out = np.zeros((CHUNK_FRAMES, 2), dtype=np.float32)
+    m._ring.read(CHUNK_FRAMES, out)
+    np.testing.assert_allclose(out[:, 0], 0.5, atol=1e-7)
+    np.testing.assert_allclose(out[:, 1], -0.5, atol=1e-7)
+
+
+def test_entity_monitor_channel_tracks_channel_mode():
+    """The entity derives the monitor channel from channel_mode and
+    re-wires the capture so 'Right'/'Left'/'Stereo' play the right thing."""
+    m = AudioMonitor()
+    e = RecordingEntity(name='e', device_id=None)
+    try:
+        e.set_monitor(m)
+        e.channel_mode = 'Right'
+        assert e._monitor_channel() == 1
+        e.channel_mode = 'Left'
+        assert e._monitor_channel() == 0
+        e.channel_mode = 'Mono'
+        assert e._monitor_channel() == 0
+        e.channel_mode = 'Stereo'
+        assert e._monitor_channel() is None
+        # Rebuilding the capture propagates the current channel to it.
+        e.channel_mode = 'Right'
+        e.change_device(None, 2)
+        assert e.capture._monitor_channel == 1
+    finally:
+        e.close()
+
+
 # ── RecordingEntity integration ------------------------------------------
 
 def test_entity_set_monitor_persists_across_capture_rebuilds():

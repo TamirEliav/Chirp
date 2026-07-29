@@ -767,10 +767,24 @@ class RecordingEntity:
         # WAV-file switch doesn't silently drop the loopback (#7).
         if self._monitor is not None:
             try:
-                cap.set_monitor(self._monitor, id(self))
+                cap.set_monitor(self._monitor, id(self), self._monitor_channel())
             except Exception:
                 pass
         return cap
+
+    def _monitor_channel(self):
+        """Which capture channel the monitor loopback should play,
+        honoring ``channel_mode`` so the audio matches the spectrogram /
+        amplitude plots: 1 = right, 0 = left / mono, None = both
+        (stereo). Mirrors the display/record selection in
+        ``process_chunk`` — without it a 'Right' stream feeds both
+        columns and the mono monitor averages the left (a *different*
+        stream when two streams split one stereo input)."""
+        if self.channel_mode == 'Right':
+            return 1
+        if self.channel_mode == 'Stereo':
+            return None
+        return 0
 
     def set_monitor(self, monitor) -> None:
         """Attach (or detach with ``None``) the shared AudioMonitor.
@@ -783,7 +797,11 @@ class RecordingEntity:
         cap = self.capture
         if cap is not None:
             try:
-                cap.set_monitor(monitor, id(self) if monitor is not None else None)
+                cap.set_monitor(
+                    monitor,
+                    id(self) if monitor is not None else None,
+                    self._monitor_channel(),
+                )
             except Exception:
                 pass
 
