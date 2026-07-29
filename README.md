@@ -14,7 +14,7 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - [Release Notes](#release-notes)
 - [Installation](#installation)
   - [Requirements](#requirements)
-  - [Step 1 — Install Miniconda](#step-1--install-miniconda)
+  - [Step 1 — Install Miniforge](#step-1--install-miniforge)
   - [Step 2 — Get Chirp and create its environment](#step-2--get-chirp-and-create-its-environment)
   - [Dependencies](#dependencies)
 - [Usage](#usage)
@@ -146,35 +146,36 @@ Per-version release notes (what's new in each version) live on the [GitHub Relea
 ## Installation
 
 ### Requirements
-- Python 3.11+ (installed for you by Miniconda in Step 1 below)
+- Python 3.11+ (installed for you by Miniforge in Step 1 below)
 - A working audio input device
 
 > **New to Python?** You don't need to install Python yourself or understand how
 > environments work. Just follow the two steps below in order and copy-paste the
 > commands — the whole setup takes a few minutes.
 
-### Step 1 — Install Miniconda
+### Step 1 — Install Miniforge
 
-**Miniconda** is a small, free installer for Python and `conda`. `conda` creates
-an isolated "environment" — a self-contained copy of Python and Chirp's
+**Miniforge** is a small, free, community-maintained installer for Python and
+`conda` (it uses the open `conda-forge` package repository by default). `conda`
+creates an isolated "environment" — a self-contained copy of Python and Chirp's
 dependencies that won't interfere with anything else on your computer. This is
 the recommended way to run Chirp because it keeps the exact Python version Chirp
 expects separate from your system.
 
-1. Download the installer for your operating system from the official page:
-   **[Miniconda download page](https://www.anaconda.com/download/success)**
-   (choose the **Miniconda** installer, not the larger Anaconda one).
+1. Download the installer for your operating system from the official releases
+   page: **[Miniforge on GitHub](https://github.com/conda-forge/miniforge#miniforge3)**
+   (pick the **Miniforge3** installer that matches your OS and CPU).
 2. Run the installer and accept the defaults.
-   - **Windows:** after it finishes, open the **"Anaconda Prompt"** from the Start
+   - **Windows:** after it finishes, open the **"Miniforge Prompt"** from the Start
      menu — this is the terminal where the commands below will work.
    - **macOS / Linux:** open a new Terminal window.
 
-A more detailed walkthrough is in Miniconda's own
-[installation guide](https://www.anaconda.com/docs/getting-started/miniconda/install).
+A more detailed walkthrough is in Miniforge's own
+[installation instructions](https://github.com/conda-forge/miniforge#install).
 
 ### Step 2 — Get Chirp and create its environment
 
-Run these commands one at a time in the Anaconda Prompt (Windows) or Terminal
+Run these commands one at a time in the Miniforge Prompt (Windows) or Terminal
 (macOS / Linux):
 
 ```bash
