@@ -87,6 +87,9 @@ class RecordingSidebarItem(QWidget):
     # Per-stream enable switch: a disabled stream keeps its full
     # configuration but is skipped by Start All Acq / Start All Rec.
     toggle_enabled = pyqtSignal(int)
+    # Per-stream parameter lock toggle (lock icon). The window handles the
+    # unlock confirmation; the item only requests the flip.
+    toggle_lock = pyqtSignal(int)
     # #28 / #29: click-to-clear sticky session flags.
     clear_sat_requested   = pyqtSignal(int)
     clear_drops_requested = pyqtSignal(int)
@@ -209,6 +212,13 @@ class RecordingSidebarItem(QWidget):
         btn_dn.clicked.connect(lambda: self.move_down.emit(self._index))
         btn_del.clicked.connect(lambda: self.delete.emit(self._index))
         self._stream_enabled = True
+        # Per-stream parameter lock toggle (lock icon).
+        self._params_locked = False
+        self._btn_lock = QPushButton('\U0001f513')   # 🔓 open padlock
+        self._btn_lock.setObjectName('btn_small')
+        self._btn_lock.setFixedSize(26, 20)
+        self._btn_lock.clicked.connect(
+            lambda: self.toggle_lock.emit(self._index))
         self._btn_enable = QPushButton('On')
         self._btn_enable.setObjectName('btn_small')
         self._btn_enable.setFixedSize(34, 20)
@@ -218,9 +228,11 @@ class RecordingSidebarItem(QWidget):
         row3.addWidget(btn_dn)
         row3.addWidget(btn_del)
         row3.addStretch()
+        row3.addWidget(self._btn_lock)
         row3.addWidget(self._btn_enable)
         vbox.addLayout(row3)
         self._apply_enabled_style()
+        self._apply_lock_style()
         self.set_color(None)  # neutral swatch until a color is assigned
 
     @property
@@ -291,6 +303,34 @@ class RecordingSidebarItem(QWidget):
             f'QPushButton {{ color: {color}; font-weight: bold; '
             f'font-size: 8pt; }}')
         self._refresh_name_style()
+
+    # ── Per-stream parameter lock ────────────────────────────────────
+
+    def set_params_locked(self, locked: bool):
+        locked = bool(locked)
+        if locked == self._params_locked:
+            return
+        self._params_locked = locked
+        self._apply_lock_style()
+
+    @property
+    def params_locked(self) -> bool:
+        return self._params_locked
+
+    def _apply_lock_style(self):
+        locked = self._params_locked
+        self._btn_lock.setText('\U0001f512' if locked else '\U0001f513')  # 🔒 / 🔓
+        self._btn_lock.setToolTip(
+            'Parameters LOCKED — editing this stream’s configuration '
+            'is disabled to prevent accidental changes. Click to unlock '
+            '(a confirmation naming the stream appears first).'
+            if locked else
+            'Parameters unlocked. Click to lock this stream’s '
+            'configuration against accidental edits (display params and '
+            'the audio monitor stay editable).')
+        color = C['peach'] if locked else C['surface2']
+        self._btn_lock.setStyleSheet(
+            f'QPushButton {{ color: {color}; font-size: 10pt; }}')
 
     def _refresh_name_style(self):
         if not self._stream_enabled:
@@ -417,6 +457,9 @@ class RecordingSidebarItem(QWidget):
         self.clicked.emit(self._index)
 
     def _start_edit(self):
+        # Renaming is a configuration change — blocked while locked.
+        if self._params_locked:
+            return
         self._editing = True
         self._name_edit.setText(self._name_label.text())
         self._name_label.hide()
@@ -457,10 +500,16 @@ class RecordingSidebar(QWidget):
     clear_errors_requested = pyqtSignal(int)
     # Per-stream enable switch (On/Off button on each item).
     toggle_enabled_requested = pyqtSignal(int)
+    # Per-stream parameter lock (lock icon on each item) + bulk lock/unlock.
+    toggle_lock_requested = pyqtSignal(int)
+    lock_all_requested    = pyqtSignal()
+    unlock_all_requested  = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedWidth(250)
+        # Minimum (not fixed) width so the enclosing splitter can widen or
+        # narrow the sidebar; 180px keeps the transport buttons legible.
+        self.setMinimumWidth(180)
         self._items: list[RecordingSidebarItem] = []
 
         vbox = QVBoxLayout(self)
@@ -509,6 +558,26 @@ class RecordingSidebar(QWidget):
         btn_add.clicked.connect(self.add_requested.emit)
         vbox.addWidget(btn_add)
 
+        # Bulk parameter lock/unlock for every stream at once.
+        lock_row = QHBoxLayout()
+        lock_row.setSpacing(4)
+        btn_lock_all   = QPushButton('\U0001f512 Lock All')
+        btn_unlock_all = QPushButton('\U0001f513 Unlock All')
+        for b in (btn_lock_all, btn_unlock_all):
+            b.setObjectName('btn_small')
+            b.setFixedHeight(24)
+            b.setStyleSheet(b.styleSheet()
+                            + 'min-width: 0px; padding: 3px 6px; font-size: 9pt;')
+        btn_lock_all.setToolTip(
+            'Lock every stream’s configuration against accidental edits.')
+        btn_unlock_all.setToolTip(
+            'Unlock every stream’s configuration (a confirmation appears first).')
+        btn_lock_all.clicked.connect(self.lock_all_requested.emit)
+        btn_unlock_all.clicked.connect(self.unlock_all_requested.emit)
+        lock_row.addWidget(btn_lock_all)
+        lock_row.addWidget(btn_unlock_all)
+        vbox.addLayout(lock_row)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -532,6 +601,7 @@ class RecordingSidebar(QWidget):
         item.clear_drops_requested.connect(self.clear_drops_requested.emit)
         item.clear_errors_requested.connect(self.clear_errors_requested.emit)
         item.toggle_enabled.connect(self.toggle_enabled_requested.emit)
+        item.toggle_lock.connect(self.toggle_lock_requested.emit)
         self._scroll_layout.insertWidget(idx, item)
         self._items.append(item)
         return idx
@@ -596,6 +666,11 @@ class RecordingSidebar(QWidget):
         """Reflect the per-stream enable switch on one item."""
         if 0 <= idx < len(self._items):
             self._items[idx].set_stream_enabled(enabled)
+
+    def set_item_params_locked(self, idx: int, locked: bool):
+        """Reflect the per-stream parameter-lock state on one item."""
+        if 0 <= idx < len(self._items):
+            self._items[idx].set_params_locked(locked)
 
     def set_item_color(self, idx: int, color: str | None):
         """Reflect the per-stream recognition color on one item."""

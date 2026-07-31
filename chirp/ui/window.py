@@ -28,7 +28,7 @@ from PyQt5.QtWidgets import (
     QGridLayout, QGroupBox, QPushButton, QLabel, QLineEdit,
     QFileDialog, QFrame, QSizePolicy, QDoubleSpinBox, QComboBox, QCheckBox,
     QScrollArea, QStackedLayout, QDialog, QCalendarWidget, QMessageBox, QSpinBox,
-    QMenu, QAction, QActionGroup, QSlider,
+    QMenu, QAction, QActionGroup, QSlider, QSplitter,
     QRadioButton, QButtonGroup, QDialogButtonBox, QColorDialog,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QSize, QDate, QPointF
@@ -395,9 +395,15 @@ class ChirpWindow(QMainWindow):
         hbox.setContentsMargins(0, 0, 0, 0)
         hbox.setSpacing(0)
 
+        # Main horizontal splitter: sidebar | right pane. The handle is a
+        # draggable border so the user can widen/narrow the sidebar.
+        self._main_splitter = QSplitter(Qt.Horizontal)
+        self._main_splitter.setChildrenCollapsible(False)
+        self._main_splitter.setHandleWidth(5)
+
         # Sidebar
         self._sidebar = RecordingSidebar()
-        hbox.addWidget(self._sidebar)
+        self._main_splitter.addWidget(self._sidebar)
 
         # Right panel (existing layout)
         right = QWidget()
@@ -411,6 +417,13 @@ class ChirpWindow(QMainWindow):
         self._monitor_bar = self._build_monitor_bar()
         vbox.addWidget(self._monitor_bar)
 
+        # Vertical splitter: plots (top) | config area (bottom). The handle
+        # is a draggable border between the display plots and the
+        # configuration panels.
+        self._plot_config_splitter = QSplitter(Qt.Vertical)
+        self._plot_config_splitter.setChildrenCollapsible(False)
+        self._plot_config_splitter.setHandleWidth(5)
+
         # Plot area inside a scroll area (scrollable in view mode). Phase 4b:
         # config mode shows the pyqtgraph ConfigPlotPanel; view mode swaps in
         # the MultiStreamGrid. The matplotlib canvas is no longer mounted.
@@ -418,38 +431,84 @@ class ChirpWindow(QMainWindow):
         self._canvas_scroll.setWidgetResizable(True)
         self._canvas_scroll.setWidget(self._config_panel)
         self._canvas_scroll.setFrameShape(QFrame.NoFrame)
-        vbox.addWidget(self._canvas_scroll, stretch=1)
+        self._plot_config_splitter.addWidget(self._canvas_scroll)
+
+        # Config area — one compact row of panels:
+        #   Controls | Trigger | Display | [Status / Output / Ref-date / Input]
+        # The last column is a vertical stack of wide horizontal panels.
+        self._config_widgets: list[QWidget] = []
+
+        controls_box = self._build_controls_box()
+        params_panel = self._build_params()
+        spec_panel   = self._build_spec_params()
+        right_stack  = self._build_config_right_stack()
+
+        config_row = QWidget()
+        config_row.setStyleSheet(f'background-color: {C["mantle"]};')
+        config_row.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        config_h = QHBoxLayout(config_row)
+        config_h.setContentsMargins(6, 2, 6, 2)
+        config_h.setSpacing(6)
+        config_h.addWidget(controls_box)
+        config_h.addWidget(params_panel)
+        config_h.addWidget(spec_panel)
+        config_h.addWidget(right_stack, stretch=1)
+
+        # Wrap the divider + row so the whole config area is one splitter
+        # child that view mode can hide/show as a unit.
+        config_container = QWidget()
+        cc_v = QVBoxLayout(config_container)
+        cc_v.setContentsMargins(0, 0, 0, 0)
+        cc_v.setSpacing(0)
+        cc_v.addWidget(self._hline())
+        cc_v.addWidget(config_row)
+        self._plot_config_splitter.addWidget(config_container)
+        self._plot_config_splitter.setStretchFactor(0, 1)  # plots grow
+        self._plot_config_splitter.setStretchFactor(1, 0)  # config keeps hint
+
+        vbox.addWidget(self._plot_config_splitter, stretch=1)
 
         # View-mode toolbar (hidden initially)
         self._view_toolbar = self._build_view_toolbar()
         vbox.addWidget(self._view_toolbar)
         self._view_toolbar.hide()
 
-        # Config panel — single compact row: Trigger | Display | Transport | Settings
-        self._config_widgets: list[QWidget] = []
+        self._config_widgets.append(config_container)
 
-        hl = self._hline()
-        params_panel = self._build_params()
-        spec_panel = self._build_spec_params()
-        transport_panel = self._build_transport()
-        settings_panel = self._build_settings()
+        self._main_splitter.addWidget(right)
+        self._main_splitter.setStretchFactor(0, 0)  # sidebar keeps width
+        self._main_splitter.setStretchFactor(1, 1)  # right pane grows
+        self._main_splitter.setSizes([250, 1200])
+        hbox.addWidget(self._main_splitter)
 
-        config_row = QWidget()
-        config_row.setStyleSheet(f'background-color: {C["mantle"]};')
-        config_row.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-        config_h = QHBoxLayout(config_row)
-        config_h.setContentsMargins(0, 0, 0, 0)
-        config_h.setSpacing(0)
-        config_h.addWidget(params_panel)
-        config_h.addWidget(spec_panel)
-        config_h.addWidget(transport_panel)
-        config_h.addWidget(settings_panel, stretch=1)
+        self._collect_lockable_widgets()
 
-        vbox.addWidget(hl)
-        vbox.addWidget(config_row)
-        self._config_widgets.extend([hl, config_row])
-
-        hbox.addWidget(right, stretch=1)
+    def _collect_lockable_widgets(self) -> None:
+        """Gather every per-stream *configuration* control that the
+        parameter lock disables. Deliberately EXCLUDES display params
+        (DISPLAY panel), the audio monitor bar, and transport actions —
+        those stay usable while a stream is locked."""
+        self._lockable_widgets = [
+            # Trigger params
+            self._sb_thr, self._sb_mc, self._sb_min_total, self._sb_hold,
+            self._sb_pre, self._sb_post_trig, self._sb_maxr,
+            self._chk_freq, self._sb_freq_lo, self._sb_freq_hi,
+            self._combo_detect_mode, self._sb_entropy_thr, self._sb_entropy_mc,
+            self._combo_rec_mode,
+            self._btn_calibrate, self._sb_calib_dur, self._sb_calib_margin,
+            # Output
+            self._folder_edit, self._btn_browse_out,
+            self._prefix_edit, self._suffix_edit,
+            # Reference date
+            self._chk_ref_date, self._date_line, self._btn_pick_date,
+            self._dph_prefix_edit,
+            # Input device
+            self._device_combo, self._btn_dev_refresh,
+            self._chan_combo, self._trig_combo, self._sr_combo,
+            self._btn_wav_reset, self._chk_wav_loop,
+            # Per-stream extras that also change persisted config
+            self._btn_stream_color, self._btn_reset,
+        ]
 
     def _build_view_toolbar(self) -> QWidget:
         """Thin toolbar shown only in view mode: Config button + layout controls."""
@@ -1008,16 +1067,10 @@ class ChirpWindow(QMainWindow):
 
     # ── Transport ─────────────────────────────────────────────────────────
 
-    def _build_transport(self) -> QWidget:
-        w = QWidget()
-        w.setStyleSheet(f'background-color: {C["mantle"]};')
-        w.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Maximum)
-        outer = QHBoxLayout(w)
-        outer.setContentsMargins(6, 2, 6, 2)
-        outer.setSpacing(6)
-
+    def _build_controls_box(self) -> QGroupBox:
         # Left column: buttons grid
         btn_box = QGroupBox('CONTROLS')
+        btn_box.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Maximum)
         btn_g = QGridLayout(btn_box)
         btn_g.setSpacing(4)
         btn_g.setContentsMargins(8, 4, 8, 4)
@@ -1107,12 +1160,18 @@ class ChirpWindow(QMainWindow):
         btn_g.addWidget(self._btn_reset,     4, 1)
         btn_g.addWidget(self._btn_startup,   5, 0, 1, 2)
         btn_g.addWidget(self._btn_view_mode, 6, 0, 1, 2)
+        return btn_box
 
-        # Right column: status labels
+    def _build_status_box(self) -> QGroupBox:
+        """STATUS panel — a single wide horizontal strip: the four status
+        readouts, then the parameter-lock toggle and the recognition-color
+        swatch for the selected stream."""
         status_box = QGroupBox('STATUS')
-        status_v   = QVBoxLayout(status_box)
-        status_v.setSpacing(2)
-        status_v.setContentsMargins(8, 4, 8, 4)
+        status_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        grid = QGridLayout(status_box)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(3)
+        grid.setContentsMargins(8, 4, 8, 4)
         self._lbl_acq_status  = QLabel('ACQ  \u25cf  STOPPED')
         self._lbl_rec_status  = QLabel('REC  \u25cf  STOPPED')
         self._lbl_trig_status = QLabel('TRIG \u25cf  IDLE')
@@ -1138,23 +1197,44 @@ class ChirpWindow(QMainWindow):
         for lbl in (self._lbl_acq_status, self._lbl_rec_status, self._lbl_trig_status,
                      self._lbl_entropy):
             lbl.setFont(mono)
-            lbl.setMinimumWidth(reserve)
+            # A small floor (not the full reserve) so the four readouts
+            # still fit when the right-hand column is narrow; the grid
+            # never lets adjacent cells overlap, it clips instead.
+            lbl.setMinimumWidth(min(reserve, 96))
             lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        status_v.addWidget(self._lbl_acq_status)
-        status_v.addWidget(self._lbl_rec_status)
-        status_v.addWidget(self._lbl_trig_status)
-        status_v.addWidget(self._lbl_entropy)
+        # Two rows × two columns of readouts so they fit even in a narrow
+        # column (a single row overlapped them on a laptop-width screen).
+        # Lock + color live in a third column on the right.
+        grid.addWidget(self._lbl_acq_status,  0, 0)
+        grid.addWidget(self._lbl_rec_status,  0, 1)
+        grid.addWidget(self._lbl_trig_status, 1, 0)
+        grid.addWidget(self._lbl_entropy,     1, 1)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
 
-        # Per-stream recognition color picker — a labeled swatch button.
-        # The chosen color frames this stream's config panel + view tile
-        # and tints its sidebar left edge.
+        # Per-stream parameter-lock toggle (mirrors the sidebar lock icon).
+        self._btn_lock_cfg = QPushButton('\U0001f513 Unlocked')
+        self._btn_lock_cfg.setObjectName('btn_small')
+        self._btn_lock_cfg.setCursor(Qt.PointingHandCursor)
+        self._btn_lock_cfg.setToolTip(
+            'Lock this stream’s configuration against accidental edits '
+            '(display params and the audio monitor stay editable). '
+            'Unlocking asks for confirmation and names the stream.')
+        self._btn_lock_cfg.clicked.connect(
+            lambda: self._on_toggle_lock(self._selected_idx))
+        grid.addWidget(self._btn_lock_cfg, 0, 2)
+
+        # Per-stream recognition color picker — a small labeled swatch
+        # button. The chosen color frames this stream's config panel + view
+        # tile and tints its sidebar left edge.
         color_row = QHBoxLayout()
-        color_row.setSpacing(6)
+        color_row.setSpacing(4)
+        color_row.setContentsMargins(0, 0, 0, 0)
         lbl_color = QLabel('Color')
         lbl_color.setFont(mono)
         lbl_color.setStyleSheet(f'color: {C["subtext"]};')
         self._btn_stream_color = QPushButton()
-        self._btn_stream_color.setFixedSize(28, 20)
+        self._btn_stream_color.setFixedSize(18, 14)
         self._btn_stream_color.setCursor(Qt.PointingHandCursor)
         self._btn_stream_color.setToolTip(
             'Choose a recognition color for the selected stream — frames '
@@ -1165,7 +1245,7 @@ class ChirpWindow(QMainWindow):
         color_row.addWidget(lbl_color)
         color_row.addWidget(self._btn_stream_color)
         color_row.addStretch()
-        status_v.addLayout(color_row)
+        grid.addLayout(color_row, 1, 2)
         self._blink_counter = 0
         # #58: ``_update_plot`` exception bookkeeping. The Qt-timer
         # slot used to swallow exceptions silently — Qt logs the
@@ -1179,10 +1259,7 @@ class ChirpWindow(QMainWindow):
         self._update_plot_err_total        = 0  # session-wide
         self._update_plot_last_err: str | None = None
         self._update_plot_freeze_threshold = 5  # ticks before sticky note
-
-        outer.addWidget(btn_box)
-        outer.addWidget(status_box)
-        return w
+        return status_box
 
     # ── Trigger Parameters ────────────────────────────────────────────────
 
@@ -1510,18 +1587,21 @@ class ChirpWindow(QMainWindow):
         self._sb_disp_freq_hi.setFixedWidth(90)
         self._sb_disp_freq_hi.setToolTip('Highest frequency shown in the spectrogram (Hz)')
 
-        grid.addWidget(lbl_fft,            0, 3)
-        grid.addWidget(self._combo_fft,    0, 4)
-        grid.addWidget(lbl_win,            1, 3)
-        grid.addWidget(self._combo_win,    1, 4)
-        grid.addWidget(lbl_fscale,         2, 3)
-        grid.addWidget(self._combo_fscale, 2, 4)
-        grid.addWidget(lbl_dfl,            3, 3)
-        grid.addWidget(self._sb_disp_freq_lo,  3, 4)
-        grid.addWidget(lbl_dfh,            4, 3)
-        grid.addWidget(self._sb_disp_freq_hi,  4, 4)
-        grid.addWidget(lbl_buf,            5, 3)
-        grid.addWidget(self._buf_combo,    5, 4)
+        # Single-column stack (label | control) to keep the DISPLAY panel
+        # narrow — gain/floor/ceil occupy rows 0–2 (added via _param_row
+        # at col 0), the rest continue down the same column.
+        grid.addWidget(lbl_fft,            3, 0)
+        grid.addWidget(self._combo_fft,    3, 1)
+        grid.addWidget(lbl_win,            4, 0)
+        grid.addWidget(self._combo_win,    4, 1)
+        grid.addWidget(lbl_fscale,         5, 0)
+        grid.addWidget(self._combo_fscale, 5, 1)
+        grid.addWidget(lbl_dfl,            6, 0)
+        grid.addWidget(self._sb_disp_freq_lo,  6, 1)
+        grid.addWidget(lbl_dfh,            7, 0)
+        grid.addWidget(self._sb_disp_freq_hi,  7, 1)
+        grid.addWidget(lbl_buf,            8, 0)
+        grid.addWidget(self._buf_combo,    8, 1)
 
         lbl_dmode = QLabel('View')
         lbl_dmode.setObjectName('param_label')
@@ -1531,8 +1611,8 @@ class ChirpWindow(QMainWindow):
         self._combo_display_mode.setCurrentText('Spectrogram')
         self._combo_display_mode.setFixedWidth(90)
         self._combo_display_mode.setToolTip('Visualization mode — Spectrogram, raw Waveform, or Both')
-        grid.addWidget(lbl_dmode,                  6, 3)
-        grid.addWidget(self._combo_display_mode,   6, 4)
+        grid.addWidget(lbl_dmode,                  9, 0)
+        grid.addWidget(self._combo_display_mode,   9, 1)
 
         outer.addWidget(box)
         return w
@@ -1559,13 +1639,18 @@ class ChirpWindow(QMainWindow):
 
     # ── Settings ──────────────────────────────────────────────────────────
 
-    def _build_settings(self) -> QWidget:
+    def _build_config_right_stack(self) -> QWidget:
+        """Right-hand column of the config row: STATUS, OUTPUT, REFERENCE
+        DATE and INPUT DEVICE stacked vertically as wide horizontal
+        panels."""
         w = QWidget()
         w.setStyleSheet(f'background-color: {C["mantle"]};')
         w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         outer = QVBoxLayout(w)
-        outer.setContentsMargins(6, 2, 6, 2)
-        outer.setSpacing(2)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+
+        status_box = self._build_status_box()
 
         output_box = QGroupBox('OUTPUT')
         output_g   = QGridLayout(output_box)
@@ -1577,7 +1662,8 @@ class ChirpWindow(QMainWindow):
         self._folder_edit = QLineEdit(RECORDINGS_DIR)
         self._folder_edit.setPlaceholderText('Path to recordings folder...')
         self._folder_edit.setToolTip('Output folder where triggered WAV files are saved')
-        btn_browse = QPushButton('Browse...')
+        self._btn_browse_out = QPushButton('Browse...')
+        btn_browse = self._btn_browse_out
         btn_browse.setObjectName('btn_browse')
         # QSS min-width would defeat the fixed width — clear it.
         btn_browse.setStyleSheet('min-width: 0px; padding: 6px 6px;')
@@ -1623,7 +1709,8 @@ class ChirpWindow(QMainWindow):
         self._device_combo.setMinimumContentsLength(16)
         self._device_combo.setToolTip('Audio input device used by this recording')
         self._populate_device_combo()
-        btn_refresh = QPushButton('Refresh')
+        self._btn_dev_refresh = QPushButton('Refresh')
+        btn_refresh = self._btn_dev_refresh
         btn_refresh.setObjectName('btn_browse')
         # QSS min-width would defeat the fixed width — clear it.
         btn_refresh.setStyleSheet('min-width: 0px; padding: 6px 6px;')
@@ -1711,9 +1798,9 @@ class ChirpWindow(QMainWindow):
         device_v.addLayout(self._wav_ctrl_row)
 
         ref_box = QGroupBox('REFERENCE DATE')
-        ref_g   = QGridLayout(ref_box)
-        ref_g.setVerticalSpacing(4)
-        ref_g.setHorizontalSpacing(6)
+        ref_h   = QHBoxLayout(ref_box)
+        ref_h.setSpacing(8)
+        ref_h.setContentsMargins(8, 4, 8, 4)
         self._chk_ref_date = QCheckBox('Days post hatch')
         self._chk_ref_date.setToolTip('When enabled, saved files are organized into day-post-hatch subfolders')
         self._date_line = QLineEdit(datetime.date.today().strftime('%Y-%m-%d'))
@@ -1731,27 +1818,23 @@ class ChirpWindow(QMainWindow):
         self._dph_prefix_edit = QLineEdit()
         self._dph_prefix_edit.setPlaceholderText('e.g. day_')
         self._dph_prefix_edit.setToolTip('Optional prefix added to the day-post-hatch subfolder name')
-        date_row = QHBoxLayout()
-        date_row.setSpacing(4)
-        date_row.addWidget(self._date_line)
-        date_row.addWidget(self._btn_pick_date)
-        date_row.addWidget(self._lbl_day_count)
-        date_row.addStretch()
-        pfx_row = QHBoxLayout()
-        pfx_row.setSpacing(4)
-        pfx_row.addWidget(lbl_dph_pfx)
-        pfx_row.addWidget(self._dph_prefix_edit)
-        ref_g.addWidget(self._chk_ref_date,  0, 0)
-        ref_g.addLayout(date_row,            1, 0)
-        ref_g.addLayout(pfx_row,             2, 0)
+        ref_h.addWidget(self._chk_ref_date)
+        ref_h.addSpacing(8)
+        ref_h.addWidget(self._date_line)
+        ref_h.addWidget(self._btn_pick_date)
+        ref_h.addWidget(self._lbl_day_count)
+        ref_h.addSpacing(14)
+        ref_h.addWidget(lbl_dph_pfx)
+        ref_h.addWidget(self._dph_prefix_edit)
+        ref_h.addStretch()
 
-        # Top row: Output + Ref Date side by side
-        top_row = QHBoxLayout()
-        top_row.setSpacing(6)
-        top_row.addWidget(output_box, stretch=3)
-        top_row.addWidget(ref_box, stretch=1)
-        outer.addLayout(top_row)
+        # Stack the four panels vertically; each spans the column width in
+        # the (stretched) right-hand column of the config row.
+        outer.addWidget(status_box)
+        outer.addWidget(output_box)
+        outer.addWidget(ref_box)
         outer.addWidget(device_box)
+        outer.addStretch()
         return w
 
     # ──────────────────────────────────────────────────────────────────────
@@ -1852,6 +1935,10 @@ class ChirpWindow(QMainWindow):
         # Per-stream enable switch.
         self._sidebar.toggle_enabled_requested.connect(
             self._on_toggle_stream_enabled)
+        # Per-stream parameter lock (icon on each item) + bulk lock/unlock.
+        self._sidebar.toggle_lock_requested.connect(self._on_toggle_lock)
+        self._sidebar.lock_all_requested.connect(self._on_lock_all)
+        self._sidebar.unlock_all_requested.connect(self._on_unlock_all)
 
     # ──────────────────────────────────────────────────────────────────────
     # Write-through: widgets → selected entity
@@ -2106,6 +2193,12 @@ class ChirpWindow(QMainWindow):
         if e is not None:
             self._refresh_stream_color_ui(e)
 
+        # Reflect this stream's parameter-lock state on the config-area
+        # controls (disable lockable widgets, update the lock toggle,
+        # freeze the threshold lines). Done last so it overrides the
+        # enabled-state the widget population above may have set.
+        self._apply_lock_ui(e)
+
     # ──────────────────────────────────────────────────────────────────────
     # Selection switching
     # ──────────────────────────────────────────────────────────────────────
@@ -2188,7 +2281,8 @@ class ChirpWindow(QMainWindow):
         btn = getattr(self, '_btn_stream_color', None)
         if btn is not None:
             btn.setStyleSheet(
-                f'QPushButton {{ background-color: {col}; '
+                f'QPushButton {{ background-color: {col}; min-width: 0px; '
+                f'min-height: 0px; padding: 0px; '
                 f'border: 1px solid {C["surface1"]}; border-radius: 3px; }}'
                 f'QPushButton:hover {{ border: 1px solid {C["text"]}; }}')
         panel = getattr(self, '_config_panel', None)
@@ -2359,6 +2453,95 @@ class ChirpWindow(QMainWindow):
         self._sidebar.set_item_stream_enabled(idx, e.stream_enabled)
         self._refresh_transport_ui()
         self._mark_dirty()
+
+    # ── Per-stream parameter lock ─────────────────────────────────────────
+
+    def _apply_lock_ui(self, e) -> None:
+        """Reflect entity ``e``'s lock state on the config-area controls:
+        disable the lockable widgets, update the STATUS lock toggle, and
+        freeze the draggable threshold lines. Display params, the monitor
+        bar and transport buttons are intentionally left untouched."""
+        locked = bool(getattr(e, 'params_locked', False)) if e is not None else False
+        for wdg in getattr(self, '_lockable_widgets', ()):
+            wdg.setEnabled(not locked)
+        # The stereo trigger combo is only meaningful in Stereo mode; keep
+        # that gating even when unlocking (don't force-enable it).
+        if not locked and e is not None:
+            self._trig_combo.setEnabled(e.channel_mode == 'Stereo')
+        btn = getattr(self, '_btn_lock_cfg', None)
+        if btn is not None:
+            btn.setText('\U0001f512 Locked' if locked else '\U0001f513 Unlocked')
+            btn.setStyleSheet(
+                f'QPushButton {{ color: {C["peach"] if locked else C["subtext"]}; '
+                f'font-weight: bold; }}')
+        panel = getattr(self, '_config_panel', None)
+        if panel is not None:
+            panel.set_threshold_locked(locked)
+
+    def _on_toggle_lock(self, idx: int) -> None:
+        """Toggle one stream's parameter lock. Unlocking is confirmed with
+        a dialog naming the stream so a stream locked by one user isn't
+        unlocked by another by mistake."""
+        if not (0 <= idx < len(self._entities)):
+            return
+        e = self._entities[idx]
+        if e.params_locked:
+            if not self._confirm_unlock([e]):
+                return
+            e.params_locked = False
+        else:
+            e.params_locked = True
+        self._sidebar.set_item_params_locked(idx, e.params_locked)
+        if idx == self._selected_idx:
+            self._apply_lock_ui(e)
+        self._mark_dirty()
+
+    def _on_lock_all(self) -> None:
+        """Lock every stream's configuration."""
+        if not self._entities:
+            return
+        for i, e in enumerate(self._entities):
+            e.params_locked = True
+            self._sidebar.set_item_params_locked(i, True)
+        if self._sel is not None:
+            self._apply_lock_ui(self._sel)
+        self._mark_dirty()
+
+    def _on_unlock_all(self) -> None:
+        """Unlock every currently-locked stream, after one confirmation
+        that names them."""
+        locked = [e for e in self._entities if e.params_locked]
+        if not locked:
+            return
+        if not self._confirm_unlock(locked):
+            return
+        for i, e in enumerate(self._entities):
+            if e.params_locked:
+                e.params_locked = False
+                self._sidebar.set_item_params_locked(i, False)
+        if self._sel is not None:
+            self._apply_lock_ui(self._sel)
+        self._mark_dirty()
+
+    def _confirm_unlock(self, entities: list) -> bool:
+        """Confirmation dialog for unlocking one or more streams. Names
+        the stream(s) so the user can be sure they're unlocking the right
+        one. Returns True if the user confirmed."""
+        names = ', '.join(f'“{e.name}”' for e in entities)
+        if len(entities) == 1:
+            msg = (f'Unlock the parameters for stream {names}?\n\n'
+                   'Its configuration will become editable again.')
+        else:
+            msg = (f'Unlock the parameters for these {len(entities)} '
+                   f'streams?\n\n{names}\n\n'
+                   'Their configuration will become editable again.')
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle('Confirm unlock')
+        box.setText(msg)
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.No)
+        return box.exec_() == QMessageBox.Yes
 
     def _on_reset_params(self):
         e = self._sel
@@ -2666,6 +2849,7 @@ class ChirpWindow(QMainWindow):
             self._entities.append(ent)
             idx = self._sidebar.add_item(ent.name)
             self._sidebar.set_item_stream_enabled(idx, ent.stream_enabled)
+            self._sidebar.set_item_params_locked(idx, ent.params_locked)
         # Assign default colors to any stream that lacks one and push
         # every color to its sidebar item.
         self._sync_stream_colors()

@@ -148,6 +148,15 @@ class RecordingEntity:
         # buttons still work for deliberate one-off use. Persisted.
         self.stream_enabled = True
 
+        # Per-stream parameter lock: when True the UI disables editing of
+        # this stream's configuration (trigger, band filter, spectral
+        # trigger, output, reference date, input device) to prevent
+        # accidental changes. Display params and the audio monitor stay
+        # editable, and transport (start/stop acq/rec) still works.
+        # Unlocking is guarded by a confirmation naming the stream, so one
+        # user can't silently unlock another's stream. Persisted.
+        self.params_locked = False
+
         # Recognition color — a per-stream accent shown wherever the
         # stream appears (sidebar item, view-mode tile header). Empty
         # means "unassigned"; the UI fills it from the default palette by
@@ -1798,6 +1807,7 @@ class RecordingEntity:
             'wav_file_path':       self.wav_file_path,
             'wav_loop':            self.wav_loop,
             'stream_enabled':      self.stream_enabled,
+            'params_locked':       self.params_locked,
             'color':               self.color,
         }
 
@@ -1829,7 +1839,7 @@ class RecordingEntity:
                      'entropy_min_cross_sec', 'rec_mode',
                      'display_mode',
                      'input_source', 'wav_file_path', 'wav_loop',
-                     'stream_enabled', 'color'):
+                     'stream_enabled', 'params_locked', 'color'):
             if attr in d:
                 setattr(e, attr, d[attr])
 

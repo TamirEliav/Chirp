@@ -84,3 +84,31 @@ def test_config_panel_threshold_signals():
         assert got and abs(got[-1] - 0.42) < 1e-6
     finally:
         e.close()
+
+
+def test_config_panel_threshold_lock_freezes_lines():
+    """set_threshold_locked freezes both draggable threshold lines, and
+    the frozen state survives a later rebuild (locked stream stays
+    non-editable when its panel is rebuilt on selection)."""
+    _app()
+    panel = ConfigPlotPanel(use_opengl=False)
+    e = RecordingEntity(name='cfglock', device_id=None)
+    try:
+        e.spectral_trigger_mode = 'Amp AND Spectral'  # adds the entropy line
+        panel.rebuild(e)
+        assert panel._thr_line.movable is True
+        assert panel._spec_thr_line.movable is True
+        # Lock → both lines frozen.
+        panel.set_threshold_locked(True)
+        assert panel._thr_line.movable is False
+        assert panel._spec_thr_line.movable is False
+        # A rebuild (e.g. on re-selecting the stream) keeps them frozen.
+        panel.rebuild(e)
+        assert panel._thr_line.movable is False
+        assert panel._spec_thr_line.movable is False
+        # Unlock restores dragging.
+        panel.set_threshold_locked(False)
+        assert panel._thr_line.movable is True
+        assert panel._spec_thr_line.movable is True
+    finally:
+        e.close()

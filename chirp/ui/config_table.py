@@ -84,6 +84,17 @@ _ROWS: list = [
 _TRUE = {'1', 'true', 'yes', 'on'}
 _FALSE = {'0', 'false', 'no', 'off'}
 
+# Keys that stay editable even when a stream's params are locked: the
+# display group + the operational enable switch. Everything else in a
+# locked stream's column is shown read-only. Mirrors the main-window lock
+# (display params and transport are never locked).
+_LOCK_EXEMPT_KEYS: frozenset = frozenset({
+    'stream_enabled',
+    'display_mode', 'display_seconds', 'freq_scale', 'spec_nperseg',
+    'spec_window', 'gain_db', 'db_floor', 'db_ceil',
+    'display_freq_lo', 'display_freq_hi', 'amp_scale',
+})
+
 
 def _fmt(val) -> str:
     if isinstance(val, bool):
@@ -166,10 +177,16 @@ class ConfigTableDialog(QDialog):
                     else:
                         val = getattr(e, key, '')
                     item = QTableWidgetItem(_fmt(val))
-                    if kind == 'readonly':
+                    locked_cell = (getattr(e, 'params_locked', False)
+                                   and key not in _LOCK_EXEMPT_KEYS)
+                    if kind == 'readonly' or locked_cell:
                         item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
                         item.setForeground(Qt.gray)
-                    if kind == 'choice' and extra:
+                    if locked_cell:
+                        item.setToolTip(
+                            f'“{e.name}” is locked — unlock the stream to '
+                            'edit this parameter.')
+                    elif kind == 'choice' and extra:
                         item.setToolTip('One of: ' + ', '.join(extra))
                     elif kind == 'bool':
                         item.setToolTip('true / false')
@@ -186,6 +203,11 @@ class ConfigTableDialog(QDialog):
         if key is None or kind == 'readonly':
             return
         if not (0 <= col < len(self._win._entities)):
+            return
+        # Locked streams: only display/enable params are editable.
+        e = self._win._entities[col]
+        if getattr(e, 'params_locked', False) and key not in _LOCK_EXEMPT_KEYS:
+            self._revert_cell(row, col, key)
             return
         item = self._table.item(row, col)
         text = (item.text() or '').strip()

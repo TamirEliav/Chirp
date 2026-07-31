@@ -96,6 +96,8 @@ _KNOWN_RECORDING_KEYS: frozenset[str] = frozenset({
     "input_source", "wav_file_path", "wav_loop",
     # v3.6.1 additions — per-stream recognition color.
     "color",
+    # v3.8.0 additions — per-stream parameter lock.
+    "params_locked",
 })
 
 _KNOWN_VIEW_MODE_KEYS: frozenset[str] = frozenset({

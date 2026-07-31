@@ -113,6 +113,8 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
         self._amp_scale = 'log'
         self._suppress = False       # guard drag-vs-programmatic set
         self._suppress_spec = False
+        # When True the threshold lines are frozen (stream params locked).
+        self._locked = False
         # Row references (set in rebuild).
         self._plots: list = []
         self._img = self._img_r = None
@@ -266,7 +268,7 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
         else:
             amp_p.setYRange(0.0, getattr(e, 'amp_ylim', 1.05), padding=0)
         self._thr_line = pg.InfiniteLine(
-            angle=0, movable=True,
+            angle=0, movable=not self._locked,
             pen=pg.mkPen(C['mauve'], width=2, style=pg.QtCore.Qt.DashLine))
         self._thr_line.setValue(_thr_to_display(e.threshold, self._amp_scale))
         self._thr_line.sigPositionChanged.connect(self._on_thr_dragged)
@@ -278,7 +280,7 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
             ent_p.setYRange(0.0, 1.0, padding=0)
             self._entropy = ent_p.plot(pen=pg.mkPen(C['peach'], width=1))
             self._spec_thr_line = pg.InfiniteLine(
-                angle=0, movable=True,
+                angle=0, movable=not self._locked,
                 pen=pg.mkPen(C['peach'], width=2, style=pg.QtCore.Qt.DashLine))
             self._spec_thr_line.setValue(e.spectral_threshold)
             self._spec_thr_line.sigPositionChanged.connect(
@@ -347,6 +349,16 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
             self._spec_thr_line.setValue(float(val))
         finally:
             self._suppress_spec = False
+
+    def set_threshold_locked(self, locked: bool) -> None:
+        """Freeze/unfreeze the draggable amplitude + entropy threshold
+        lines. The flag is remembered so lines recreated by a later
+        rebuild come back frozen when the stream is locked."""
+        self._locked = bool(locked)
+        if self._thr_line is not None:
+            self._thr_line.setMovable(not self._locked)
+        if self._spec_thr_line is not None:
+            self._spec_thr_line.setMovable(not self._locked)
 
     # ── Per-tick update ───────────────────────────────────────────────
     def _t_axis(self, n: int, disp: float) -> np.ndarray:

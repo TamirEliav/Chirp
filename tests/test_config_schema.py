@@ -216,6 +216,47 @@ def test_stream_enabled_roundtrip_and_default():
         e.close()
 
 
+def test_params_locked_roundtrip_and_default():
+    """Per-stream parameter lock: defaults False (older files omit the
+    key), serializes, survives a to_dict/from_dict round-trip, and is a
+    recognized schema key (no unknown-key warning)."""
+    e = RecordingEntity(name='pl', device_id=None)
+    try:
+        assert e.params_locked is False
+        e.params_locked = True
+        d = e.to_dict()
+        assert d['params_locked'] is True
+        e2, _warn = RecordingEntity.from_dict(d)
+        try:
+            assert e2.params_locked is True
+        finally:
+            e2.close()
+        # Legacy dict without the key → default False.
+        d.pop('params_locked')
+        e3, _warn = RecordingEntity.from_dict(d)
+        try:
+            assert e3.params_locked is False
+        finally:
+            e3.close()
+    finally:
+        e.close()
+
+    # A locked stream survives a full build → json → load trip with no
+    # unknown-key warning (the key is registered in the schema).
+    e = RecordingEntity(name='pl2', device_id=None)
+    try:
+        e.params_locked = True
+        data = build_settings_dict([e])
+        entities, _vm, _mon, warnings = load_settings_dict(
+            json.loads(json.dumps(data)))
+        assert entities[0].params_locked is True
+        assert not any('params_locked' in w for w in warnings)
+        for r in entities:
+            r.close()
+    finally:
+        e.close()
+
+
 def test_color_roundtrip_and_default():
     """Per-stream recognition color: defaults empty, serializes, and
     survives a to_dict/from_dict round-trip."""

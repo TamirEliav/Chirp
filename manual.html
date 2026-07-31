@@ -469,10 +469,26 @@ python chirp.py</code></pre>
       per-stream Start buttons still work for deliberate one-off use, and Stop All always stops
       every stream. The switch is persisted in the config file and also editable in the
       All-Streams Table ("Enabled" row).</li>
+    <li><strong>Lock switch (&#128274;)</strong> &mdash; per-stream <em>parameter lock</em>. Locking
+      freezes the stream's configuration (trigger parameters, band filter, spectral trigger, output
+      folder/prefix/suffix, reference date, input device, recognition color, Reset, and inline
+      rename) so it can't be changed by accident. <em>Display parameters, the audio monitor, and
+      Start/Stop still work while locked</em> &mdash; the lock protects settings, not operation.
+      The same state is shown by a lock button in the Config <a href="#transport-bar">Status area</a>.
+      <strong>Unlocking asks for confirmation and names the stream</strong>, so in a shared setup one
+      person can't unlock another's stream by mistake. The sidebar also has
+      <strong>Lock&nbsp;All</strong> / <strong>Unlock&nbsp;All</strong> buttons (Unlock All confirms
+      once and lists the affected streams). In the All-Streams Table a locked stream's protected
+      cells are greyed read-only. The lock is persisted in the config file.</li>
   </ul>
   <p>
     Click <strong>Add Recording</strong> at the bottom of the sidebar to create a new stream.
     Right-click the sidebar background for <em>Start All</em> and <em>Stop All</em> context actions.
+  </p>
+  <p>
+    <strong>Adjustable layout:</strong> the border between the sidebar and the main pane, and the
+    border between the display plots and the configuration panels, are <em>draggable splitters</em>
+    &mdash; drag either to give more room to the sidebar, the plots, or the config controls.
   </p>
 
   <h3 id="canvas">Canvas (Center)</h3>
@@ -1062,7 +1078,9 @@ python chirp.py</code></pre>
     immediately, exactly as if you had edited it in the per-stream panel. Choice-valued rows list
     their allowed values in the tooltip; invalid input reverts. Structural parameters (device,
     sample rate, channel mode, input source) are shown read-only — change those from the Settings
-    panel. This replaces the live-sync checkboxes from earlier versions.
+    panel. A <a href="#sidebar-panel">locked</a> stream's protected cells are also greyed read-only (its
+    display params and Enabled switch stay editable). This replaces the live-sync checkboxes from
+    earlier versions.
   </p>
   <h3 id="monitor-controls">Audio Monitor Controls</h3>
   <p>

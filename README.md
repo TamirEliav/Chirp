@@ -34,6 +34,8 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - Independent configuration per stream (device, sample rate, threshold, filters)
 - Start/stop acquisition and recording individually or all at once
 - Sidebar with live status indicators and mini-amplitude previews
+- **Parameter lock** (per stream, or Lock All / Unlock All) — a 🔒 toggle freezes a stream's configuration against accidental edits; display params, the audio monitor, and start/stop still work, and unlocking asks for confirmation naming the stream so one user can't unlock another's by mistake
+- **Adjustable layout** — drag the borders between the sidebar and the main pane, and between the display plots and the configuration panels
 
 ### Real-Time Visualization
 - **Efficient real-time rendering** via pyqtgraph with an OpenGL-composited viewport (both Config and View modes) — cheap per-frame image blits (no full-figure re-raster), auto-downsampled curves, off-screen tile culling, and an adaptive frame rate keep many streams cheap
