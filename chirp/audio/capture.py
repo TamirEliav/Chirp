@@ -58,6 +58,18 @@ class AudioCapture:
         self.os_drop_count        = 0      # transient per-tick
         self.os_drop_count_total  = 0      # session-wide monotonic
         self.has_ever_os_dropped  = False
+        # Zero-insertion detection: PortAudio's ``input_underflow``
+        # status flag means zero samples were INSERTED into ``indata``
+        # to compensate for missing capture data (portaudio.h, fixed
+        # blocksize: "one or more zero samples have been inserted").
+        # Distinct from ``input_overflow`` (data discarded): underflow
+        # corrupts the audio *content* with silent zero runs that flow
+        # into the spectrogram, the monitor, and every recorded WAV.
+        # Previously ignored entirely — periodic zero runs in long
+        # triggered recordings were invisible to every badge and log.
+        self.underflow_count       = 0     # transient per-tick
+        self.underflow_count_total = 0     # session-wide monotonic
+        self.has_ever_underflowed  = False
         # #48: stream-open failure reason. The constructor used to
         # swallow the exception with a print() call — in a GUI build
         # nothing reaches the user. Callers can now check ``valid`` and
@@ -91,6 +103,32 @@ class AudioCapture:
             _err_log('open', self._name,
                      f'failed to open device {device}: '
                      f'{type(exc).__name__}: {exc}')
+        # Hidden sample-rate-conversion warning: in WASAPI shared mode
+        # the OS engine runs the endpoint at its configured default
+        # format; a mismatched stream rate inserts an OS resampler
+        # between the driver and our callback. That resampler smears
+        # driver-level zero-filled glitch packets to non-obvious run
+        # lengths and can swallow the discontinuity flags that would
+        # otherwise light the `!` badge. Logged once per open so the
+        # correlation with zero-run corruption is visible in the log.
+        if self._stream is not None:
+            try:
+                dev = device
+                if dev is None:
+                    dev = sd.default.device[0]
+                info = sd.query_devices(dev)
+                dev_sr = float(info.get('default_samplerate') or 0.0)
+                if dev_sr > 0 and abs(dev_sr - float(samplerate)) > 0.5:
+                    msg = (f'stream rate {samplerate} Hz != device default '
+                           f'{dev_sr:.0f} Hz — the OS is resampling this '
+                           f'capture (WASAPI shared). Driver glitches may '
+                           f'surface as smeared zero-sample runs. Match the '
+                           f"endpoint's default format to the stream rate "
+                           f'(Sound Control Panel → Recording → Advanced).')
+                    print(f'[AudioCapture] {self._name or dev}: {msg}')
+                    _err_log('open', self._name, msg)
+            except Exception:
+                pass
 
     def set_monitor(self, monitor, source_id, channel=None) -> None:
         """Wire the shared audio monitor. Safe to call at any time.
@@ -123,13 +161,22 @@ class AudioCapture:
         # our queue. A separate failure mode from our own queue.Full.
         if status is not None:
             try:
-                overflow = bool(getattr(status, 'input_overflow', False))
+                overflow  = bool(getattr(status, 'input_overflow', False))
+                underflow = bool(getattr(status, 'input_underflow', False))
             except Exception:
-                overflow = False
+                overflow = underflow = False
             if overflow:
                 self.os_drop_count       += 1
                 self.os_drop_count_total += 1
                 self.has_ever_os_dropped  = True
+            # ``input_underflow``: PortAudio inserted zero samples into
+            # this buffer (missing capture data zero-filled in place).
+            # Counter increments only — logging happens off the
+            # realtime path in ``consume_underflow_count``.
+            if underflow:
+                self.underflow_count       += 1
+                self.underflow_count_total += 1
+                self.has_ever_underflowed   = True
         # Feed the monitor first — it's the lowest-latency path and
         # doesn't care whether the DSP ring is full.
         mon = self._monitor
@@ -211,15 +258,36 @@ class AudioCapture:
                      f'(cumulative={self.os_drop_count_total})')
         return n
 
+    def consume_underflow_count(self) -> int:
+        """Return and clear the transient input-underflow counter.
+        Polled once per UI tick alongside ``consume_os_drop_count``.
+        Does NOT touch the sticky session stats. Emits a throttled log
+        line here (off the realtime callback) when new underflows
+        appeared — each flagged buffer contained zero samples PortAudio
+        inserted to cover missing capture data, i.e. silent zero runs
+        are being recorded into the audio content itself.
+        """
+        n = self.underflow_count
+        self.underflow_count = 0
+        if n:
+            _err_log('underflow', self._name,
+                     f'PortAudio input_underflow x{n} — zero samples '
+                     f'inserted into captured audio '
+                     f'(cumulative={self.underflow_count_total})')
+        return n
+
     def reset_error_stats(self) -> None:
-        """#43 / #48: clear OS-drop stats and any cached open-error
-        message. Triggered by the user clicking the sticky error
-        badge. Kept separate from ``reset_drop_stats`` because the
-        two have distinct badges.
+        """#43 / #48: clear OS-drop + underflow stats and any cached
+        open-error message. Triggered by the user clicking the sticky
+        error badge. Kept separate from ``reset_drop_stats`` because
+        the two have distinct badges.
         """
         self.os_drop_count       = 0
         self.os_drop_count_total = 0
         self.has_ever_os_dropped = False
+        self.underflow_count       = 0
+        self.underflow_count_total = 0
+        self.has_ever_underflowed  = False
         self.open_error          = None
 
     def resume(self):

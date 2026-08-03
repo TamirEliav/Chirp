@@ -3921,6 +3921,11 @@ class ChirpWindow(QMainWindow):
             try:
                 if hasattr(e.capture, 'consume_os_drop_count'):
                     e.capture.consume_os_drop_count()
+                # Zero-insertion (input_underflow) counter — the log
+                # line marking "zeros are entering the recorded audio"
+                # is emitted inside this consume call.
+                if hasattr(e.capture, 'consume_underflow_count'):
+                    e.capture.consume_underflow_count()
                 e.consume_ingest_error_count()
                 # M3: detect a dead ingest thread while acq claims to
                 # be running (BaseException escaped the chunk guard).

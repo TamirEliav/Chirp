@@ -76,6 +76,9 @@ class WavFileCapture:
         self.os_drop_count        = 0
         self.os_drop_count_total  = 0
         self.has_ever_os_dropped  = False
+        self.underflow_count       = 0
+        self.underflow_count_total = 0
+        self.has_ever_underflowed  = False
         self.open_error: str | None = None
         # #7: optional monitor loopback — see AudioCapture.set_monitor.
         self._monitor = None
@@ -185,11 +188,22 @@ class WavFileCapture:
         self.os_drop_count = 0
         return n
 
+    def consume_underflow_count(self) -> int:
+        """Mirror of AudioCapture.consume_underflow_count. Always
+        returns 0 for WAV playback — no PortAudio layer, no
+        zero-insertion."""
+        n = self.underflow_count
+        self.underflow_count = 0
+        return n
+
     def reset_error_stats(self) -> None:
         """Mirror of AudioCapture.reset_error_stats (#43 / #48)."""
         self.os_drop_count       = 0
         self.os_drop_count_total = 0
         self.has_ever_os_dropped = False
+        self.underflow_count       = 0
+        self.underflow_count_total = 0
+        self.has_ever_underflowed  = False
         self.open_error          = None
 
     def resume(self) -> None:

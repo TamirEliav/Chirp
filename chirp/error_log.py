@@ -26,6 +26,11 @@ Categories
                   still using it). Throttled.
 ``os_drop``     — PortAudio ``input_overflow`` flag (driver / OS lost
                   samples upstream of our ring). Throttled.
+``underflow``   — PortAudio ``input_underflow`` flag: zero samples were
+                  INSERTED into the capture buffer to cover missing
+                  data — silent zero runs are entering the recorded
+                  audio itself (spectrogram / monitor / WAVs).
+                  Throttled.
 ``ingest``      — Exception raised inside the per-entity DSP loop
                   (DSP / FFT / trigger). Logged every event.
 ``open``        — Capture failed to open the device or the WAV input
@@ -50,8 +55,9 @@ Categories
 
 Throttling
 ----------
-``ring_overrun``, ``queue_full`` and ``os_drop`` can fire on every audio
-chunk. To keep the log bounded, those categories are limited to one
+``ring_overrun``, ``queue_full``, ``os_drop`` and ``underflow`` can fire
+on every audio chunk. To keep the log bounded, those categories are
+limited to one
 entry per (stream, category) per ``_THROTTLE_SECONDS``. Throttling is
 applied on the writer thread (keyed on the event's stamped wall time),
 so the cheap, non-blocking enqueue on the producer side stays uniform.
@@ -70,7 +76,8 @@ import time
 
 _LOG_FILENAME = 'chirp_errors.log'
 _THROTTLE_SECONDS = 1.0
-_THROTTLED_CATEGORIES = frozenset({'ring_overrun', 'queue_full', 'os_drop'})
+_THROTTLED_CATEGORIES = frozenset({'ring_overrun', 'queue_full', 'os_drop',
+                                   'underflow'})
 
 # Lock-free, unbounded, thread-safe producer→writer channel. Producers
 # (realtime callback, DSP threads, writer threads, UI poll) only ever

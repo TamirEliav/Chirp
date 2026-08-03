@@ -21,6 +21,7 @@ def compose_error_state(e) -> tuple[bool, str]:
     cap = getattr(e, 'capture', None)
     ingest_ever = bool(getattr(e, 'has_ever_ingest_errored', False))
     os_drop_ever = bool(getattr(cap, 'has_ever_os_dropped', False))
+    underflow_ever = bool(getattr(cap, 'has_ever_underflowed', False))
     open_err = getattr(cap, 'open_error', None)
     ch_trunc = bool(getattr(cap, 'channels_truncated', False))
     ch_trunc_msg = getattr(cap, 'channels_truncated_msg', '') or ''
@@ -30,8 +31,8 @@ def compose_error_state(e) -> tuple[bool, str]:
     except Exception:
         wr_has, wr_total, wr_last = False, 0, None
 
-    any_err = (ingest_ever or os_drop_ever or bool(open_err)
-               or ch_trunc or wr_has)
+    any_err = (ingest_ever or os_drop_ever or underflow_ever
+               or bool(open_err) or ch_trunc or wr_has)
     if not any_err:
         return False, 'No pipeline errors recorded for this stream.'
     parts = []
@@ -46,6 +47,12 @@ def compose_error_state(e) -> tuple[bool, str]:
         parts.append(
             f'{n} OS-level input overflow{"s" if n != 1 else ""} — '
             f'samples lost before our queue')
+    if underflow_ever:
+        n = int(getattr(cap, 'underflow_count_total', 0))
+        parts.append(
+            f'{n} input underflow{"s" if n != 1 else ""} — PortAudio '
+            f'inserted ZERO samples into the captured audio (zero runs '
+            f'are being recorded)')
     if open_err:
         parts.append(f'Capture open failed: {open_err}')
     if ch_trunc:
