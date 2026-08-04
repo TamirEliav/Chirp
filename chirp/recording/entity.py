@@ -55,6 +55,17 @@ from chirp.recording.trigger import ThresholdRecorder
 from chirp.recording import writer as _wav_writer
 
 
+# ── Zero-run detector ──────────────────────────────────────────────────────
+# Minimum length (seconds) of an exact-zero run in the raw captured
+# signal before it is counted as inserted digital silence. A live analog
+# input's noise floor guarantees nonzero LSBs, so exact-zero runs of a
+# millisecond are not natural audio. Field-observed insertions are
+# 2–8 ms; 1 ms catches them all with headroom against chance zeros.
+# (A digital input — ADAT / S/PDIF — carrying true digital silence can
+# legitimately trip this; the badge is informational and clearable.)
+ZERO_RUN_MIN_SEC = 0.001
+
+
 # ── Sidecar clock log ──────────────────────────────────────────────────────
 # One CSV row per stream per ``clock_log_interval_sec`` (default 60 s):
 # the capture-ring sample index, the derived capture time (and which
@@ -273,6 +284,24 @@ class RecordingEntity:
         self.ingest_error_count_total = 0      # session-wide monotonic
         self.has_ever_ingest_errored  = False
         self.last_ingest_error: str | None = None  # short str(exc) for tooltip
+        # Zero-run detector: exact-zero runs >= ZERO_RUN_MIN_SEC in the
+        # raw captured signal. A live analog input never produces exact
+        # 0.0 floats (the ADC noise floor guarantees nonzero LSBs), so
+        # such runs are digital silence inserted upstream — observed in
+        # the field as periodic 2–8 ms zero fills latched into one
+        # endpoint's Windows capture session (split-stereo L/R streams
+        # saw time-locked identical runs; PortAudio raised NO status
+        # flags, so signal-level detection is the only in-app tell).
+        # Cleared by restarting acquisition on ALL streams sharing the
+        # endpoint. Counters mirror the capture drop-stat contract.
+        # Only live-device captures are scanned — WAV playback pads
+        # legit zeros (loop seam) and may contain true silence.
+        self.zero_run_count       = 0      # transient per-tick
+        self.zero_run_count_total = 0      # session-wide monotonic
+        self.has_ever_zero_run    = False
+        self.zero_run_longest     = 0      # samples, session max
+        self._zero_carry          = 0      # trailing zero run in progress
+        self._zero_carry_counted  = False  # carry already counted
         self.amp_ylim   = 1.05    # amplitude y-axis max (persists across mode switches)
         # Amplitude-plot Y scale: 'linear' (raw envelope, 0..amp_ylim)
         # or 'log' (20*log10, AMP_DB_MIN..AMP_DB_MAX). User-toggled via
@@ -491,6 +520,10 @@ class RecordingEntity:
         self.ingest_error_count_total = 0
         self.has_ever_ingest_errored  = False
         self.last_ingest_error        = None
+        self.zero_run_count           = 0
+        self.zero_run_count_total     = 0
+        self.has_ever_zero_run        = False
+        self.zero_run_longest         = 0
         # #53: also clear the stuck-ingest-thread latch so the user
         # can try acquisition again after restarting the device.
         self._ingest_join_failed      = False
@@ -505,6 +538,75 @@ class RecordingEntity:
         n = self.ingest_error_count
         self.ingest_error_count = 0
         return n
+
+    def consume_zero_run_count(self) -> int:
+        """Return & clear the transient zero-run counter. Polled once
+        per UI tick. Emits a throttled ``zero_run`` log line here (off
+        the ingest thread's hot path is fine, but the UI tick keeps
+        logging cadence uniform with the other capture-stat consumes).
+        """
+        n = self.zero_run_count
+        self.zero_run_count = 0
+        if n:
+            ms = self.zero_run_longest / max(1, self.sample_rate) * 1000.0
+            _err_log('zero_run', self.name,
+                     f'inserted-silence detected: {n} exact-zero run(s) '
+                     f'>= {ZERO_RUN_MIN_SEC*1000:.0f} ms in captured audio '
+                     f'(longest {ms:.1f} ms, cumulative='
+                     f'{self.zero_run_count_total}) — restart acquisition '
+                     f'on ALL streams of this input device to clear')
+        return n
+
+    def _detect_zero_runs(self, raw_chunk: np.ndarray) -> None:
+        """Count exact-zero runs >= ``ZERO_RUN_MIN_SEC`` in the raw
+        chunk (all captured channels simultaneously zero). Runs are
+        counted once, at the moment they reach the threshold — a run
+        spanning many chunks (via the ``_zero_carry`` carry-over) still
+        counts exactly once. Live-device captures only.
+        """
+        if self.input_source != 'device':
+            return
+        if raw_chunk.ndim == 2:
+            z = np.all(raw_chunk == 0, axis=1)
+        else:
+            z = (raw_chunk == 0)
+        n = z.shape[0]
+        if n == 0:
+            return
+        if not z.any():
+            self._zero_carry = 0
+            self._zero_carry_counted = False
+            return
+        min_run = max(2, int(ZERO_RUN_MIN_SEC * self.sample_rate))
+        d = np.diff(np.concatenate(([0], z.view(np.int8), [0])))
+        starts = np.nonzero(d == 1)[0]
+        ends   = np.nonzero(d == -1)[0]
+        new_runs = 0
+        for i in range(len(starts)):
+            length = int(ends[i] - starts[i])
+            if i == 0 and starts[0] == 0 and self._zero_carry > 0:
+                total   = self._zero_carry + length
+                counted = self._zero_carry_counted
+            else:
+                total   = length
+                counted = False
+            if total > self.zero_run_longest:
+                self.zero_run_longest = total
+            if total >= min_run and not counted:
+                new_runs += 1
+                counted = True
+            if ends[i] == n:
+                # Run touches chunk end — carry it (and whether it was
+                # already counted) into the next chunk.
+                self._zero_carry = total
+                self._zero_carry_counted = counted
+        if ends[-1] != n:
+            self._zero_carry = 0
+            self._zero_carry_counted = False
+        if new_runs:
+            self.zero_run_count       += new_runs
+            self.zero_run_count_total += new_runs
+            self.has_ever_zero_run     = True
 
     def consume_env_peak(self):
         """M8: return the max trigger-envelope peak observed since the
@@ -1275,6 +1377,11 @@ class RecordingEntity:
         if self._force_stop_requested:
             self._force_stop_requested = False
             self._flush_active_events(reason='force_trigger_stop')
+
+        # Inserted-silence (zero-run) detection on the raw chunk, before
+        # any channel selection — the upstream insertion zeroes every
+        # channel of the endpoint simultaneously.
+        self._detect_zero_runs(raw_chunk)
 
         mode = self.channel_mode
         if raw_chunk.ndim == 2:

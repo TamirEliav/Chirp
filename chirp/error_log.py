@@ -31,6 +31,12 @@ Categories
                   data — silent zero runs are entering the recorded
                   audio itself (spectrogram / monitor / WAVs).
                   Throttled.
+``zero_run``    — Signal-level inserted-silence detector: exact-zero
+                  runs >= ~1 ms found in the raw captured audio (the
+                  Windows engine / driver zero-fills without raising
+                  any PortAudio flag; restart acquisition on ALL
+                  streams of the affected input device to clear the
+                  latched endpoint state). Throttled.
 ``ingest``      — Exception raised inside the per-entity DSP loop
                   (DSP / FFT / trigger). Logged every event.
 ``open``        — Capture failed to open the device or the WAV input
@@ -77,7 +83,7 @@ import time
 _LOG_FILENAME = 'chirp_errors.log'
 _THROTTLE_SECONDS = 1.0
 _THROTTLED_CATEGORIES = frozenset({'ring_overrun', 'queue_full', 'os_drop',
-                                   'underflow'})
+                                   'underflow', 'zero_run'})
 
 # Lock-free, unbounded, thread-safe producer→writer channel. Producers
 # (realtime callback, DSP threads, writer threads, UI poll) only ever

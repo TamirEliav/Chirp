@@ -3927,6 +3927,9 @@ class ChirpWindow(QMainWindow):
                 if hasattr(e.capture, 'consume_underflow_count'):
                     e.capture.consume_underflow_count()
                 e.consume_ingest_error_count()
+                # Inserted-silence (zero-run) detector — the throttled
+                # zero_run log line is emitted inside this consume.
+                e.consume_zero_run_count()
                 # M3: detect a dead ingest thread while acq claims to
                 # be running (BaseException escaped the chunk guard).
                 e.check_ingest_alive()

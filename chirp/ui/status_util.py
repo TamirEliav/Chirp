@@ -22,6 +22,7 @@ def compose_error_state(e) -> tuple[bool, str]:
     ingest_ever = bool(getattr(e, 'has_ever_ingest_errored', False))
     os_drop_ever = bool(getattr(cap, 'has_ever_os_dropped', False))
     underflow_ever = bool(getattr(cap, 'has_ever_underflowed', False))
+    zero_run_ever = bool(getattr(e, 'has_ever_zero_run', False))
     open_err = getattr(cap, 'open_error', None)
     ch_trunc = bool(getattr(cap, 'channels_truncated', False))
     ch_trunc_msg = getattr(cap, 'channels_truncated_msg', '') or ''
@@ -32,7 +33,7 @@ def compose_error_state(e) -> tuple[bool, str]:
         wr_has, wr_total, wr_last = False, 0, None
 
     any_err = (ingest_ever or os_drop_ever or underflow_ever
-               or bool(open_err) or ch_trunc or wr_has)
+               or zero_run_ever or bool(open_err) or ch_trunc or wr_has)
     if not any_err:
         return False, 'No pipeline errors recorded for this stream.'
     parts = []
@@ -53,6 +54,16 @@ def compose_error_state(e) -> tuple[bool, str]:
             f'{n} input underflow{"s" if n != 1 else ""} — PortAudio '
             f'inserted ZERO samples into the captured audio (zero runs '
             f'are being recorded)')
+    if zero_run_ever:
+        n = int(getattr(e, 'zero_run_count_total', 0))
+        longest = int(getattr(e, 'zero_run_longest', 0))
+        sr = int(getattr(e, 'sample_rate', 0)) or 1
+        parts.append(
+            f'{n} inserted-silence run{"s" if n != 1 else ""} detected '
+            f'in captured audio (exact-zero gaps, longest '
+            f'{longest / sr * 1000:.1f} ms) — the device/engine is '
+            f'zero-filling; restart acquisition on ALL streams of this '
+            f'input device to clear')
     if open_err:
         parts.append(f'Capture open failed: {open_err}')
     if ch_trunc:
