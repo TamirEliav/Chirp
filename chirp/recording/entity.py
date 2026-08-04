@@ -688,6 +688,15 @@ class RecordingEntity:
         # we work).
         self.acq_running = False
         self._stop_ingest_and_flush(reason='capture_recovery')
+        # A stalled device stalls every stream sharing its endpoint, so
+        # retire the whole shared stream — otherwise the replacement
+        # captures would re-attach to the dead session still held open
+        # by the sibling streams that haven't recovered yet.
+        try:
+            if hasattr(self.capture, 'mark_stream_dead'):
+                self.capture.mark_stream_dead()
+        except Exception:
+            pass
         try:
             self.capture.close()
         except Exception:
@@ -1152,7 +1161,19 @@ class RecordingEntity:
 
     def _reopen_capture(self):
         """Close the current capture and open a fresh one for the
-        current device / channel mode. Returns the new capture."""
+        current device / channel mode. Returns the new capture.
+
+        The shared stream is marked dead first: this path exists for
+        the case where the existing PortAudio stream is unusable (a
+        WDM-KS pin that refuses to restart, a churned endpoint), so the
+        replacement capture must renegotiate a *new* stream rather than
+        re-attach to the broken one still held by sibling streams.
+        """
+        try:
+            if hasattr(self.capture, 'mark_stream_dead'):
+                self.capture.mark_stream_dead()
+        except Exception:
+            pass
         try:
             self.capture.close()
         except Exception:

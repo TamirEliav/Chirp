@@ -1,7 +1,7 @@
-"""AudioCapture — sounddevice.InputStream wrapper.
+"""AudioCapture — per-stream view of a (possibly shared) input stream.
 
-Redesign: the PortAudio callback now writes raw frames into a
-preallocated single-producer/single-consumer ring buffer
+The PortAudio callback writes raw frames into a preallocated
+single-producer/single-consumer ring buffer
 (:class:`chirp.audio.ringbuffer.AudioRing`) instead of allocating a
 fresh numpy array per chunk and pushing it onto a ``queue.Queue``. The
 callback does only a memcpy into preallocated memory plus integer
@@ -11,14 +11,25 @@ stall the realtime thread. Drop accounting maps to ring *overruns*
 multi-second ring should never happen in practice. Logging is emitted
 off the realtime path, when the UI polls ``consume_drop_count`` /
 ``consume_os_drop_count``.
+
+Stream sharing: an AudioCapture no longer owns a PortAudio stream. It is
+a *sink* of a :class:`~chirp.audio.shared_stream.SharedInputStream`,
+which opens exactly one ``sd.InputStream`` per (device, samplerate) and
+fans each buffer out to every attached sink. Two Chirp streams splitting
+one stereo input therefore present a single client to the Windows
+capture session — see ``chirp/audio/shared_stream.py`` for the field
+evidence that made this necessary. Everything else about the contract is
+unchanged: ``valid`` / ``open_error`` / ``resume`` / ``pause`` /
+``close`` / ``set_monitor`` / the drop, overflow and underflow counters
+all behave exactly as before, and ``_callback`` keeps its signature so
+it can still be driven directly in tests.
 """
 
 import time
 
-import sounddevice as sd
-
+from chirp.audio import shared_stream as _shared
 from chirp.audio.ringbuffer import AudioRing
-from chirp.constants import CAPTURE_LATENCY, CHUNK_FRAMES, DTYPE, SAMPLE_RATE
+from chirp.constants import SAMPLE_RATE
 from chirp.error_log import log as _err_log
 
 
@@ -27,7 +38,12 @@ class AudioCapture:
                  samplerate=SAMPLE_RATE, name: str = '', clock=None):
         self._ring     = audio_ring
         self._channels = channels
-        self._stream   = None
+        # Shared PortAudio stream this capture is a sink of (None until
+        # attached / after close). ``_active`` gates the fan-out: a
+        # paused sink stays attached — keeping the endpoint open for its
+        # siblings — but receives no buffers, so its ring doesn't fill.
+        self._shared   = None
+        self._active   = False
         # Disciplined timestamp clock (chirp.audio.clock). When wired,
         # the callback records one (write_total, time.time()) pair per
         # buffer — the raw observations the ingest thread's clock servo
@@ -85,50 +101,30 @@ class AudioCapture:
         # 0 = left/mono, 1 = right, None = both (stereo). Without this a
         # 'Right' stream opened with 2 channels would feed both columns.
         self._monitor_channel = None
-        try:
-            self._stream = sd.InputStream(
-                samplerate=samplerate, channels=channels,
-                dtype=DTYPE, blocksize=CHUNK_FRAMES,
-                device=device,
-                # #43: request a generous input buffer so the OS/driver
-                # doesn't overrun it before our callback runs (the
-                # ``input_overflow`` / ``!`` badge). Decoupled from the
-                # downstream chunk size by the capture ring.
-                latency=CAPTURE_LATENCY,
-                callback=self._callback,
-            )
-        except Exception as exc:
-            self.open_error = f'{type(exc).__name__}: {exc}'[:200]
-            print(f"[AudioCapture] Failed to open device {device}: {exc}")
-            _err_log('open', self._name,
-                     f'failed to open device {device}: '
-                     f'{type(exc).__name__}: {exc}')
-        # Hidden sample-rate-conversion warning: in WASAPI shared mode
-        # the OS engine runs the endpoint at its configured default
-        # format; a mismatched stream rate inserts an OS resampler
-        # between the driver and our callback. That resampler smears
-        # driver-level zero-filled glitch packets to non-obvious run
-        # lengths and can swallow the discontinuity flags that would
-        # otherwise light the `!` badge. Logged once per open so the
-        # correlation with zero-run corruption is visible in the log.
-        if self._stream is not None:
-            try:
-                dev = device
-                if dev is None:
-                    dev = sd.default.device[0]
-                info = sd.query_devices(dev)
-                dev_sr = float(info.get('default_samplerate') or 0.0)
-                if dev_sr > 0 and abs(dev_sr - float(samplerate)) > 0.5:
-                    msg = (f'stream rate {samplerate} Hz != device default '
-                           f'{dev_sr:.0f} Hz — the OS is resampling this '
-                           f'capture (WASAPI shared). Driver glitches may '
-                           f'surface as smeared zero-sample runs. Match the '
-                           f"endpoint's default format to the stream rate "
-                           f'(Sound Control Panel → Recording → Advanced).')
-                    print(f'[AudioCapture] {self._name or dev}: {msg}')
-                    _err_log('open', self._name, msg)
-            except Exception:
-                pass
+        # Attach to the shared stream for this (device, samplerate),
+        # opening one if this is the first stream on the endpoint. The
+        # open-failure contract is unchanged: ``valid`` False +
+        # ``open_error`` set + one ``open`` log line.
+        shared, err = _shared.acquire(self, device, samplerate, channels,
+                                      name=name)
+        if err is not None:
+            self.open_error = err[:200]
+        else:
+            self._shared = shared
+
+    # ── Shared-stream plumbing ───────────────────────────────────────
+
+    def mark_stream_dead(self) -> None:
+        """Declare the underlying shared stream unusable so the next
+        capture built for this device opens a fresh one.
+
+        Called from the capture-recovery path: when a device stalls,
+        every sink on that endpoint is stalled, so the whole shared
+        stream has to go rather than being inherited by the replacement
+        captures (which would silently reuse the dead session)."""
+        shared = self._shared
+        if shared is not None:
+            shared.mark_dead()
 
     def set_monitor(self, monitor, source_id, channel=None) -> None:
         """Wire the shared audio monitor. Safe to call at any time.
@@ -147,14 +143,19 @@ class AudioCapture:
 
     @property
     def valid(self):
-        return self._stream is not None
+        shared = self._shared
+        return shared is not None and shared.stream is not None
 
     def _callback(self, indata, frames, time_info, status):
-        # Realtime-safety: this runs on the PortAudio thread and must not
-        # block. It does *only* counter increments and an array copy into
-        # the queue — no disk I/O and no logging. Drop / overflow events
-        # are turned into log lines off the realtime path, when the UI
-        # polls ``consume_drop_count`` / ``consume_os_drop_count``.
+        # Invoked by SharedInputStream's fan-out, on the PortAudio
+        # thread, with ``indata`` already sliced to this sink's channel
+        # count. Realtime-safety: must not block. It does *only* counter
+        # increments and an array copy into the ring — no disk I/O and no
+        # logging. Drop / overflow events are turned into log lines off
+        # the realtime path, when the UI polls ``consume_drop_count`` /
+        # ``consume_os_drop_count``. The status flags are shared by every
+        # sink on the endpoint (they describe the endpoint, not us), so
+        # each sink counts them independently.
         #
         # #43: ``input_overflow`` means the driver's input ring buffer
         # wrapped before we serviced it — samples were lost upstream of
@@ -291,18 +292,34 @@ class AudioCapture:
         self.open_error          = None
 
     def resume(self):
-        if self._stream is not None:
-            self._stream.start()
+        """Begin receiving buffers. Starts the shared PortAudio stream
+        if this is the first active sink on the endpoint."""
+        shared = self._shared
+        if shared is None:
+            return
+        self._active = True
+        try:
+            shared.start()
+        except Exception:
+            # Roll back so a failed start doesn't leave a sink marked
+            # active on a stopped stream; the caller (start_acq) latches
+            # the failure and may rebuild the capture.
+            self._active = False
+            raise
 
     def pause(self):
-        if self._stream is not None:
-            self._stream.stop()
+        """Stop receiving buffers. The shared stream keeps running while
+        any sibling sink is still active; it stops when none are."""
+        shared = self._shared
+        self._active = False
+        if shared is not None:
+            shared.stop_if_idle()
 
     def close(self):
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-            except Exception:
-                pass
-            self._stream.close()
-            self._stream = None
+        """Detach from the shared stream. The PortAudio stream — and
+        with it the OS capture session — is closed once the last sink on
+        the endpoint detaches. Idempotent."""
+        shared, self._shared = self._shared, None
+        self._active = False
+        if shared is not None:
+            shared.detach(self)

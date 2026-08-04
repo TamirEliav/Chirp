@@ -231,16 +231,23 @@ def test_reset_error_stats_independent_of_reset_drop_stats():
 # ── #48: open_error exposure ─────────────────────────────────────────
 
 def test_open_error_captured_when_inputstream_raises(monkeypatch):
-    """When sounddevice.InputStream() raises, the exception reason
+    """When the PortAudio stream fails to open, the exception reason
     lands on ``open_error`` so the UI can surface it — the old code
-    only printed to stdout, which is invisible in the frozen GUI."""
+    only printed to stdout, which is invisible in the frozen GUI.
+
+    The open now happens inside the shared-stream layer (one
+    ``sd.InputStream`` per device, fanned out to every stream on it),
+    so that is where the failure is injected; the AudioCapture contract
+    it feeds — ``valid`` False, ``open_error`` populated — is unchanged.
+    """
     import chirp.audio.capture as mod
+    import chirp.audio.shared_stream as shared
 
     class _BadStream:
         def __init__(self, *a, **kw):
             raise OSError('Error opening InputStream: no such device [PaError -9996]')
 
-    monkeypatch.setattr(mod.sd, 'InputStream', _BadStream)
+    monkeypatch.setattr(shared, '_stream_factory', _BadStream)
     q = AudioRing(CHUNK_FRAMES * 8, channels=1)
     cap = mod.AudioCapture(q, device=99)
 
