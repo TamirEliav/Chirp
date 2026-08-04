@@ -4,7 +4,7 @@
 
 Chirp is a desktop application for multi-stream audio monitoring, visualization, and threshold-triggered recording. It was designed with bioacoustics research in mind but works for any audio analysis task.
 
-![Version](https://img.shields.io/badge/Version-v3.7.0-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5%20%2B%20pyqtgraph-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
+![Version](https://img.shields.io/badge/Version-v3.8.0-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5%20%2B%20pyqtgraph-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 ---
 
@@ -83,6 +83,19 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - Persistent `D` badge latches for the session; click to clear
 - In View Mode a per-tile `DROP×N` overlay shows the running session total
 
+### Inserted-Silence Detection
+- Detects **digital silence injected below the app** — a driver or the Windows audio engine can zero-fill milliseconds of a capture in place, corrupting the spectrogram, the monitor and every recorded WAV, sometimes *without raising any PortAudio error flag*
+- Two independent detectors: PortAudio's `input_underflow` status flag (zero samples inserted to cover missing data), and a **signal-level scan** for exact-zero runs ≥ 1 ms — a live analog input's noise floor never produces those, so such a run is inserted silence by definition
+- Lights the sticky `!` badge with the run count and longest gap, and logs `underflow` / `zero_run` lines so a corrupted session is visible **while it happens** instead of being discovered in the recordings afterwards
+- The first second after Start Acq is exempt (a priming capture pin legitimately delivers silence)
+- Chirp also warns at stream open when the device's default format doesn't match the stream's sample rate — hidden OS resampling that can mask discontinuities
+
+### One Capture Stream per Device
+- All streams that share an input device now share **one** PortAudio stream, so two streams splitting a stereo input (e.g. Left on one, Right on the other) present a **single client** to the operating system's capture session rather than two
+- Each stream still keeps its own ring buffer, clock, trigger state, monitor routing and error counters — the buffer is simply fanned out
+- The device is released when the **last** stream on it stops, which is what resets a driver/engine capture session that has latched into a bad state
+- Note: two streams on the same device at *different* sample rates cannot share and will still open two sessions
+
 ### Trustworthy Timestamps
 - Filename timestamps come from a **disciplined capture clock**: sample-accurate relative timing (adjacent and Max-Rec–split files tile exactly), continuously steered onto the system wall clock so sound-card crystal drift never accumulates over multi-week runs
 - Internally UTC, rendered to local time only in the filename — DST transitions mid-run don't skew timestamps
@@ -93,9 +106,9 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 ### Error Logging
 - Every pipeline failure surfaced by the sidebar `S` / `D` / `!` indicators is also written to a plain-text log file (`chirp_errors.log`) in the folder Chirp is launched from
 - Each line carries an ISO timestamp, the category, the stream name, and (where applicable) the WAV file path involved — so any indicator can be traced back to a precise event
-- Categories: `ring_overrun` (capture ring overrun), `os_drop` (PortAudio overflow), `ingest` (DSP-thread exceptions, with a short traceback), `open` (capture / WAV open failure), `wav_writer` (writer-pool failure, with target folder), `saturation` (one line per finished WAV that contained clipping, with the full path), `clock_step` (timestamp clock jumped a capture hole), `timestamp_divergence` (published WAV's timestamp disagrees with the wall clock, with the full path)
+- Categories: `ring_overrun` (capture ring overrun), `os_drop` (PortAudio overflow), `underflow` (PortAudio inserted zero samples into the captured audio), `zero_run` (exact-zero runs found in the captured signal — inserted silence with no PortAudio flag), `ingest` (DSP-thread exceptions, with a short traceback), `open` (capture / WAV open failure), `wav_writer` (writer-pool failure, with target folder), `saturation` (one line per finished WAV that contained clipping, with the full path), `clock_step` (timestamp clock jumped a capture hole), `timestamp_divergence` (published WAV's timestamp disagrees with the wall clock, with the full path)
 - All disk logging happens on a dedicated background thread — realtime and DSP threads only enqueue a record, so logging can never stall the audio pipeline
-- High-frequency categories (`ring_overrun`, `os_drop`) are throttled to one entry per stream per second; cumulative counts are stamped on each line
+- High-frequency categories (`ring_overrun`, `os_drop`, `underflow`, `zero_run`) are throttled to one entry per stream per second; cumulative counts are stamped on each line
 - Saturation is logged **per file**, not per sample — one line per WAV that clipped — so the log stays compact even on noisy inputs
 - The log is append-only (survives across runs) and the logger never raises — it cannot crash the audio pipeline
 

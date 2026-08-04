@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Chirp v3.7.0 — User Manual</title>
+<title>Chirp v3.8.0 — User Manual</title>
 <style>
   :root {
     --base: #1e1e2e;
@@ -304,7 +304,7 @@
 <nav class="sidebar">
   <div class="logo">
     <h1>Chirp</h1>
-    <span>User Manual &mdash; v3.7.0</span>
+    <span>User Manual &mdash; v3.8.0</span>
   </div>
   <ul>
     <li><a href="#overview">Overview</a></li>
@@ -350,6 +350,7 @@
     <li><a href="#view-mode">View Mode</a></li>
     <li><a href="#settings-mgmt">Settings Management</a></li>
     <li><a href="#error-log">Error Logging</a></li>
+    <li><a href="#inserted-silence">Inserted Silence</a></li>
     <li><a href="#rdp">Remote Desktop (RDP)</a></li>
     <li><a href="#interactions">Mouse &amp; Keyboard</a></li>
     <li><a href="#tips">Tips &amp; Best Practices</a></li>
@@ -365,7 +366,7 @@
 <header class="hero">
   <h1>Chirp</h1>
   <p class="subtitle">Real-Time Audio Monitoring, Visualization &amp; Triggered Recording</p>
-  <span class="version">v3.7.0</span>
+  <span class="version">v3.8.0</span>
 </header>
 
 <!-- ── 1. Overview ── -->
@@ -448,9 +449,12 @@ python chirp.py</code></pre>
       <span style="color:var(--red); font-weight:bold">S</span> latches when this stream has saturated
       (clipped) at any point during the session;
       <span style="color:var(--red); font-weight:bold">D</span> latches when the audio capture has
-      dropped any callback chunks (with the total count in its tooltip). Both stay lit until you
+      dropped any callback chunks (with the total count in its tooltip);
+      <span style="color:var(--peach); font-weight:bold">!</span> latches on pipeline problems
+      &mdash; device open failures, DSP errors, WAV-write failures, timestamp divergence, and
+      <a href="#inserted-silence">inserted silence</a> in the captured audio. All stay lit until you
       <strong>click the badge to clear</strong>, so a brief clip or a single dropped callback can't
-      slip by unnoticed.</li>
+      slip by unnoticed; hover any badge for the details behind it.</li>
     <li><strong>Transient drop flash</strong> &mdash; a short per-tick indicator that blinks when a
       drop occurs in the current UI tick, alongside the sticky <span style="color:var(--red); font-weight:bold">D</span> badge.</li>
     <li><strong>Mini amplitude preview</strong> &mdash; a small real-time level meter</li>
@@ -958,6 +962,19 @@ python chirp.py</code></pre>
     </tbody>
   </table>
 
+  <div class="callout tip">
+    <strong>Splitting one input across two streams.</strong> A common setup is two streams on the
+    same stereo device &mdash; one set to <strong>Left</strong>, the other to <strong>Right</strong>
+    &mdash; so each microphone gets its own trigger settings and output files. Chirp opens the
+    device <strong>once</strong> and hands the same audio to both streams, so the operating system
+    sees a single client rather than two competing for one capture session. Each stream still keeps
+    its own buffers, trigger state, recordings, monitor routing and error badges.
+    <br><br>
+    Because the two share one device, the device is only released when the <em>last</em> of them
+    stops acquiring &mdash; relevant if you ever need to reset a misbehaving audio device
+    (see <a href="#inserted-silence">Inserted Silence</a>).
+  </div>
+
   <h3>Stereo Trigger Modes</h3>
   <p>When operating in stereo, the <strong>Trigger Mode</strong> control determines how per-channel
   amplitude values are combined for threshold comparison:</p>
@@ -1159,6 +1176,25 @@ python chirp.py</code></pre>
         <td>&mdash;</td>
       </tr>
       <tr>
+        <td><code>underflow</code></td>
+        <td>PortAudio reported <code>input_underflow</code> &mdash; zero samples were
+            <strong>inserted into the captured audio</strong> to cover data the device failed to
+            deliver. Unlike <code>os_drop</code> (samples lost) this corrupts the audio
+            <em>content</em>: the silence reaches the spectrogram, the monitor and the WAVs.
+            Lights the <span style="color:var(--peach); font-weight:bold">!</span> badge. Same
+            throttling as <code>os_drop</code>. See <a href="#inserted-silence">Inserted Silence</a>.</td>
+        <td>&mdash;</td>
+      </tr>
+      <tr>
+        <td><code>zero_run</code></td>
+        <td>Chirp found runs of <strong>exact digital zeros</strong> (&ge;&nbsp;1&nbsp;ms) in the
+            captured signal &mdash; inserted silence that raised <em>no</em> PortAudio flag at all.
+            The line carries how many runs were seen and the longest one. Lights the
+            <span style="color:var(--peach); font-weight:bold">!</span> badge. Throttled.
+            See <a href="#inserted-silence">Inserted Silence</a>.</td>
+        <td>&mdash;</td>
+      </tr>
+      <tr>
         <td><code>ingest</code></td>
         <td>An exception was raised inside the per-entity ingest loop (DSP / FFT / trigger).
             The thread is preserved; a 3-frame traceback is included in the message. Every
@@ -1205,9 +1241,10 @@ python chirp.py</code></pre>
 
   <h3>Throttling</h3>
   <p>
-    <code>ring_overrun</code> and <code>os_drop</code> can fire on every audio chunk
+    <code>ring_overrun</code>, <code>os_drop</code>, <code>underflow</code> and
+    <code>zero_run</code> can fire on every audio chunk
     (50+/second at the default sample rate / chunk size). To keep the log bounded and useful,
-    those two categories are limited to one entry per (stream, category) per second. The first
+    those categories are limited to one entry per (stream, category) per second. The first
     event in any burst always logs immediately; subsequent events within the window are
     suppressed. Because each line carries a cumulative count, the difference between two adjacent
     lines tells you how many events were suppressed in between.
@@ -1231,6 +1268,60 @@ python chirp.py</code></pre>
     matching line is when the failure actually occurred &mdash; the badge only tells you it
     happened, the log tells you when, where, and (for writer / saturation events) which file.
   </div>
+</section>
+
+<!-- ── Inserted Silence ── -->
+<section id="inserted-silence">
+  <h2>Inserted Silence (Zero Samples)</h2>
+  <p>
+    Audio drivers and the Windows audio engine sometimes <strong>fill gaps with digital
+    silence</strong> instead of reporting them. When that happens, runs of exact zeros appear
+    <em>inside</em> the captured signal: you can see them as gaps in the spectrogram, hear them as
+    dropouts in the monitor, and they are written into the WAV files verbatim. Nothing in the
+    recording chain above the driver can tell the difference between "the microphone was silent"
+    and "the driver made this up" &mdash; except statistically, which is what Chirp does.
+  </p>
+
+  <h3>How Chirp detects it</h3>
+  <ul>
+    <li><strong>PortAudio flag</strong> &mdash; when the audio layer <em>admits</em> to inserting
+      zeros it raises <code>input_underflow</code>, which Chirp counts and logs as
+      <code>underflow</code>.</li>
+    <li><strong>Signal-level scan</strong> &mdash; the flag is often <em>not</em> raised, so Chirp
+      additionally scans the raw capture for runs of exact zeros lasting
+      <strong>1&nbsp;ms or more</strong> and logs them as <code>zero_run</code>. A live analog
+      input never produces those: even in a silent room, the noise floor of the analog-to-digital
+      converter guarantees the lowest bits keep flickering. An exact-zero millisecond is therefore
+      inserted silence by definition, not quiet audio.</li>
+  </ul>
+  <p>
+    Either detector lights the sticky <span style="color:var(--peach); font-weight:bold">!</span>
+    badge; hover it to see how many runs were found and how long the longest one was. The first
+    second after <strong>Start&nbsp;Acq</strong> is deliberately ignored &mdash; a freshly-started
+    capture legitimately delivers silence while the device primes.
+  </p>
+
+  <div class="callout warning">
+    <strong>If the badge appears mid-session:</strong> the audio device has latched into a bad
+    state, and it will usually <em>stay</em> there &mdash; every recording made from that point on
+    is corrupted. To clear it, <strong>Stop&nbsp;Acq on every stream that uses that input device,
+    then start them again</strong>. Stopping only one stream is not enough: the operating system
+    keeps the capture session alive (and its bad state with it) as long as any stream still holds
+    the device.
+  </div>
+
+  <h3>Reducing the odds</h3>
+  <ul>
+    <li><strong>Match the device's sample rate.</strong> If the endpoint's default format in
+      <em>Sound Control Panel &rarr; Recording &rarr; Properties &rarr; Advanced</em> differs from
+      the rate Chirp is running at, Windows silently resamples the capture &mdash; which can hide
+      driver glitches. Chirp warns about this in the log when it opens the stream.</li>
+    <li><strong>Keep the interface on its own USB controller</strong> where possible, on a rear
+      port, and not behind a hub shared with busy devices.</li>
+    <li><strong>Keep the driver and firmware current</strong> for your audio interface.</li>
+    <li><strong>Check the recordings, not just the badge</strong> &mdash; the log records exactly
+      when the runs started, so you can tell which files are affected.</li>
+  </ul>
 </section>
 
 <!-- ── Recording over Remote Desktop ── -->
@@ -1419,7 +1510,7 @@ python chirp.py</code></pre>
 
 <!-- Footer -->
 <footer style="margin-top:3rem; padding-top:1.5rem; border-top:1px solid var(--surface0); text-align:center; color:var(--overlay0); font-size:0.82rem;">
-  <p>Chirp v3.7.0 &mdash; User Manual</p>
+  <p>Chirp v3.8.0 &mdash; User Manual</p>
   <p>Designed for bioacoustics research. Built with Python, PyQt5, and pyqtgraph.</p>
 </footer>
 
