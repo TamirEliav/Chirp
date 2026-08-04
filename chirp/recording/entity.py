@@ -64,6 +64,13 @@ from chirp.recording import writer as _wav_writer
 # (A digital input — ADAT / S/PDIF — carrying true digital silence can
 # legitimately trip this; the badge is informational and clearable.)
 ZERO_RUN_MIN_SEC = 0.001
+# Grace period after ``start_acq`` during which zero runs are ignored.
+# A freshly-started stream legitimately delivers silence for its first
+# buffers while the device/engine primes the capture pin — counting that
+# lit the badge on every single acquisition start. The real fault is
+# continuous once latched, so a one-second blind spot costs nothing: it
+# still fires within a second of the corruption starting.
+ZERO_RUN_WARMUP_SEC = 1.0
 
 
 # ── Sidecar clock log ──────────────────────────────────────────────────────
@@ -302,6 +309,10 @@ class RecordingEntity:
         self.zero_run_longest     = 0      # samples, session max
         self._zero_carry          = 0      # trailing zero run in progress
         self._zero_carry_counted  = False  # carry already counted
+        # Samples still to skip after an acquisition start (see
+        # ZERO_RUN_WARMUP_SEC). Armed by ``start_acq``; zero here so
+        # direct chunk feeds (tests) detect from the first sample.
+        self._zero_warmup_left    = 0
         self.amp_ylim   = 1.05    # amplitude y-axis max (persists across mode switches)
         # Amplitude-plot Y scale: 'linear' (raw envelope, 0..amp_ylim)
         # or 'log' (20*log10, AMP_DB_MIN..AMP_DB_MAX). User-toggled via
@@ -565,6 +576,15 @@ class RecordingEntity:
         counts exactly once. Live-device captures only.
         """
         if self.input_source != 'device':
+            return
+        if self._zero_warmup_left > 0:
+            # Start-of-acquisition grace period: the device's first
+            # buffers are legitimately silent while the capture primes.
+            # Drop the carry too, so a run straddling the boundary isn't
+            # credited with its warm-up half.
+            self._zero_warmup_left -= raw_chunk.shape[0]
+            self._zero_carry = 0
+            self._zero_carry_counted = False
             return
         if raw_chunk.ndim == 2:
             z = np.all(raw_chunk == 0, axis=1)
@@ -1250,6 +1270,11 @@ class RecordingEntity:
         self._wall_anchor_time = datetime.datetime.now(
             datetime.timezone.utc)
         self._wall_anchor_samples = self._samples_total
+        # Arm the zero-run warm-up: ignore the silence a priming capture
+        # pin delivers in its first buffers (see ZERO_RUN_WARMUP_SEC).
+        self._zero_warmup_left = int(ZERO_RUN_WARMUP_SEC * self.sample_rate)
+        self._zero_carry = 0
+        self._zero_carry_counted = False
         # Open every acquisition session with a clock-log row.
         self._clock_log_next_t = 0.0
         # Start ingestion thread (#19 / c21).

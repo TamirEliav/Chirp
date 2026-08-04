@@ -138,6 +138,50 @@ def test_consume_and_clear_contract():
     assert e.zero_run_longest == 0
 
 
+# ── Start-of-acquisition warm-up ─────────────────────────────────────────
+
+def test_warmup_ignores_zeros_then_detects_after_it_elapses():
+    """A priming capture pin delivers silence in its first buffers —
+    that must not light the badge on every acquisition start."""
+    e = _entity()
+    e._zero_warmup_left = 2048
+    e.ingest_chunk(np.zeros(1024, dtype=np.float32))
+    e.ingest_chunk(np.zeros(1024, dtype=np.float32))
+    assert e.zero_run_count == 0
+    assert e.has_ever_zero_run is False
+    # Warm-up exhausted — the next silent chunk counts.
+    e.ingest_chunk(np.zeros(1024, dtype=np.float32))
+    e.ingest_chunk(_noise(1024))          # run ends
+    assert e.zero_run_count == 1
+
+
+def test_warmup_run_does_not_carry_into_detection():
+    """A zero run straddling the warm-up boundary is judged only on the
+    samples after it — no credit for the warm-up half."""
+    e = _entity()
+    m = _min_run(e)
+    e._zero_warmup_left = 1024
+    e.ingest_chunk(np.zeros(1024, dtype=np.float32))   # all warm-up
+    tail = _noise(1024)
+    tail[:m - 1] = 0.0                    # just under threshold on its own
+    e.ingest_chunk(tail)
+    assert e.zero_run_count == 0
+
+
+def test_start_acq_arms_the_warmup():
+    from tests.test_acq_restart import _FakeCapture
+    e = _entity()
+    e.capture.close()
+    e.capture = _FakeCapture(valid=True)
+    e.input_source = 'device'
+    try:
+        e.start_acq()
+        assert e._zero_warmup_left == int(e.sample_rate * 1.0)
+    finally:
+        e.stop_acq()
+        e.close()
+
+
 def test_badge_composition_includes_zero_runs():
     from chirp.ui.status_util import compose_error_state
     e = _entity()
