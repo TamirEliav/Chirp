@@ -8,6 +8,8 @@ will fail to load cleanly on upgrade.
 
 import json
 
+import numpy as np
+
 import pytest
 
 from chirp.config.schema import (
@@ -429,3 +431,80 @@ def test_configured_blocksize_reaches_the_stream(monkeypatch):
     finally:
         shared.reset_registry()
         shared.configure(*before)
+
+
+# ── Loading a config must open each device exactly once ──────────────────
+#
+# RecordingEntity.__init__ used to open the capture with channels=1 and
+# from_dict then called change_device(..., 2) for every non-Mono stream,
+# so each endpoint was opened, closed and reopened milliseconds apart on
+# every config load. Field logs showed the pair of opens per stream. The
+# fault under investigation is a latched per-endpoint capture session, so
+# needless create/destroy churn of exactly that session is worth removing.
+
+def _count_captures(monkeypatch):
+    """Count RecordingEntity._make_capture calls."""
+    calls = []
+    orig = RecordingEntity._make_capture
+
+    def counting(self, channels):
+        calls.append(channels)
+        return orig(self, channels)
+
+    monkeypatch.setattr(RecordingEntity, '_make_capture', counting)
+    return calls
+
+
+def test_from_dict_opens_capture_once_for_mono(monkeypatch):
+    calls = _count_captures(monkeypatch)
+    e, _ = RecordingEntity.from_dict({'name': 'm', 'channel_mode': 'Mono'})
+    assert calls == [1]
+    e.close()
+
+
+def test_from_dict_opens_capture_once_for_stereo_modes(monkeypatch):
+    for mode in ('Left', 'Right', 'Stereo'):
+        calls = _count_captures(monkeypatch)
+        e, _ = RecordingEntity.from_dict({'name': mode, 'channel_mode': mode})
+        assert calls == [2], f'{mode}: expected one 2-channel open, got {calls}'
+        assert e.channel_mode == mode
+        e.close()
+
+
+def test_stereo_mode_downgraded_when_device_is_mono(monkeypatch):
+    """The downgrade has to happen before the capture opens, or we are
+    back to opening the device twice."""
+    import chirp.recording.entity as ent
+
+    monkeypatch.setattr(ent, 'find_device_by_name',
+                        lambda name, hostapi: (7, None))
+    monkeypatch.setattr(ent.sd, 'query_devices',
+                        lambda dev: {'max_input_channels': 1})
+    calls = _count_captures(monkeypatch)
+    e, _ = RecordingEntity.from_dict(
+        {'name': 'mono-dev', 'device_name': 'X', 'channel_mode': 'Stereo'})
+    assert e.channel_mode == 'Mono'
+    assert calls == [1]
+    e.close()
+
+
+def test_wav_file_source_survives_a_stereo_channel_mode(tmp_path, monkeypatch):
+    """Regression: from_dict's change_device() call reset input_source to
+    'device', so a non-Mono config whose input was a WAV file silently
+    lost its file and came back as a live-device stream."""
+    import scipy.io.wavfile
+
+    wav = tmp_path / 'src.wav'
+    scipy.io.wavfile.write(str(wav), 44100,
+                           np.zeros((2048, 2), dtype=np.int16))
+    e, _warn = RecordingEntity.from_dict({
+        'name': 'wavstereo',
+        'channel_mode': 'Stereo',
+        'input_source': 'wav_file',
+        'wav_file_path': str(wav),
+    })
+    try:
+        assert e.input_source == 'wav_file'
+        assert e.wav_file_path == str(wav)
+    finally:
+        e.close()

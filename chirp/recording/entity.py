@@ -111,7 +111,7 @@ class RecordingEntity:
     SUPPORTED_DISPLAY_SECONDS = (5.0, 10.0, 15.0, 20.0, 30.0, 60.0)
 
     def __init__(self, name: str = 'Recording 1', device_id=None, sample_rate=SAMPLE_RATE,
-                 display_seconds=DISPLAY_SECONDS):
+                 display_seconds=DISPLAY_SECONDS, channel_mode: str = 'Mono'):
         self.name = name
         self.sample_rate = sample_rate
         self.display_seconds = float(display_seconds)
@@ -120,9 +120,14 @@ class RecordingEntity:
         self._n_cols        = max(1, int(self.display_seconds * self.sample_rate / CHUNK_FRAMES))
         self._total_samples = self._n_cols * CHUNK_FRAMES
 
-        # Device / channel
+        # Device / channel. ``channel_mode`` is a constructor argument
+        # because ``_make_capture`` below opens the device with the
+        # matching channel count: setting it afterwards forced a
+        # close+reopen of the endpoint (see ``from_dict``), and needless
+        # churn of a capture session is exactly what we don't want on a
+        # driver that latches into a zero-filling state.
         self.device_id    = device_id
-        self.channel_mode = 'Mono'
+        self.channel_mode = channel_mode
         self.trigger_mode = 'Average'
 
         # Input source: 'device' (live sounddevice input) or 'wav_file'
@@ -141,7 +146,8 @@ class RecordingEntity:
         # capture that writes into it. The DSP ingest thread is the ring's
         # sole consumer.
         self.ring       = None
-        self.capture    = self._make_capture(channels=1)
+        self.capture    = self._make_capture(
+            channels=2 if self.channel_mode != 'Mono' else 1)
         self.spec_acc   = SpectrogramAccumulator()
         self.spec_acc_r = SpectrogramAccumulator()
         # H1: streaming mode — events append to a StreamingWavWriter as
@@ -2022,11 +2028,30 @@ class RecordingEntity:
 
         sr = d.get('sample_rate', SAMPLE_RATE)
         ds = d.get('display_seconds', DISPLAY_SECONDS)
-        e = cls(name=d.get('name', 'Recording'), device_id=device_id,
-                sample_rate=sr, display_seconds=ds)
 
-        # Scalar attributes
-        for attr in ('channel_mode', 'trigger_mode', 'threshold',
+        # Resolve the channel mode BEFORE constructing. The constructor
+        # opens the capture, so a mode applied afterwards meant every
+        # non-Mono stream opened its endpoint, closed it and reopened it
+        # milliseconds later on every config load — pointless churn of
+        # the exact per-endpoint capture session that latches into the
+        # zero-filling fault. A stereo mode on a device that turns out
+        # to be mono is downgraded here, for the same reason.
+        channel_mode = d.get('channel_mode', 'Mono')
+        if channel_mode != 'Mono' and device_id is not None:
+            try:
+                if sd.query_devices(device_id)['max_input_channels'] < 2:
+                    channel_mode = 'Mono'
+            except Exception:
+                channel_mode = 'Mono'
+
+        e = cls(name=d.get('name', 'Recording'), device_id=device_id,
+                sample_rate=sr, display_seconds=ds,
+                channel_mode=channel_mode)
+
+        # Scalar attributes. ``channel_mode`` is deliberately absent —
+        # it was applied above (and possibly downgraded), and re-setting
+        # it from the dict here would undo that.
+        for attr in ('trigger_mode', 'threshold',
                      'min_cross_sec', 'min_total_cross_sec',
                      'hold_sec', 'post_trig_sec', 'max_rec_sec', 'pre_trig_sec',
                      'freq_filter_enabled', 'freq_lo', 'freq_hi',
@@ -2065,17 +2090,12 @@ class RecordingEntity:
             except (ValueError, TypeError):
                 e.ref_date = None
 
-        # Channel mode may need stereo device
-        need_ch = 2 if e.channel_mode != 'Mono' else 1
-        if need_ch == 2 and device_id is not None:
-            try:
-                max_ch = sd.query_devices(device_id)['max_input_channels']
-                if max_ch < 2:
-                    e.channel_mode = 'Mono'
-            except Exception:
-                e.channel_mode = 'Mono'
-        if need_ch == 2:
-            e.change_device(device_id, 2)
+        # (The capture was already opened with the right channel count by
+        # the constructor — no change_device() call here. Besides the
+        # endpoint churn, that call also reset ``input_source`` to
+        # 'device', which silently discarded the WAV source of any
+        # non-Mono wav_file config before the branch below could act on
+        # it.)
 
         # If the saved config used a WAV file, re-open it so the capture
         # actually points at the file (the setattr loop only set the
