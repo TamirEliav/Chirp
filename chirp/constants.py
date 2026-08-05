@@ -33,6 +33,27 @@ RING_SECONDS        = 10.0
 # for finer control. Display latency rises modestly in exchange for a
 # driver buffer generous enough that the OS never overruns it.
 CAPTURE_LATENCY     = 'high'
+# Frames per PortAudio capture callback. DECOUPLED from CHUNK_FRAMES: the
+# capture ring absorbs any buffer size, and the ingest thread always
+# hands the DSP pipeline exactly CHUNK_FRAMES samples, so this only
+# controls how often the realtime callback fires.
+#
+# Why it is larger than CHUNK_FRAMES: with sounddevice the callback is
+# *Python* code and must take the GIL to run. Every ingest thread, the
+# GUI, the writer pool and the logger contend for that same GIL, so a
+# callback that arrives while another thread holds it is delayed — and a
+# driver that finds no buffer ready on time fills the gap with digital
+# silence or drops the samples outright (the field zero-run fault). At
+# 4096 the callback fires ~11x/s per device instead of ~43x/s, cutting
+# both the number of GIL acquisitions on the realtime path and the odds
+# that any one of them lands late, in exchange for display/monitor
+# latency (93 ms at 44.1 kHz) that no recording ever sees.
+#
+# FIELD TUNING: if inserted-silence runs persist, raise this (8192 =
+# 186 ms) and/or replace CAPTURE_LATENCY with an explicit float such as
+# 0.25 to ask the driver for a deeper host buffer. Both trade only
+# monitor/display latency for capture robustness.
+CAPTURE_BLOCKSIZE   = 4096
 
 # ── Display ────────────────────────────────────────────────────────────────────
 DISPLAY_SECONDS     = 10.0
@@ -216,7 +237,7 @@ QScrollArea {{ border: none; }}
 __all__ = [
     # Audio
     "SAMPLE_RATE", "CHANNELS", "CHUNK_FRAMES", "DTYPE", "RING_SECONDS",
-    "CAPTURE_LATENCY",
+    "CAPTURE_LATENCY", "CAPTURE_BLOCKSIZE",
     # Display
     "DISPLAY_SECONDS", "SPECTROGRAM_NPERSEG", "COLORMAP",
     "ANIMATION_INTERVAL", "SPEC_DB_MIN", "SPEC_DB_MAX", "N_DISPLAY_ROWS",

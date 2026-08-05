@@ -287,6 +287,18 @@ def write_wav_sync(buf_snapshot: list, output_dir: str,
 # would corrupt each other's file.
 _tmp_counter = itertools.count(1)
 
+# Async-append plumbing for StreamingWavWriter. The bound is in queued
+# buffers, not bytes: at the default chunk size it is well over a minute
+# of audio per open event, so ``put`` only ever blocks if the disk has
+# stopped keeping up entirely — at which point stalling beats losing
+# samples.
+_APPEND_QUEUE_MAX = 4096
+_APPEND_STOP = object()
+# Upper bound on how long close()/abort() wait for the queue to drain.
+# Runs on a writer-pool worker, so a slow flush delays publication, not
+# audio capture.
+_APPEND_DRAIN_TIMEOUT = 120.0
+
 
 class StreamingWavWriter:
     """Incremental, atomic WAV writer backed by soundfile / libsndfile.
@@ -325,6 +337,12 @@ class StreamingWavWriter:
         self.frames_written = 0
         self.peak = 0.0
         self._closed = False
+        # Async append plumbing (see ``append``). The queue is created
+        # lazily on the first append so a writer that never receives
+        # audio costs nothing.
+        self._q: "queue.Queue | None" = None
+        self._thread: threading.Thread | None = None
+        self._async_err: BaseException | None = None
         self._sf = sf.SoundFile(self._tmp, mode='w',
                                 samplerate=self.sample_rate,
                                 channels=self.channels,
@@ -357,8 +375,73 @@ class StreamingWavWriter:
         fname = _compose_filename(prefix, suffix, onset_time)
         self.path = _resolve_safe_path(output_dir, fname)
 
+    # ── Async append path ────────────────────────────────────────────
+
+    def _ensure_worker(self) -> None:
+        if self._thread is not None:
+            return
+        self._q = queue.Queue(maxsize=_APPEND_QUEUE_MAX)
+        t = threading.Thread(
+            target=self._drain_loop, daemon=True,
+            name=f'chirp-wav-{os.path.basename(self.path)[:24]}')
+        self._thread = t
+        t.start()
+
+    def _drain_loop(self) -> None:
+        """Own the file handle: every byte of this WAV is written here,
+        on this one thread, in queue order."""
+        while True:
+            item = self._q.get()
+            if item is _APPEND_STOP:
+                return
+            if self._async_err is not None:
+                continue          # already failed; drain and discard
+            try:
+                self._write_frames(item)
+            except BaseException as exc:      # noqa: BLE001
+                self._async_err = exc
+
+    def _write_frames(self, frames: np.ndarray) -> None:
+        pcm16 = (frames * 32767.0).clip(-32768, 32767).astype(np.int16)
+        self._sf.write(pcm16)
+
+    def _stop_worker(self) -> None:
+        """Drain and retire the append worker. Safe to call repeatedly."""
+        t, self._thread = self._thread, None
+        if t is None:
+            return
+        try:
+            self._q.put(_APPEND_STOP)
+            t.join(timeout=_APPEND_DRAIN_TIMEOUT)
+        except Exception:
+            pass
+
     def append(self, frames: np.ndarray) -> None:
-        """Append float32 frames (mono ``(n,)`` or ``(n, channels)``)."""
+        """Queue float32 frames (mono ``(n,)`` or ``(n, channels)``).
+
+        Realtime-path note: this is called from the per-stream ingest
+        thread, which also runs the FFTs, the envelope and the trigger
+        state machine. Doing the PCM conversion and the actual
+        ``SoundFile.write`` here meant a slow or stalled disk (a busy
+        SSD, an SMB share, a writeback burst) blocked audio consumption;
+        the ingest thread then processed its backlog in a burst, holding
+        the GIL long enough to delay the PortAudio callback — and a
+        capture callback that misses its deadline is exactly what makes
+        the driver zero-fill or drop samples. So the caller now only
+        hands the buffer over; conversion and I/O happen on this
+        writer's own thread.
+
+        The queue is FIFO with a single consumer, so bytes land in the
+        file in call order. It is bounded: if the disk falls
+        catastrophically behind, ``put`` blocks rather than dropping
+        audio (losing samples is worse than stalling) or growing without
+        limit.
+
+        The peak (saturation) scan stays on the caller: it is a single
+        cheap pass next to the conversion and syscall being moved, and
+        keeping it here preserves ``saturated`` as readable immediately
+        after ``append`` rather than making it race the worker.
+        """
         if self._closed or frames is None:
             return
         if frames.shape[0] == 0:
@@ -366,8 +449,15 @@ class StreamingWavWriter:
         local_peak = float(np.abs(frames).max())
         if local_peak > self.peak:
             self.peak = local_peak
-        pcm16 = (frames * 32767.0).clip(-32768, 32767).astype(np.int16)
-        self._sf.write(pcm16)
+        err = self._async_err
+        if err is not None:
+            # Surface the background failure on the caller's thread so
+            # the recorder aborts this event exactly as it did when the
+            # write was synchronous.
+            self._async_err = None
+            raise err
+        self._ensure_worker()
+        self._q.put(frames)
         self.frames_written += int(frames.shape[0])
 
     def close(self) -> str:
@@ -376,6 +466,21 @@ class StreamingWavWriter:
         if self._closed:
             return self.path
         self._closed = True
+        # Flush every queued buffer to disk before the file is finalized
+        # — this runs on a writer-pool worker, never on the ingest
+        # thread, so waiting here costs no audio.
+        self._stop_worker()
+        if self._async_err is not None:
+            err, self._async_err = self._async_err, None
+            try:
+                self._sf.close()
+            except Exception:
+                pass
+            try:
+                os.remove(self._tmp)
+            except OSError:
+                pass
+            raise err
         try:
             self._sf.close()
         except Exception:
@@ -406,6 +511,8 @@ class StreamingWavWriter:
         if self._closed:
             return
         self._closed = True
+        self._stop_worker()
+        self._async_err = None
         try:
             self._sf.close()
         except Exception:

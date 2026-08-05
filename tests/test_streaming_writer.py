@@ -135,3 +135,104 @@ def test_stream_atomic_no_tmp_after_close(tmp_path):
     assert os.path.exists(out)
     assert not os.path.exists(out + '.tmp')
     assert out.endswith('.wav')
+
+
+# ── Async appends (writes must not run on the ingest thread) ──────────────
+#
+# Appending ran on the per-stream ingest thread, so a slow or stalled
+# disk blocked audio consumption; the ingest thread then caught up in a
+# burst, holding the GIL long enough to delay the PortAudio callback —
+# and a late callback is what makes the driver zero-fill or drop
+# samples. Appends are now handed to the writer's own thread.
+
+def test_append_does_not_block_caller_on_slow_disk(tmp_path, monkeypatch):
+    """A stalled write must not stall the caller (the ingest thread)."""
+    import threading
+    import time as _time
+
+    from chirp.recording import writer as W
+
+    onset = datetime.datetime(2024, 1, 1, 0, 0, 0)
+    w = StreamingWavWriter(str(tmp_path), sample_rate=44100, onset_time=onset)
+    release = threading.Event()
+    real_write = w._write_frames
+
+    def slow_write(frames):
+        release.wait(5.0)          # simulate a stalled disk / SMB share
+        real_write(frames)
+
+    monkeypatch.setattr(w, '_write_frames', slow_write)
+
+    block = np.zeros(1024, dtype=np.float32)
+    t0 = _time.monotonic()
+    for _ in range(4):
+        w.append(block)
+    elapsed = _time.monotonic() - t0
+    assert elapsed < 1.0, f'append blocked the caller for {elapsed:.2f}s'
+
+    release.set()
+    path = w.close()               # drains before finalizing
+    sr, data = scipy.io.wavfile.read(path)
+    assert len(data) == 4 * 1024   # nothing lost while the disk stalled
+
+
+def test_appends_land_in_call_order(tmp_path):
+    """Single-consumer queue ⇒ bytes land in the order they were queued."""
+    onset = datetime.datetime(2024, 1, 1, 0, 0, 0)
+    w = StreamingWavWriter(str(tmp_path), sample_rate=44100, onset_time=onset)
+    for i in range(1, 21):
+        w.append(np.full(64, i / 100.0, dtype=np.float32))
+    path = w.close()
+    sr, data = scipy.io.wavfile.read(path)
+    assert len(data) == 20 * 64
+    for i in range(1, 21):
+        seg = data[(i - 1) * 64: i * 64]
+        expected = np.int16(round(i / 100.0 * 32767))
+        assert np.all(np.abs(seg.astype(int) - int(expected)) <= 1), \
+            f'segment {i} out of order or corrupted'
+
+
+def test_background_write_failure_surfaces_to_caller(tmp_path):
+    """A failure on the writer thread must reach the recorder so the
+    event aborts, exactly as a synchronous write error did."""
+    import time as _time
+
+    onset = datetime.datetime(2024, 1, 1, 0, 0, 0)
+    w = StreamingWavWriter(str(tmp_path), sample_rate=44100, onset_time=onset)
+
+    def boom(frames):
+        raise OSError('disk went away')
+
+    w._write_frames = boom
+    w.append(np.zeros(64, dtype=np.float32))
+    deadline = _time.monotonic() + 5.0
+    raised = None
+    while _time.monotonic() < deadline:
+        try:
+            w.append(np.zeros(64, dtype=np.float32))
+        except OSError as exc:
+            raised = exc
+            break
+        _time.sleep(0.01)
+    assert raised is not None, 'background failure never surfaced'
+    w.abort()
+
+
+def test_close_waits_for_queued_audio(tmp_path):
+    """close() must flush everything queued — no truncated recordings."""
+    onset = datetime.datetime(2024, 1, 1, 0, 0, 0)
+    w = StreamingWavWriter(str(tmp_path), sample_rate=44100, onset_time=onset)
+    for _ in range(50):
+        w.append(np.full(512, 0.25, dtype=np.float32))
+    path = w.close()
+    sr, data = scipy.io.wavfile.read(path)
+    assert len(data) == 50 * 512
+
+
+def test_abort_discards_queued_audio(tmp_path):
+    onset = datetime.datetime(2024, 1, 1, 0, 0, 0)
+    w = StreamingWavWriter(str(tmp_path), sample_rate=44100, onset_time=onset)
+    for _ in range(10):
+        w.append(np.full(256, 0.5, dtype=np.float32))
+    w.abort()
+    assert os.listdir(tmp_path) == []

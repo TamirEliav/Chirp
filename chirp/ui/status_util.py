@@ -58,12 +58,13 @@ def compose_error_state(e) -> tuple[bool, str]:
         n = int(getattr(e, 'zero_run_count_total', 0))
         longest = int(getattr(e, 'zero_run_longest', 0))
         sr = int(getattr(e, 'sample_rate', 0)) or 1
+        frac = float(getattr(e, 'zero_sample_frac', 0.0))
         parts.append(
-            f'{n} inserted-silence run{"s" if n != 1 else ""} detected '
-            f'in captured audio (exact-zero gaps, longest '
-            f'{longest / sr * 1000:.1f} ms) — the device/engine is '
-            f'zero-filling; restart acquisition on ALL streams of this '
-            f'input device to clear')
+            f'INSERTED SILENCE — {frac * 100:.1f}% of recent audio was '
+            f'digital zeros ({n} run{"s" if n != 1 else ""} so far, '
+            f'longest {longest / sr * 1000:.1f} ms). Recordings are being '
+            f'corrupted: restart acquisition on ALL streams of this input '
+            f'device to clear')
     if open_err:
         parts.append(f'Capture open failed: {open_err}')
     if ch_trunc:

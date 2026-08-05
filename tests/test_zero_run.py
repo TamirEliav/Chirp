@@ -138,6 +138,77 @@ def test_consume_and_clear_contract():
     assert e.zero_run_longest == 0
 
 
+# ── Duty cycle (how BAD is it) ───────────────────────────────────────────
+
+def test_duty_cycle_reports_fraction_of_samples_zeroed():
+    """The log line must report the share of captured audio that was
+    digital silence — the number that tells a blip apart from half the
+    recording being destroyed. Batched over ~1 s of audio."""
+    e = _entity()
+    sr = e.sample_rate
+    logged = []
+    import chirp.recording.entity as ent
+    orig = ent._err_log
+    ent._err_log = lambda cat, name, msg, **kw: logged.append((cat, msg))
+    try:
+        # Exactly 25% of every chunk is a zero run, over ~1 s of audio.
+        n_chunks = int(sr / 1024) + 1
+        for _ in range(n_chunks):
+            c = _noise(1024)
+            c[:256] = 0.0
+            e.ingest_chunk(c)
+            e.consume_zero_run_count()
+    finally:
+        ent._err_log = orig
+    assert logged, 'expected a zero_run line after ~1 s of audio'
+    cat, msg = logged[0]
+    assert cat == 'zero_run'
+    assert '25.0% of captured samples' in msg
+    assert abs(e.zero_sample_frac - 0.25) < 0.01
+
+
+def test_no_line_when_audio_is_clean():
+    e = _entity()
+    sr = e.sample_rate
+    logged = []
+    import chirp.recording.entity as ent
+    orig = ent._err_log
+    ent._err_log = lambda cat, name, msg, **kw: logged.append((cat, msg))
+    try:
+        for _ in range(int(sr / 1024) + 2):
+            e.ingest_chunk(_noise(1024))
+            e.consume_zero_run_count()
+    finally:
+        ent._err_log = orig
+    assert logged == []
+
+
+def test_duty_cycle_window_resets_between_lines():
+    """Each line covers its own window — a clean second after a bad one
+    must not inherit the bad second's zeros."""
+    e = _entity()
+    sr = e.sample_rate
+    logged = []
+    import chirp.recording.entity as ent
+    orig = ent._err_log
+    ent._err_log = lambda cat, name, msg, **kw: logged.append(msg)
+    try:
+        for _ in range(int(sr / 1024) + 1):
+            c = _noise(1024)
+            c[:512] = 0.0
+            e.ingest_chunk(c)
+            e.consume_zero_run_count()
+        first = len(logged)
+        for _ in range(int(sr / 1024) + 1):     # clean second
+            e.ingest_chunk(_noise(1024))
+            e.consume_zero_run_count()
+    finally:
+        ent._err_log = orig
+    assert first >= 1
+    assert '50.0% of captured samples' in logged[0]
+    assert len(logged) == first, 'clean second must not emit a line'
+
+
 # ── Start-of-acquisition warm-up ─────────────────────────────────────────
 
 def test_warmup_ignores_zeros_then_detects_after_it_elapses():
@@ -191,4 +262,5 @@ def test_badge_composition_includes_zero_runs():
     e.ingest_chunk(chunk)
     any_err, tip = compose_error_state(e)
     assert any_err is True
-    assert 'inserted-silence' in tip
+    assert 'INSERTED SILENCE' in tip
+    assert '% of recent audio' in tip

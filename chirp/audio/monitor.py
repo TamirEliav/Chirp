@@ -24,13 +24,18 @@ from typing import Any
 import numpy as np
 import sounddevice as sd
 
-from chirp.constants import CHUNK_FRAMES, DTYPE, SAMPLE_RATE
+from chirp.constants import CAPTURE_BLOCKSIZE, CHUNK_FRAMES, DTYPE, SAMPLE_RATE
 
 
 # Default ring-buffer capacity: ~8 chunks (~185 ms at 44.1 kHz). Large
 # enough to absorb Windows scheduler jitter, small enough that a stall
 # drops recent audio rather than piling up lag.
 _DEFAULT_RING_CHUNKS = 8
+# The capture callback feeds the monitor one CAPTURE_BLOCKSIZE burst at a
+# time while the output callback drains CHUNK_FRAMES at a time, so the
+# ring must comfortably hold several capture bursts or every burst would
+# partially overwrite itself before playback caught up.
+_RING_FRAMES = max(CHUNK_FRAMES * _DEFAULT_RING_CHUNKS, CAPTURE_BLOCKSIZE * 4)
 
 
 class _RingBuffer:
@@ -281,7 +286,7 @@ class AudioMonitor:
             self._channels = ch
             # Re-size the ring buffer for the new channel count / SR.
             self._ring = _RingBuffer(
-                capacity_frames=CHUNK_FRAMES * _DEFAULT_RING_CHUNKS,
+                capacity_frames=_RING_FRAMES,
                 channels=ch,
             )
             self._stream = sd.OutputStream(

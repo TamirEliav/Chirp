@@ -309,6 +309,17 @@ class RecordingEntity:
         self.zero_run_longest     = 0      # samples, session max
         self._zero_carry          = 0      # trailing zero run in progress
         self._zero_carry_counted  = False  # carry already counted
+        # Duty-cycle accounting — the number that says how BAD it is.
+        # ``_zero_samples_acc`` counts samples inside qualifying runs and
+        # ``_zero_scanned_acc`` the samples examined, both since the last
+        # log line; their ratio is the fraction of audio destroyed.
+        # Without this the log couldn't distinguish an occasional blip
+        # from half the recording being silence.
+        self._zero_samples_acc    = 0
+        self._zero_scanned_acc    = 0
+        self._zero_batch_longest  = 0      # longest run since last line
+        self._zero_pending        = 0      # runs awaiting the next line
+        self.zero_sample_frac     = 0.0    # last reported duty cycle
         # Samples still to skip after an acquisition start (see
         # ZERO_RUN_WARMUP_SEC). Armed by ``start_acq``; zero here so
         # direct chunk feeds (tests) detect from the first sample.
@@ -535,6 +546,11 @@ class RecordingEntity:
         self.zero_run_count_total     = 0
         self.has_ever_zero_run        = False
         self.zero_run_longest         = 0
+        self._zero_samples_acc        = 0
+        self._zero_scanned_acc        = 0
+        self._zero_batch_longest      = 0
+        self._zero_pending            = 0
+        self.zero_sample_frac         = 0.0
         # #53: also clear the stuck-ingest-thread latch so the user
         # can try acquisition again after restarting the device.
         self._ingest_join_failed      = False
@@ -552,20 +568,42 @@ class RecordingEntity:
 
     def consume_zero_run_count(self) -> int:
         """Return & clear the transient zero-run counter. Polled once
-        per UI tick. Emits a throttled ``zero_run`` log line here (off
-        the ingest thread's hot path is fine, but the UI tick keeps
-        logging cadence uniform with the other capture-stat consumes).
+        per UI tick.
+
+        Logging is batched over ~1 second of audio rather than emitted
+        per tick, so each line reports a real **duty cycle** — the
+        percentage of captured samples that were digital silence over a
+        known window. That number is what tells an occasional blip apart
+        from half the recording being destroyed, and it is the metric to
+        compare before and after any mitigation. (Per-tick lines would
+        have covered 50 ms each and mostly been dropped by the log
+        throttle anyway.)
         """
         n = self.zero_run_count
         self.zero_run_count = 0
-        if n:
-            ms = self.zero_run_longest / max(1, self.sample_rate) * 1000.0
-            _err_log('zero_run', self.name,
-                     f'inserted-silence detected: {n} exact-zero run(s) '
-                     f'>= {ZERO_RUN_MIN_SEC*1000:.0f} ms in captured audio '
-                     f'(longest {ms:.1f} ms, cumulative='
-                     f'{self.zero_run_count_total}) — restart acquisition '
-                     f'on ALL streams of this input device to clear')
+        self._zero_pending += n
+        sr = max(1, int(self.sample_rate))
+        if self._zero_scanned_acc < sr:
+            return n
+        scanned = self._zero_scanned_acc
+        zeroed  = self._zero_samples_acc
+        runs    = self._zero_pending
+        longest = self._zero_batch_longest
+        self._zero_scanned_acc = 0
+        self._zero_samples_acc = 0
+        self._zero_batch_longest = 0
+        self._zero_pending = 0
+        if not runs:
+            return n
+        frac = zeroed / scanned
+        self.zero_sample_frac = frac
+        _err_log('zero_run', self.name,
+                 f'inserted silence: {frac*100:.1f}% of captured samples '
+                 f'were digital zeros over the last {scanned/sr:.1f}s '
+                 f'({runs} run(s) >= {ZERO_RUN_MIN_SEC*1000:.0f} ms, '
+                 f'longest {longest/sr*1000:.1f} ms, cumulative runs='
+                 f'{self.zero_run_count_total}) — restart acquisition on '
+                 f'ALL streams of this input device to clear')
         return n
 
     def _detect_zero_runs(self, raw_chunk: np.ndarray) -> None:
@@ -593,6 +631,7 @@ class RecordingEntity:
         n = z.shape[0]
         if n == 0:
             return
+        self._zero_scanned_acc += n
         if not z.any():
             self._zero_carry = 0
             self._zero_carry_counted = False
@@ -612,6 +651,13 @@ class RecordingEntity:
                 counted = False
             if total > self.zero_run_longest:
                 self.zero_run_longest = total
+            if total >= min_run:
+                # Duty cycle: add the samples of this run not yet
+                # accounted for. A run that only now reaches the
+                # threshold contributes its carried part too.
+                self._zero_samples_acc += length if counted else total
+                if total > self._zero_batch_longest:
+                    self._zero_batch_longest = total
             if total >= min_run and not counted:
                 new_runs += 1
                 counted = True

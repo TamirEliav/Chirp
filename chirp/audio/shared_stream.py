@@ -51,7 +51,7 @@ import threading
 
 import sounddevice as sd
 
-from chirp.constants import CAPTURE_LATENCY, CHUNK_FRAMES, DTYPE
+from chirp.constants import CAPTURE_BLOCKSIZE, CAPTURE_LATENCY, DTYPE
 from chirp.error_log import log as _err_log
 
 # Test seam: monkeypatch to substitute a fake stream class so the shared
@@ -123,7 +123,7 @@ class SharedInputStream:
         try:
             self._stream = factory(
                 samplerate=self.samplerate, channels=self.channels,
-                dtype=DTYPE, blocksize=CHUNK_FRAMES, device=device,
+                dtype=DTYPE, blocksize=CAPTURE_BLOCKSIZE, device=device,
                 latency=CAPTURE_LATENCY, callback=self._callback,
             )
         except Exception as exc:
