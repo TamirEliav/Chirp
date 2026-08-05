@@ -289,3 +289,26 @@ def test_open_failure_leaves_registry_clean(monkeypatch):
     assert cap.valid is False
     assert 'OSError' in cap.open_error
     assert shared.registry_size() == 0     # failed opens are not cached
+
+
+# ── Capture parameters actually reach PortAudio ──────────────────────────
+
+def test_default_latency_is_an_explicit_float_not_high():
+    """Regression guard. On WASAPI the device's own 'high' default can be
+    10 ms (measured on a Focusrite Scarlett 18i20), which is far too thin
+    a margin for the driver + USB stack + GIL + unrelated DPCs — and it
+    reads as generous, so it invites being 'restored'. The default must
+    stay an explicit number of seconds."""
+    from chirp.constants import CAPTURE_LATENCY
+    assert isinstance(CAPTURE_LATENCY, (int, float)), \
+        'CAPTURE_LATENCY must be explicit seconds, not a device default'
+    assert CAPTURE_LATENCY >= 0.1
+
+
+def test_stream_opens_with_configured_params():
+    a, _ = _cap(device=7)
+    kw = FakeStream.instances[0].kw
+    from chirp.audio import shared_stream as sh
+    blocksize, latency = sh.current_params()
+    assert kw['blocksize'] == blocksize
+    assert kw['latency'] == latency

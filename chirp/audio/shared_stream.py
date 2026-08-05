@@ -178,6 +178,22 @@ class SharedInputStream:
                      f'failed to open device {device}: '
                      f'{type(exc).__name__}: {exc}')
             return
+        # Report what the driver actually granted: ``latency`` is only a
+        # *suggestion*, and on WASAPI the device's own 'high' default can
+        # be as little as 10 ms — far too thin a margin for a shared
+        # desktop. Logging the achieved value makes that visible in the
+        # field instead of having to be inferred.
+        try:
+            actual = float(getattr(self._stream, 'latency', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            actual = 0.0
+        if actual:
+            _err_log('open', name,
+                     f'capture stream open: blocksize={self.blocksize} '
+                     f'({self.blocksize / max(1, self.samplerate) * 1000:.0f} ms), '
+                     f'requested latency={self.latency}, '
+                     f'granted latency={actual * 1000:.1f} ms, '
+                     f'{self.channels} ch @ {self.samplerate} Hz')
         _warn_samplerate_mismatch(device, self.samplerate, name)
 
     # ── Introspection ────────────────────────────────────────────────

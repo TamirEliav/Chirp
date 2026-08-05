@@ -25,14 +25,25 @@ DTYPE               = 'float32'
 # overwriting unread audio. An overrun here would mean the consumer
 # stalled for this long — it should never happen in practice.
 RING_SECONDS        = 10.0
-# PortAudio input latency for the capture stream. ``'high'`` asks the
-# driver for its larger default input buffer, which is the standard cure
-# for ``input_overflow`` (the OS losing samples upstream of our callback,
-# surfaced as the ``os_drop`` / sidebar ``!`` badge) on machines whose
-# default low-latency buffer is too small. A float (seconds) can be used
-# for finer control. Display latency rises modestly in exchange for a
-# driver buffer generous enough that the OS never overruns it.
-CAPTURE_LATENCY     = 'high'
+# PortAudio suggested input latency, in seconds — the size of the buffer
+# between the driver and our callback, i.e. how late the rest of the
+# machine is allowed to be before captured audio has nowhere to go.
+#
+# An EXPLICIT float, not ``'high'``. Field measurement on a Focusrite
+# Scarlett 18i20 (2026-08-05): the WASAPI endpoints report
+# ``default_low_input_latency`` = 3 ms and ``default_high_input_latency``
+# = **10 ms**, so ``'high'`` — which sounds generous, and is 180 ms on
+# the same device's MME endpoints — was asking for a ten-millisecond
+# margin covering the driver, the USB stack, PortAudio, the GIL and
+# every unrelated DPC on the system. That is far too thin for a
+# multi-stream recorder on a shared desktop.
+#
+# 0.25 s costs a quarter second of monitor/spectrogram lag (recorded
+# audio is unaffected — the ring keeps full pre-trigger history) and
+# buys 25x the tolerance. Overridable per install via the config file's
+# ``audio.capture_latency`` ('low' / 'high' / seconds); raise it to 0.5
+# if inserted-silence runs persist.
+CAPTURE_LATENCY     = 0.25
 # Frames per PortAudio capture callback. DECOUPLED from CHUNK_FRAMES: the
 # capture ring absorbs any buffer size, and the ingest thread always
 # hands the DSP pipeline exactly CHUNK_FRAMES samples, so this only
@@ -49,10 +60,11 @@ CAPTURE_LATENCY     = 'high'
 # that any one of them lands late, in exchange for display/monitor
 # latency (93 ms at 44.1 kHz) that no recording ever sees.
 #
-# FIELD TUNING: if inserted-silence runs persist, raise this (8192 =
-# 186 ms) and/or replace CAPTURE_LATENCY with an explicit float such as
-# 0.25 to ask the driver for a deeper host buffer. Both trade only
-# monitor/display latency for capture robustness.
+# FIELD TUNING: if inserted-silence runs persist, raise CAPTURE_LATENCY
+# first (it is what widens the machine's tolerance) and this second
+# (8192 = 186 ms). Both trade only monitor/display latency for capture
+# robustness, and both are overridable per install through the config
+# file's ``audio`` section.
 CAPTURE_BLOCKSIZE   = 4096
 # Accepted range for the user-configurable capture blocksize
 # (``audio.capture_blocksize`` in the config file).
