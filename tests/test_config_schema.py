@@ -330,3 +330,102 @@ def test_unknown_monitor_key_warns():
     _, _, mon, warnings = load_settings_dict(raw)
     assert mon["gain_percent"] == 80
     assert any("bogus_key" in w for w in warnings)
+
+
+# ── audio section: capture-engine tuning (v3.8.1) ────────────────────────
+#
+# Tunable in the config file because the fault it exists for (a late
+# Python callback letting the driver zero-fill) is machine- and
+# hardware-specific — a field user must be able to raise the buffer
+# without editing code.
+
+def test_audio_section_round_trip():
+    from chirp.config.schema import build_settings_dict, load_settings_dict
+    e = _fresh_entity('aud')
+    data = build_settings_dict([e], audio={'capture_blocksize': 16384,
+                                           'capture_latency': 0.25})
+    decoded = json.loads(json.dumps(data))
+    assert decoded['audio']['capture_blocksize'] == 16384
+    assert decoded['audio']['capture_latency'] == 0.25
+    # The audio section must not upset the rest of the loader.
+    _ents, _vm, _mon, warnings = load_settings_dict(decoded)
+    assert not [w for w in warnings if 'audio' in w.lower()]
+
+
+def test_audio_defaults_when_section_absent():
+    from chirp.config.schema import DEFAULT_AUDIO, parse_audio_settings
+    cfg, warnings = parse_audio_settings({'recordings': []})
+    assert cfg == DEFAULT_AUDIO
+    assert warnings == []
+
+
+def test_audio_unknown_key_warns():
+    from chirp.config.schema import parse_audio_settings
+    cfg, warnings = parse_audio_settings(
+        {'audio': {'capture_blocksize': 8192, 'bogus': 1}})
+    assert cfg['capture_blocksize'] == 8192
+    assert any('bogus' in w for w in warnings)
+
+
+def test_audio_section_not_a_dict_warns():
+    from chirp.config.schema import DEFAULT_AUDIO, parse_audio_settings
+    cfg, warnings = parse_audio_settings({'audio': 'nope'})
+    assert cfg == DEFAULT_AUDIO
+    assert warnings
+
+
+def test_blocksize_is_clamped_to_supported_range():
+    """Absurd values must not reach PortAudio: too small defeats the
+    purpose, too large starves the timestamp clock's observations and
+    trips the capture-stall watchdog."""
+    import chirp.audio.shared_stream as shared
+    from chirp.constants import (CAPTURE_BLOCKSIZE_MAX, CAPTURE_BLOCKSIZE_MIN,
+                                 CAPTURE_BLOCKSIZE)
+    before = shared.current_params()
+    try:
+        bs, _ = shared.configure(blocksize=10 ** 9)
+        assert bs == CAPTURE_BLOCKSIZE_MAX
+        bs, _ = shared.configure(blocksize=1)
+        assert bs == CAPTURE_BLOCKSIZE_MIN
+        bs, _ = shared.configure(blocksize='not-a-number')
+        assert bs == CAPTURE_BLOCKSIZE
+        bs, lat = shared.configure(blocksize=8192, latency='high')
+        assert (bs, lat) == (8192, 'high')
+        _bs, lat = shared.configure(latency=0.3)
+        assert lat == 0.3
+        _bs, lat = shared.configure(latency='garbage')
+        assert lat in ('low', 'high') or isinstance(lat, float)
+    finally:
+        shared.configure(*before)
+
+
+def test_configured_blocksize_reaches_the_stream(monkeypatch):
+    import chirp.audio.shared_stream as shared
+    from chirp.audio.capture import AudioCapture
+    from chirp.audio.ringbuffer import AudioRing
+
+    opened = {}
+
+    class _FakeStream:
+        def __init__(self, **kw):
+            opened.update(kw)
+
+        def start(self): pass
+        def stop(self): pass
+        def close(self): pass
+
+    before = shared.current_params()
+    shared.reset_registry()
+    monkeypatch.setattr(shared, '_stream_factory', _FakeStream)
+    monkeypatch.setattr(shared, '_device_input_channels', lambda d: 2)
+    monkeypatch.setattr(shared, '_warn_samplerate_mismatch', lambda *a, **k: None)
+    try:
+        shared.configure(blocksize=16384, latency=0.2)
+        cap = AudioCapture(AudioRing(44100 * 10, channels=1), device=3,
+                           channels=1, samplerate=44100)
+        assert cap.valid
+        assert opened['blocksize'] == 16384
+        assert opened['latency'] == 0.2
+    finally:
+        shared.reset_registry()
+        shared.configure(*before)

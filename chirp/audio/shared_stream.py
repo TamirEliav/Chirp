@@ -51,13 +51,55 @@ import threading
 
 import sounddevice as sd
 
-from chirp.constants import CAPTURE_BLOCKSIZE, CAPTURE_LATENCY, DTYPE
+from chirp.constants import (CAPTURE_BLOCKSIZE, CAPTURE_BLOCKSIZE_MAX,
+                             CAPTURE_BLOCKSIZE_MIN, CAPTURE_LATENCY, DTYPE)
 from chirp.error_log import log as _err_log
 
 # Test seam: monkeypatch to substitute a fake stream class so the shared
 # layer can be exercised without an audio device. ``None`` → the real
 # ``sd.InputStream``.
 _stream_factory = None
+
+# Capture parameters applied to streams opened from now on. Settable
+# from the config file (``audio`` section) via :func:`configure` so the
+# buffer can be tuned in the field without editing code — the field
+# fault this exists for (a late Python callback letting the driver
+# zero-fill) is hardware- and machine-specific.
+_capture_blocksize: int = CAPTURE_BLOCKSIZE
+_capture_latency = CAPTURE_LATENCY
+
+
+def configure(blocksize=None, latency=None) -> tuple[int, object]:
+    """Set the capture blocksize / latency for streams opened after this
+    call, clamping the blocksize into the supported range. Already-open
+    streams keep their parameters until they are reopened (Stop/Start
+    Acq, or a config load, which rebuilds every capture).
+
+    Returns the effective ``(blocksize, latency)``.
+    """
+    global _capture_blocksize, _capture_latency
+    if blocksize is not None:
+        try:
+            bs = int(blocksize)
+        except (TypeError, ValueError):
+            bs = CAPTURE_BLOCKSIZE
+        _capture_blocksize = max(CAPTURE_BLOCKSIZE_MIN,
+                                 min(CAPTURE_BLOCKSIZE_MAX, bs))
+    if latency is not None:
+        # 'low' / 'high' or an explicit float in seconds.
+        if isinstance(latency, str) and latency.strip().lower() in ('low', 'high'):
+            _capture_latency = latency.strip().lower()
+        else:
+            try:
+                _capture_latency = max(0.0, float(latency))
+            except (TypeError, ValueError):
+                _capture_latency = CAPTURE_LATENCY
+    return _capture_blocksize, _capture_latency
+
+
+def current_params() -> tuple[int, object]:
+    """The capture parameters the next stream will open with."""
+    return _capture_blocksize, _capture_latency
 
 # (device, samplerate) → SharedInputStream. Guarded by ``_registry_lock``
 # for mutation; the audio callback never touches it.
@@ -121,10 +163,12 @@ class SharedInputStream:
         self._key        = (device, int(samplerate))
         factory = _stream_factory or sd.InputStream
         try:
+            self.blocksize = int(_capture_blocksize)
+            self.latency = _capture_latency
             self._stream = factory(
                 samplerate=self.samplerate, channels=self.channels,
-                dtype=DTYPE, blocksize=CAPTURE_BLOCKSIZE, device=device,
-                latency=CAPTURE_LATENCY, callback=self._callback,
+                dtype=DTYPE, blocksize=self.blocksize, device=device,
+                latency=self.latency, callback=self._callback,
             )
         except Exception as exc:
             self.open_error = f'{type(exc).__name__}: {exc}'[:200]

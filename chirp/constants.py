@@ -54,6 +54,24 @@ CAPTURE_LATENCY     = 'high'
 # 0.25 to ask the driver for a deeper host buffer. Both trade only
 # monitor/display latency for capture robustness.
 CAPTURE_BLOCKSIZE   = 4096
+# Accepted range for the user-configurable capture blocksize
+# (``audio.capture_blocksize`` in the config file).
+#
+# The upper bound is not arbitrary. Three things break down as the
+# buffer grows:
+#   * the disciplined timestamp clock takes ONE observation per callback
+#     and filters them with a windowed minimum over 10 s buckets — at
+#     65536 frames / 44.1 kHz that is still ~7 observations per bucket,
+#     but much beyond it a bucket can end up empty and the filter loses
+#     its ability to reject late deliveries;
+#   * ``RecordingEntity.CAPTURE_STALL_SECONDS`` (5 s) declares a device
+#     dead when no frames arrive — the buffer period must stay well
+#     under it or a healthy stream looks stalled;
+#   * triggering, the spectrogram and the monitor all lag by one buffer.
+# Below 256 the callback rate climbs back into the range this setting
+# exists to escape.
+CAPTURE_BLOCKSIZE_MIN = 256
+CAPTURE_BLOCKSIZE_MAX = 65536
 
 # ── Display ────────────────────────────────────────────────────────────────────
 DISPLAY_SECONDS     = 10.0
@@ -238,6 +256,7 @@ __all__ = [
     # Audio
     "SAMPLE_RATE", "CHANNELS", "CHUNK_FRAMES", "DTYPE", "RING_SECONDS",
     "CAPTURE_LATENCY", "CAPTURE_BLOCKSIZE",
+    "CAPTURE_BLOCKSIZE_MIN", "CAPTURE_BLOCKSIZE_MAX",
     # Display
     "DISPLAY_SECONDS", "SPECTROGRAM_NPERSEG", "COLORMAP",
     "ANIMATION_INTERVAL", "SPEC_DB_MIN", "SPEC_DB_MAX", "N_DISPLAY_ROWS",

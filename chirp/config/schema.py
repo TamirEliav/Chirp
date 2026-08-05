@@ -37,6 +37,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
+from chirp.constants import CAPTURE_BLOCKSIZE, CAPTURE_LATENCY
 from chirp.recording.entity import RecordingEntity
 
 
@@ -63,11 +64,27 @@ DEFAULT_MONITOR = {
 }
 
 
+# Capture-engine tuning (v3.8.1). Machine/hardware-specific knobs for
+# keeping the realtime callback on time: with sounddevice the callback is
+# Python and must take the GIL, and a callback that misses its deadline
+# is what lets a driver zero-fill or drop samples. ``capture_blocksize``
+# sets how often it fires (bigger = less often, at the cost of monitor /
+# display / trigger latency, none of which affects recorded audio);
+# ``capture_latency`` is passed to PortAudio as the suggested input
+# latency — 'low', 'high', or an explicit float in seconds — and is what
+# actually buys the driver slack.
+DEFAULT_AUDIO = {
+    "capture_blocksize": CAPTURE_BLOCKSIZE,
+    "capture_latency": CAPTURE_LATENCY,
+}
+
 # Set of top-level keys recognized by the loader. Anything else triggers
 # a warning so users notice typos and forks notice schema drift.
 _KNOWN_TOP_KEYS: frozenset[str] = frozenset({
-    "version", "view_mode", "recordings", "monitor",
+    "version", "view_mode", "recordings", "monitor", "audio",
 })
+
+_KNOWN_AUDIO_KEYS: frozenset[str] = frozenset(DEFAULT_AUDIO.keys())
 
 # Set of keys recognized inside each recording's dict. Mirrors
 # `RecordingEntity.to_dict` exactly.
@@ -146,16 +163,46 @@ def _normalize_fill_order(value) -> str:
     return "row" if str(value).lower().startswith("row") else "column"
 
 
+def parse_audio_settings(data: dict) -> tuple[dict, list[str]]:
+    """Extract the ``audio`` section from a settings dict.
+
+    Standalone (rather than part of :func:`load_settings_dict`'s return)
+    because it must be applied BEFORE entities are constructed —
+    building a RecordingEntity opens its capture, which is exactly when
+    the blocksize takes effect.
+    """
+    warnings: list[str] = []
+    raw = data.get("audio") or {}
+    if not isinstance(raw, dict):
+        warnings.append("audio is not a dict — using defaults")
+        raw = {}
+    unknown = sorted(set(raw.keys()) - _KNOWN_AUDIO_KEYS)
+    if unknown:
+        warnings.append(
+            f"Ignoring unknown audio key(s): {', '.join(unknown)}")
+    return {
+        "capture_blocksize": raw.get("capture_blocksize",
+                                     DEFAULT_AUDIO["capture_blocksize"]),
+        "capture_latency": raw.get("capture_latency",
+                                   DEFAULT_AUDIO["capture_latency"]),
+    }, warnings
+
+
 def build_settings_dict(entities: Iterable[RecordingEntity],
                         view_mode: dict | None = None,
-                        monitor: dict | None = None) -> dict:
-    """Serialize a collection of entities + view-mode + monitor to a plain dict."""
+                        monitor: dict | None = None,
+                        audio: dict | None = None) -> dict:
+    """Serialize a collection of entities + view-mode + monitor + audio
+    settings to a plain dict."""
     vm = dict(DEFAULT_VIEW_MODE)
     if view_mode:
         vm.update(view_mode)
     mon = dict(DEFAULT_MONITOR)
     if monitor:
         mon.update(monitor)
+    aud = dict(DEFAULT_AUDIO)
+    if audio:
+        aud.update(audio)
     return {
         "version": CONFIG_SCHEMA_VERSION,
         "view_mode": {
@@ -172,6 +219,12 @@ def build_settings_dict(entities: Iterable[RecordingEntity],
             "muted":                 bool(mon.get("muted", DEFAULT_MONITOR["muted"])),
             "follow":                bool(mon.get("follow", DEFAULT_MONITOR["follow"])),
             "source_index":          int(mon.get("source_index", DEFAULT_MONITOR["source_index"])),
+        },
+        "audio": {
+            "capture_blocksize": int(aud.get("capture_blocksize",
+                                             DEFAULT_AUDIO["capture_blocksize"])),
+            "capture_latency":   aud.get("capture_latency",
+                                         DEFAULT_AUDIO["capture_latency"]),
         },
         "recordings": [e.to_dict() for e in entities],
     }

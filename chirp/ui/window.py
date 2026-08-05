@@ -2595,7 +2595,14 @@ class ChirpWindow(QMainWindow):
                 'fill_order':   self._vm_fill_order,
             },
             monitor=self._build_monitor_settings(),
+            audio=self._build_audio_settings(),
         )
+
+    def _build_audio_settings(self) -> dict:
+        """Capture-engine tuning, as the next stream would open."""
+        from chirp.audio import shared_stream as _shared
+        blocksize, latency = _shared.current_params()
+        return {'capture_blocksize': blocksize, 'capture_latency': latency}
 
     def _write_settings_to_path(self, path: str, data: dict) -> bool:
         # #52: atomic settings write. Serialize to JSON in memory
@@ -2781,7 +2788,18 @@ class ChirpWindow(QMainWindow):
         # and instantiated entities directly, leaving the schema
         # version guard, the migration chain, and the unknown-key
         # warnings as dead code (only exercised by tests).
-        from chirp.config import load_settings_dict
+        from chirp.config import load_settings_dict, parse_audio_settings
+        # Capture tuning must be applied BEFORE the entities are built —
+        # constructing a RecordingEntity opens its capture, which is
+        # when the blocksize / latency take effect.
+        audio_warnings: list[str] = []
+        try:
+            audio_cfg, audio_warnings = parse_audio_settings(data)
+            from chirp.audio import shared_stream as _shared
+            _shared.configure(audio_cfg.get('capture_blocksize'),
+                              audio_cfg.get('capture_latency'))
+        except Exception as exc:
+            print(f'[Chirp] could not apply audio settings: {exc}')
         try:
             entities, view_mode, monitor, schema_warnings = load_settings_dict(data)
         except ValueError as exc:
@@ -2842,7 +2860,7 @@ class ChirpWindow(QMainWindow):
         # Per-entity device warnings come back inside ``schema_warnings``
         # already (load_settings_dict appends RecordingEntity.from_dict's
         # warning). Surface them all in a single modal at the end.
-        warnings = list(schema_warnings)
+        warnings = list(audio_warnings) + list(schema_warnings)
         for ent in entities:
             # #7: re-wire the monitor on every freshly-loaded entity.
             ent.set_monitor(self._monitor)
