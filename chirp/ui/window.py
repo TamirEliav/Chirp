@@ -45,6 +45,7 @@ from chirp.constants import *  # noqa: F401,F403
 from chirp.audio import AudioCapture, AudioMonitor  # noqa: F401
 from chirp.audio.devices import list_output_devices, host_api_name
 from chirp.config import DEFAULT_VIEW_MODE, DEFAULT_MONITOR  # noqa: F401
+from chirp.error_log import log as _err_log
 from chirp.dsp import (  # noqa: F401
     BandpassFilter,
     SpectrogramAccumulator,
@@ -134,6 +135,18 @@ class ChirpWindow(QMainWindow):
         self._recovery_needs_refresh = False
         self._recovery_thread: threading.Thread | None = None
         self._recovery_backoff = 3.0   # doubles on failure, max 30 s
+
+        # Capture-engine settings + inserted-silence auto-recovery state.
+        # The audio dict mirrors the config file's ``audio`` section; the
+        # recovery bookkeeping is per-entity (how long its duty cycle has
+        # been high) and per-device (when that endpoint was last reset,
+        # so a persistent fault can't become a restart loop).
+        from chirp.config.schema import DEFAULT_AUDIO
+        self._audio_cfg = dict(DEFAULT_AUDIO)
+        self._zero_high_since: dict[int, float] = {}
+        self._zero_recover_last: dict[tuple, float] = {}
+        self._zero_recover_thread: threading.Thread | None = None
+        self.zero_recovery_count = 0
 
         # #7: shared audio-monitor loopback. One output stream; each
         # RecordingEntity is wired into it in `_add_recording` and the
@@ -1128,13 +1141,17 @@ class ChirpWindow(QMainWindow):
         self._btn_save_as = QPushButton('\U0001f4be Save As')
         self._btn_load    = QPushButton('\U0001f4c2 Load')
         self._btn_startup = QPushButton('⚙ Startup')
+        self._btn_advanced = QPushButton('⚙ Advanced')
+        self._btn_advanced.setToolTip(
+            'Capture engine tuning (buffer sizes) and inserted-silence '
+            'auto-recovery')
         self._btn_save   .setToolTip('Save configuration to the current file')
         self._btn_save_as.setToolTip('Save configuration to a new file')
         self._btn_load   .setToolTip('Load configuration from a file (.json or legacy .chirp)')
         self._btn_startup.setToolTip('Choose which configuration Chirp loads at startup '
                                      '(empty / last used / a specific file)')
         for btn in (self._btn_save, self._btn_save_as, self._btn_load,
-                    self._btn_startup):
+                    self._btn_startup, self._btn_advanced):
             btn.setObjectName('btn_browse')
 
         # Width diet: the global QSS gives every button min-width 120px
@@ -1145,7 +1162,8 @@ class ChirpWindow(QMainWindow):
         for btn in (self._btn_start_acq, self._btn_stop_acq,
                     self._btn_start_rec, self._btn_stop_rec,
                     self._btn_save, self._btn_save_as,
-                    self._btn_load, self._btn_reset, self._btn_startup):
+                    self._btn_load, self._btn_reset, self._btn_startup,
+                    self._btn_advanced):
             btn.setStyleSheet(btn.styleSheet()
                               + 'min-width: 0px; padding: 6px 10px;')
 
@@ -1158,7 +1176,8 @@ class ChirpWindow(QMainWindow):
         btn_g.addWidget(self._btn_save_as,   3, 1)
         btn_g.addWidget(self._btn_load,      4, 0)
         btn_g.addWidget(self._btn_reset,     4, 1)
-        btn_g.addWidget(self._btn_startup,   5, 0, 1, 2)
+        btn_g.addWidget(self._btn_startup,   5, 0)
+        btn_g.addWidget(self._btn_advanced,  5, 1)
         btn_g.addWidget(self._btn_view_mode, 6, 0, 1, 2)
         return btn_box
 
@@ -1856,6 +1875,7 @@ class ChirpWindow(QMainWindow):
         self._btn_save_as .clicked.connect(self._save_settings_as)
         self._btn_load    .clicked.connect(self._load_settings)
         self._btn_startup .clicked.connect(self._open_startup_prefs)
+        self._btn_advanced.clicked.connect(self._open_advanced_settings)
         self._btn_view_mode.clicked.connect(self._toggle_view_mode)
 
         # Threshold (hidden spinbox, synced from amplitude graph drag)
@@ -2599,10 +2619,14 @@ class ChirpWindow(QMainWindow):
         )
 
     def _build_audio_settings(self) -> dict:
-        """Capture-engine tuning, as the next stream would open."""
+        """Capture-engine tuning, as the next stream would open, plus the
+        inserted-silence auto-recovery settings."""
         from chirp.audio import shared_stream as _shared
         blocksize, latency = _shared.current_params()
-        return {'capture_blocksize': blocksize, 'capture_latency': latency}
+        out = dict(self._audio_cfg)
+        out['capture_blocksize'] = blocksize
+        out['capture_latency'] = latency
+        return out
 
     def _write_settings_to_path(self, path: str, data: dict) -> bool:
         # #52: atomic settings write. Serialize to JSON in memory
@@ -2689,6 +2713,154 @@ class ChirpWindow(QMainWindow):
         if not loaded:
             # Empty config (historical default) or fallback.
             self._add_recording()
+
+    # ── Advanced (capture engine + auto-recovery) ─────────────────────
+
+    def _open_advanced_settings(self):
+        """Capture-engine tuning and inserted-silence auto-recovery.
+
+        These live here rather than in the per-stream panels because
+        they are properties of the machine and its audio hardware, not
+        of any one recording: the buffer sizes apply to every capture
+        stream, and the recovery watchdog acts on a whole device.
+        """
+        from chirp.audio import shared_stream as _shared
+        from chirp.constants import (CAPTURE_BLOCKSIZE_MAX,
+                                     CAPTURE_BLOCKSIZE_MIN)
+
+        cur_bs, cur_lat = _shared.current_params()
+        cfg = dict(self._audio_cfg)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Advanced Settings')
+        v = QVBoxLayout(dlg)
+
+        # ── Capture engine ────────────────────────────────────────────
+        cap_box = QGroupBox('CAPTURE ENGINE')
+        cap_form = QGridLayout(cap_box)
+        row = 0
+
+        cap_form.addWidget(QLabel('Input buffer (latency):'), row, 0)
+        sb_lat = QDoubleSpinBox()
+        sb_lat.setRange(0.0, 2.0)
+        sb_lat.setSingleStep(0.05)
+        sb_lat.setDecimals(2)
+        sb_lat.setSuffix(' s')
+        sb_lat.setSpecialValueText('device default')
+        sb_lat.setValue(float(cur_lat) if isinstance(cur_lat, (int, float))
+                        else 0.0)
+        cap_form.addWidget(sb_lat, row, 1)
+        row += 1
+        hint_lat = QLabel(
+            'How late the machine may be before captured audio is lost.\n'
+            'This is the setting that protects against dropouts and\n'
+            'inserted silence. "device default" can be as little as 10 ms\n'
+            'on WASAPI — an explicit 0.25–0.5 s is far safer.')
+        hint_lat.setStyleSheet(f'color: {C["subtext"]};')
+        cap_form.addWidget(hint_lat, row, 0, 1, 2)
+        row += 1
+
+        cap_form.addWidget(QLabel('Callback block size:'), row, 0)
+        cb_bs = QComboBox()
+        sizes = [b for b in (1024, 2048, 4096, 8192, 16384, 32768, 65536)
+                 if CAPTURE_BLOCKSIZE_MIN <= b <= CAPTURE_BLOCKSIZE_MAX]
+        for b in sizes:
+            cb_bs.addItem(f'{b} frames', b)
+        idx = cb_bs.findData(int(cur_bs))
+        cb_bs.setCurrentIndex(idx if idx >= 0 else 0)
+        cap_form.addWidget(cb_bs, row, 1)
+        row += 1
+        hint_bs = QLabel(
+            'How often Chirp is handed audio. Larger = fewer wake-ups\n'
+            '(less chance of being late) but more delay before the\n'
+            'monitor and spectrogram update. Does NOT affect recordings.')
+        hint_bs.setStyleSheet(f'color: {C["subtext"]};')
+        cap_form.addWidget(hint_bs, row, 0, 1, 2)
+        row += 1
+
+        lbl_apply = QLabel('Both take effect the next time a stream opens '
+                           '(Stop Acq → Start Acq, or a config load).')
+        lbl_apply.setStyleSheet(f'color: {C["peach"]};')
+        cap_form.addWidget(lbl_apply, row, 0, 1, 2)
+        v.addWidget(cap_box)
+
+        # ── Auto-recovery ─────────────────────────────────────────────
+        rec_box = QGroupBox('INSERTED-SILENCE AUTO-RECOVERY')
+        rec_form = QGridLayout(rec_box)
+        r = 0
+        chk = QCheckBox('Restart acquisition automatically when the input '
+                        'is being zero-filled')
+        chk.setChecked(bool(cfg.get('auto_recover_zero_runs', True)))
+        rec_form.addWidget(chk, r, 0, 1, 2)
+        r += 1
+
+        rec_form.addWidget(QLabel('Trigger above:'), r, 0)
+        sb_pct = QDoubleSpinBox()
+        sb_pct.setRange(0.1, 100.0)
+        sb_pct.setSingleStep(1.0)
+        sb_pct.setDecimals(1)
+        sb_pct.setSuffix(' % digital zeros')
+        sb_pct.setValue(float(cfg.get('zero_recover_percent', 5.0)))
+        rec_form.addWidget(sb_pct, r, 1)
+        r += 1
+
+        rec_form.addWidget(QLabel('Sustained for:'), r, 0)
+        sb_sec = QDoubleSpinBox()
+        sb_sec.setRange(1.0, 600.0)
+        sb_sec.setSingleStep(5.0)
+        sb_sec.setDecimals(0)
+        sb_sec.setSuffix(' s')
+        sb_sec.setValue(float(cfg.get('zero_recover_seconds', 15.0)))
+        rec_form.addWidget(sb_sec, r, 1)
+        r += 1
+
+        rec_form.addWidget(QLabel('Wait between attempts:'), r, 0)
+        sb_cool = QDoubleSpinBox()
+        sb_cool.setRange(5.0, 3600.0)
+        sb_cool.setSingleStep(30.0)
+        sb_cool.setDecimals(0)
+        sb_cool.setSuffix(' s')
+        sb_cool.setValue(float(cfg.get('zero_recover_cooldown_sec', 120.0)))
+        rec_form.addWidget(sb_cool, r, 1)
+        r += 1
+
+        hint_rec = QLabel(
+            'A capture session can latch into zero-filling the audio; the\n'
+            'only reliable reset is stopping every stream that uses that\n'
+            'device and starting again. This does it for you — recording\n'
+            'resumes automatically and each intervention is logged.')
+        hint_rec.setStyleSheet(f'color: {C["subtext"]};')
+        rec_form.addWidget(hint_rec, r, 0, 1, 2)
+        v.addWidget(rec_box)
+
+        def _sync_rec_enabled():
+            on = chk.isChecked()
+            for w in (sb_pct, sb_sec, sb_cool):
+                w.setEnabled(on)
+        chk.toggled.connect(_sync_rec_enabled)
+        _sync_rec_enabled()
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        latency = sb_lat.value()
+        # 0 means "whatever the device says" — stored as 'high' so the
+        # config keeps working with the string form the schema accepts.
+        _shared.configure(cb_bs.currentData(),
+                          latency if latency > 0 else 'high')
+        self._audio_cfg.update({
+            'auto_recover_zero_runs': bool(chk.isChecked()),
+            'zero_recover_percent': float(sb_pct.value()),
+            'zero_recover_seconds': float(sb_sec.value()),
+            'zero_recover_cooldown_sec': float(sb_cool.value()),
+        })
+        self._zero_high_since.clear()
+        self._mark_dirty()
 
     def _open_startup_prefs(self):
         """Modal to choose what Chirp loads on startup."""
@@ -2795,6 +2967,8 @@ class ChirpWindow(QMainWindow):
         audio_warnings: list[str] = []
         try:
             audio_cfg, audio_warnings = parse_audio_settings(data)
+            self._audio_cfg = dict(audio_cfg)
+            self._zero_high_since.clear()
             from chirp.audio import shared_stream as _shared
             _shared.configure(audio_cfg.get('capture_blocksize'),
                               audio_cfg.get('capture_latency'))
@@ -3984,6 +4158,13 @@ class ChirpWindow(QMainWindow):
         except Exception:
             pass
 
+        # Inserted-silence auto-recovery: reset an endpoint whose audio
+        # has been substantially digital silence for a sustained period.
+        try:
+            self._zero_recovery_tick()
+        except Exception:
+            pass
+
         # TODO#1 (RDP): capture-stall watchdog + auto-reconnect.
         try:
             self._capture_watchdog_tick()
@@ -4038,6 +4219,107 @@ class ChirpWindow(QMainWindow):
                 self._lbl_trig_status.style().polish(self._lbl_trig_status)
             except Exception:
                 pass
+
+    # ── Inserted-silence auto-recovery ────────────────────────────────
+    #
+    # Field evidence: a capture session can latch into a state where the
+    # driver/engine periodically zero-fills the audio, and the ONLY
+    # reliable reset is stopping acquisition on every stream that holds
+    # the endpoint and starting again — stopping just one is not enough,
+    # because the OS keeps the session alive for the remaining client.
+    # An overnight episode ran 96 minutes unattended. This watchdog
+    # performs that reset automatically.
+
+    def _zero_recovery_tick(self):
+        """Poll each stream's zero-sample duty cycle; when one stays
+        above the configured threshold for the configured time, reset
+        every stream on its device. Cheap enough for the UI tick — it
+        reads one float per entity."""
+        cfg = self._audio_cfg
+        if not cfg.get('auto_recover_zero_runs', True):
+            self._zero_high_since.clear()
+            return
+        t = self._zero_recover_thread
+        if t is not None and t.is_alive():
+            return
+        now = time.monotonic()
+        thr = float(cfg.get('zero_recover_percent', 5.0)) / 100.0
+        hold = float(cfg.get('zero_recover_seconds', 15.0))
+        cooldown = float(cfg.get('zero_recover_cooldown_sec', 120.0))
+        for e in self._entities:
+            key = id(e)
+            if (not getattr(e, 'acq_running', False)
+                    or getattr(e, 'input_source', '') != 'device'):
+                self._zero_high_since.pop(key, None)
+                continue
+            if float(getattr(e, 'zero_sample_frac', 0.0)) < thr:
+                self._zero_high_since.pop(key, None)
+                continue
+            since = self._zero_high_since.setdefault(key, now)
+            if now - since < hold:
+                continue
+            dev_key = (getattr(e, 'device_id', None),
+                       getattr(e, 'sample_rate', None))
+            if now - self._zero_recover_last.get(dev_key, -1e9) < cooldown:
+                continue
+            # Every stream on this endpoint has to go down together, or
+            # the OS session survives and the fault with it.
+            group = [g for g in self._entities
+                     if getattr(g, 'input_source', '') == 'device'
+                     and (getattr(g, 'device_id', None),
+                          getattr(g, 'sample_rate', None)) == dev_key]
+            self._zero_recover_last[dev_key] = now
+            for g in group:
+                self._zero_high_since.pop(id(g), None)
+            self._start_zero_recovery(group, e)
+            return
+
+    def _start_zero_recovery(self, group, trigger) -> None:
+        pct = float(getattr(trigger, 'zero_sample_frac', 0.0)) * 100.0
+        names = ', '.join(getattr(g, 'name', '?') for g in group)
+        self.zero_recovery_count += 1
+        msg = (f'inserted-silence auto-recovery #{self.zero_recovery_count}: '
+               f'{getattr(trigger, "name", "?")} at {pct:.1f}% digital '
+               f'zeros — restarting acquisition on all streams of this '
+               f'device ({names})')
+        print(f'[Chirp] {msg}')
+        _err_log('zero_run_recovery', getattr(trigger, 'name', ''), msg)
+        t = threading.Thread(target=self._zero_recovery_worker,
+                             args=(list(group),),
+                             name='chirp-zero-recovery', daemon=True)
+        self._zero_recover_thread = t
+        t.start()
+
+    def _zero_recovery_worker(self, group) -> None:
+        """Stop every stream on the endpoint, let the OS tear the capture
+        session down, then bring them back. Runs off the GUI thread —
+        ``stop_acq`` joins an ingest thread and closes PortAudio streams,
+        either of which can block."""
+        try:
+            was_rec = {id(g): bool(getattr(g, 'rec_enabled', False))
+                       for g in group}
+            for g in group:
+                try:
+                    g.stop_acq()
+                except Exception as exc:
+                    print(f'[Chirp] zero-recovery: stop failed for '
+                          f'{getattr(g, "name", "?")}: {exc}')
+            # The last close releases the endpoint; give the driver a
+            # moment to actually tear the session down before we ask for
+            # a new one.
+            time.sleep(0.75)
+            for g in group:
+                try:
+                    g.start_acq()
+                    if was_rec.get(id(g)):
+                        g.rec_enabled = True
+                except Exception as exc:
+                    print(f'[Chirp] zero-recovery: restart failed for '
+                          f'{getattr(g, "name", "?")}: {exc}')
+                    _err_log('zero_run_recovery', getattr(g, 'name', ''),
+                             f'restart after auto-recovery failed: {exc}')
+        except Exception as exc:
+            print(f'[Chirp] zero-recovery round crashed: {exc}')
 
     def _capture_watchdog_tick(self):
         """TODO#1: detect live-device captures that stopped delivering

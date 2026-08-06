@@ -600,6 +600,11 @@ class RecordingEntity:
         self._zero_batch_longest = 0
         self._zero_pending = 0
         if not runs:
+            # A clean window: publish 0 so ``zero_sample_frac`` stays a
+            # LIVE ~1 Hz metric. Leaving the last bad value in place
+            # would make the auto-recovery watchdog think the fault is
+            # still running long after it stopped.
+            self.zero_sample_frac = 0.0
             return n
         frac = zeroed / scanned
         self.zero_sample_frac = frac

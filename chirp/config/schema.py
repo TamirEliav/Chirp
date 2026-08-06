@@ -76,6 +76,17 @@ DEFAULT_MONITOR = {
 DEFAULT_AUDIO = {
     "capture_blocksize": CAPTURE_BLOCKSIZE,
     "capture_latency": CAPTURE_LATENCY,
+    # Inserted-silence auto-recovery. When the zero-sample duty cycle
+    # stays above ``zero_recover_percent`` for ``zero_recover_seconds``,
+    # acquisition is restarted on every stream sharing the affected
+    # device — the only reset known to clear a capture session that has
+    # latched into zero-filling, and the one the user otherwise has to
+    # perform by hand. ``zero_recover_cooldown_sec`` keeps a persistent
+    # fault from turning into a restart loop.
+    "auto_recover_zero_runs": True,
+    "zero_recover_percent": 5.0,
+    "zero_recover_seconds": 15.0,
+    "zero_recover_cooldown_sec": 120.0,
 }
 
 # Set of top-level keys recognized by the loader. Anything else triggers
@@ -180,12 +191,24 @@ def parse_audio_settings(data: dict) -> tuple[dict, list[str]]:
     if unknown:
         warnings.append(
             f"Ignoring unknown audio key(s): {', '.join(unknown)}")
-    return {
-        "capture_blocksize": raw.get("capture_blocksize",
-                                     DEFAULT_AUDIO["capture_blocksize"]),
-        "capture_latency": raw.get("capture_latency",
-                                   DEFAULT_AUDIO["capture_latency"]),
-    }, warnings
+    out = dict(DEFAULT_AUDIO)
+    for k in _KNOWN_AUDIO_KEYS:
+        if k in raw:
+            out[k] = raw[k]
+    # Coerce the numeric / boolean knobs so a hand-edited config can't
+    # feed a string into the watchdog arithmetic.
+    try:
+        out["auto_recover_zero_runs"] = bool(out["auto_recover_zero_runs"])
+        out["zero_recover_percent"] = max(0.1, float(out["zero_recover_percent"]))
+        out["zero_recover_seconds"] = max(1.0, float(out["zero_recover_seconds"]))
+        out["zero_recover_cooldown_sec"] = max(
+            5.0, float(out["zero_recover_cooldown_sec"]))
+    except (TypeError, ValueError):
+        warnings.append("audio: invalid auto-recovery value(s) — using defaults")
+        for k in ("auto_recover_zero_runs", "zero_recover_percent",
+                  "zero_recover_seconds", "zero_recover_cooldown_sec"):
+            out[k] = DEFAULT_AUDIO[k]
+    return out, warnings
 
 
 def build_settings_dict(entities: Iterable[RecordingEntity],
@@ -225,6 +248,18 @@ def build_settings_dict(entities: Iterable[RecordingEntity],
                                              DEFAULT_AUDIO["capture_blocksize"])),
             "capture_latency":   aud.get("capture_latency",
                                          DEFAULT_AUDIO["capture_latency"]),
+            "auto_recover_zero_runs": bool(
+                aud.get("auto_recover_zero_runs",
+                        DEFAULT_AUDIO["auto_recover_zero_runs"])),
+            "zero_recover_percent": float(
+                aud.get("zero_recover_percent",
+                        DEFAULT_AUDIO["zero_recover_percent"])),
+            "zero_recover_seconds": float(
+                aud.get("zero_recover_seconds",
+                        DEFAULT_AUDIO["zero_recover_seconds"])),
+            "zero_recover_cooldown_sec": float(
+                aud.get("zero_recover_cooldown_sec",
+                        DEFAULT_AUDIO["zero_recover_cooldown_sec"])),
         },
         "recordings": [e.to_dict() for e in entities],
     }

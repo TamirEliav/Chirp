@@ -37,6 +37,11 @@ Categories
                   any PortAudio flag; restart acquisition on ALL
                   streams of the affected input device to clear the
                   latched endpoint state). Throttled.
+``zero_run_recovery`` — The inserted-silence watchdog restarted
+                  acquisition on every stream of a device because its
+                  zero-sample duty cycle stayed above the configured
+                  threshold. Logged per intervention (and per failure to
+                  restart). Not throttled.
 ``ingest``      — Exception raised inside the per-entity DSP loop
                   (DSP / FFT / trigger). Logged every event.
 ``open``        — Capture failed to open the device or the WAV input
