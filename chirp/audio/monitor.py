@@ -37,6 +37,36 @@ _DEFAULT_RING_CHUNKS = 8
 # partially overwrite itself before playback caught up.
 _RING_FRAMES = max(CHUNK_FRAMES * _DEFAULT_RING_CHUNKS, CAPTURE_BLOCKSIZE * 4)
 
+# ── Jitter buffer ────────────────────────────────────────────────────────
+#
+# WASAPI *shared* mode delivers capture on the engine's own steady period
+# no matter how much latency was requested, so audio trickles in evenly
+# and the output callback always finds samples waiting. WASAPI
+# *exclusive* and WDM-KS do not: the requested latency becomes the
+# device buffer, and the driver hands over that whole buffer at once —
+# 0.5 s of audio arriving in a few milliseconds, then nothing for 0.5 s.
+# Draining that as it arrives empties the ring before the next burst, so
+# the output callback zero-fills the gap and the monitor stutters once
+# per burst. That is the "chunky" monitor, and it scales with the
+# latency setting exactly as observed in the field.
+#
+# The cure is the standard one: hold back a target level before playing,
+# so playback rides across the gap between bursts. The cost is monitor
+# delay equal to that level — unavoidable, since a source that speaks
+# only every 0.5 s cannot be monitored continuously on less than 0.5 s
+# of buffer. Nothing here touches acquisition or recording: the capture
+# ring is 10 s deep and absorbs bursts without noticing.
+#
+# The target self-tunes rather than being configured: it starts at one
+# capture block and DOUBLES on each underrun until playback is
+# continuous, so it converges on whatever cadence the driver actually
+# uses without the user having to know what the driver does. It is not
+# shrunk again while the device stays open — lowering it could not
+# reclaim latency already sitting in the ring, and re-priming on purpose
+# would create the very gap it exists to avoid.
+_PREFILL_MAX_SEC = 1.0
+_PREFILL_RING_FACTOR = 3
+
 
 class _RingBuffer:
     """Lock-free mono/stereo sample ring buffer (SPSC + clear-floor).
@@ -220,6 +250,13 @@ class AudioMonitor:
         # Output gain, 0.0–2.0 (1.0 = unity / 100%). Applied in the
         # output callback; survives device reopen and mute toggles.
         self._gain: float = 1.0
+        # Jitter buffer: play only once this many frames are resident,
+        # so bursty capture (exclusive / WDM-KS) doesn't stutter.
+        self._prefill_floor: int = CAPTURE_BLOCKSIZE
+        self._prefill_frames: int = CAPTURE_BLOCKSIZE
+        self._prefill_max: int = int(_PREFILL_MAX_SEC * SAMPLE_RATE)
+        self._priming: bool = True
+        self._underrun_count: int = 0
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -232,6 +269,20 @@ class AudioMonitor:
         unity). A single float store, atomic under the GIL — safe to
         call from the UI thread while the output callback runs."""
         self._gain = float(min(2.0, max(0.0, gain)))
+
+    @property
+    def prefill_frames(self) -> int:
+        """Frames the jitter buffer currently holds back before playing.
+        Grows on underrun; the monitor's delay tracks it."""
+        return self._prefill_frames
+
+    @property
+    def underrun_count(self) -> int:
+        """Times the output callback ran dry since the device opened.
+        A handful right after a source switch is the buffer finding the
+        driver's cadence; a number that keeps climbing means the capture
+        is arriving in bursts longer than ``_PREFILL_MAX_SEC``."""
+        return self._underrun_count
 
     @property
     def output_device(self) -> Any:
@@ -285,8 +336,17 @@ class AudioMonitor:
             self._samplerate = sr
             self._channels = ch
             # Re-size the ring buffer for the new channel count / SR.
+            # It must hold several times the largest jitter buffer the
+            # monitor may grow to, or a burst would overwrite its own
+            # tail before playback reached it.
+            self._prefill_max = int(_PREFILL_MAX_SEC * sr)
+            self._prefill_floor = min(CAPTURE_BLOCKSIZE, self._prefill_max)
+            self._prefill_frames = self._prefill_floor
+            self._priming = True
+            self._underrun_count = 0
             self._ring = _RingBuffer(
-                capacity_frames=_RING_FRAMES,
+                capacity_frames=max(_RING_FRAMES,
+                                    _PREFILL_RING_FACTOR * self._prefill_max),
                 channels=ch,
             )
             self._stream = sd.OutputStream(
@@ -317,6 +377,9 @@ class AudioMonitor:
         if source_id != self._source_id:
             self._source_id = source_id
             self._ring.clear()
+            # The ring is empty again — re-prime rather than play the
+            # first arriving block into an empty buffer.
+            self._priming = True
 
     def feed(self, source_id: Any, chunk: np.ndarray) -> None:
         """Called from capture threads — no-op unless this is the active source."""
@@ -334,6 +397,7 @@ class AudioMonitor:
         self._close_stream()
         self._source_id = None
         self._ring.clear()
+        self._priming = True
 
     # ── Internals ─────────────────────────────────────────────────────
 
@@ -351,6 +415,14 @@ class AudioMonitor:
         self._device = None
 
     def _callback(self, outdata, frames, time_info, status):
+        # Jitter buffer. While priming, output silence until the target
+        # level is resident — playing early is what makes a bursty
+        # capture stutter once per burst.
+        if self._priming:
+            if self._ring.size() < self._prefill_frames + frames:
+                outdata[:] = 0.0
+                return
+            self._priming = False
         if self._channels == 1:
             # ``outdata`` is (frames, 1); read into a flat view.
             n = self._ring.read(frames, outdata[:, 0])
@@ -360,6 +432,16 @@ class AudioMonitor:
             n = self._ring.read(frames, outdata)
             if n < frames:
                 outdata[n:] = 0.0
+        if n < frames:
+            # Ran dry: the source delivers in bursts longer than the
+            # current target. Double it (once per underrun, capped) and
+            # re-prime, so the stutter converges to a single gap instead
+            # of repeating on every burst.
+            self._underrun_count += 1
+            self._prefill_frames = min(self._prefill_max,
+                                       max(self._prefill_floor,
+                                           self._prefill_frames * 2))
+            self._priming = True
         # Output gain (0–200%). In-place scale on the filled region;
         # boosted output is clipped to full scale so a >100% gain can't
         # wrap when the driver converts to fixed point.

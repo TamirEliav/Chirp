@@ -403,6 +403,7 @@ def test_gain_default_and_clamping():
 
 def test_callback_applies_gain():
     m = AudioMonitor()
+    m._priming = False          # gain path under test, not the jitter buffer
     m.set_gain(0.5)
     m._ring.write(np.full(CHUNK_FRAMES, 0.8, dtype=np.float32))
     out = np.zeros((CHUNK_FRAMES, 1), dtype=np.float32)
@@ -412,6 +413,7 @@ def test_callback_applies_gain():
 
 def test_callback_boost_clips_to_full_scale():
     m = AudioMonitor()
+    m._priming = False          # gain path under test, not the jitter buffer
     m.set_gain(2.0)
     m._ring.write(np.full(CHUNK_FRAMES, 0.8, dtype=np.float32))
     out = np.zeros((CHUNK_FRAMES, 1), dtype=np.float32)
@@ -422,8 +424,157 @@ def test_callback_boost_clips_to_full_scale():
 
 def test_callback_unity_gain_leaves_samples_untouched():
     m = AudioMonitor()
+    m._priming = False          # gain path under test, not the jitter buffer
     m._ring.write(np.full(4, 0.25, dtype=np.float32))
     out = np.zeros((CHUNK_FRAMES, 1), dtype=np.float32)
     m._callback(out, CHUNK_FRAMES, None, None)
     np.testing.assert_allclose(out[:4, 0], 0.25, atol=1e-7)
     np.testing.assert_allclose(out[4:, 0], 0.0)
+
+
+# ── Jitter buffer (bursty capture: WASAPI exclusive / WDM-KS) -------------
+#
+# Shared-mode WASAPI delivers capture on the engine's steady period, so
+# the output callback always finds samples waiting. Exclusive mode and
+# WDM-KS instead hand over one device buffer at a time: with a 0.5 s
+# latency setting, half a second of audio arrives at once and then
+# nothing for half a second. Draining as it arrives empties the ring
+# before the next burst and the monitor stutters once per burst — the
+# "chunky" monitor reported from the field, scaling with the latency
+# setting. These tests pin the buffer that rides across the gap.
+
+def _prime(monitor, frames=CHUNK_FRAMES):
+    """Run output callbacks until the jitter buffer starts playing."""
+    out = np.zeros((frames, monitor.channels), dtype=np.float32)
+    for _ in range(64):
+        monitor._callback(out, frames, None, None)
+        if not monitor._priming:
+            return True
+    return False
+
+
+def _monitor_with_fake_stream(prefill=CHUNK_FRAMES, capacity=None):
+    m = AudioMonitor()
+    m._stream = object()               # feed() requires an open stream
+    m._source_id = 'src'
+    m._channels = 1
+    m._prefill_floor = prefill
+    m._prefill_frames = prefill
+    m._prefill_max = prefill * 8
+    m._priming = True
+    m._underrun_count = 0
+    m._ring = _RingBuffer(capacity_frames=capacity or prefill * 24,
+                          channels=1)
+    return m
+
+
+def test_monitor_outputs_silence_until_prefilled():
+    """Playing the first block into a nearly-empty ring is what makes a
+    bursty source stutter; hold back until the target is resident."""
+    m = _monitor_with_fake_stream(prefill=4 * CHUNK_FRAMES)
+    out = np.zeros((CHUNK_FRAMES, 1), dtype=np.float32)
+
+    m.feed('src', np.full(CHUNK_FRAMES, 0.5, dtype=np.float32))
+    m._callback(out, CHUNK_FRAMES, None, None)
+    assert np.all(out == 0.0), 'must not play before the target level'
+    assert m._ring.size() == CHUNK_FRAMES, 'held-back audio is kept, not dropped'
+
+    m.feed('src', np.full(4 * CHUNK_FRAMES, 0.5, dtype=np.float32))
+    m._callback(out, CHUNK_FRAMES, None, None)
+    assert np.all(out == 0.5), 'must play once the target is resident'
+
+
+def test_ring_holds_a_full_delivery_burst(monkeypatch):
+    """The sizing rule that actually fixes the chunky monitor.
+
+    Exclusive / WDM-KS hand over one device buffer at a time, so the
+    ring level jumps by a whole burst. The old capacity was derived from
+    the capture BLOCK size (4x8192 = 743 ms), which a 0.5 s burst plus
+    the samples still queued from the previous one can exceed — and an
+    overflowing ring drops its oldest frames, so part of every burst is
+    destroyed before playback reaches it. That loss grows with the
+    latency setting, exactly as reported. Capacity must be derived from
+    the maximum burst the buffer is prepared to ride out.
+    """
+    import chirp.audio.monitor as mon
+
+    class _FakeOut:
+        def __init__(self, **kw):
+            pass
+
+        def start(self): pass
+        def stop(self): pass
+        def close(self): pass
+
+    monkeypatch.setattr(mon.sd, 'OutputStream', _FakeOut)
+    monkeypatch.setattr(mon.sd, 'query_devices',
+                        lambda d: {'max_output_channels': 2})
+    m = AudioMonitor()
+    assert m.set_output_device(0, samplerate=44100, channels=1)
+    assert m._ring.capacity >= 3 * mon._PREFILL_MAX_SEC * 44100
+    assert m._ring.capacity >= m.prefill_frames + int(0.5 * 44100), \
+        'must hold a 0.5 s delivery burst on top of the jitter buffer'
+
+
+def test_burst_survives_the_ring_intact():
+    """A whole burst must be playable, not just its tail."""
+    burst = 22050                       # 0.5 s at 44.1 kHz
+    m = _monitor_with_fake_stream(prefill=CHUNK_FRAMES,
+                                  capacity=3 * burst)
+    data = np.arange(burst, dtype=np.float32)
+    m.feed('src', data)
+    out = np.zeros(burst, dtype=np.float32)
+    m._priming = False
+    n = m._ring.read(burst, out)
+    assert n == burst
+    np.testing.assert_array_equal(out, data)
+
+    # Control: a ring that cannot hold one burst silently destroys its
+    # head — audible as the monitor dropping part of every burst.
+    small = _monitor_with_fake_stream(prefill=CHUNK_FRAMES,
+                                      capacity=burst // 2)
+    small.feed('src', data)
+    assert small._ring.size() < burst
+
+
+def test_prefill_target_grows_on_underrun_and_is_capped():
+    m = _monitor_with_fake_stream(prefill=CHUNK_FRAMES)
+    out = np.zeros((CHUNK_FRAMES, 1), dtype=np.float32)
+    m.feed('src', np.full(2 * CHUNK_FRAMES, 0.5, dtype=np.float32))
+    assert _prime(m)
+    before = m.prefill_frames
+    # Drain past the end of what was fed → underrun.
+    for _ in range(4):
+        m._callback(out, CHUNK_FRAMES, None, None)
+    assert m.underrun_count >= 1
+    assert m.prefill_frames > before
+    # Repeated underruns must not grow the buffer without bound —
+    # monitor delay tracks this number.
+    for _ in range(200):
+        m._priming = False
+        m._callback(out, CHUNK_FRAMES, None, None)
+    assert m.prefill_frames <= m._prefill_max
+
+
+def test_source_switch_re_primes():
+    """After a flush the ring is empty; playing straight into it would
+    reproduce the stutter the buffer exists to prevent."""
+    m = _monitor_with_fake_stream(prefill=CHUNK_FRAMES)
+    m.feed('src', np.full(4 * CHUNK_FRAMES, 0.5, dtype=np.float32))
+    assert _prime(m)
+    m.set_source('other')
+    assert m._priming is True
+
+
+def test_steady_source_never_underruns():
+    """The buffer must not cost latency on a well-behaved shared-mode
+    source: one block in, one block out, no growth."""
+    m = _monitor_with_fake_stream(prefill=CHUNK_FRAMES)
+    out = np.zeros((CHUNK_FRAMES, 1), dtype=np.float32)
+    m.feed('src', np.full(2 * CHUNK_FRAMES, 0.5, dtype=np.float32))
+    assert _prime(m)
+    for _ in range(200):
+        m.feed('src', np.full(CHUNK_FRAMES, 0.5, dtype=np.float32))
+        m._callback(out, CHUNK_FRAMES, None, None)
+    assert m.underrun_count == 0
+    assert m.prefill_frames == CHUNK_FRAMES
