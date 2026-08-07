@@ -2622,10 +2622,11 @@ class ChirpWindow(QMainWindow):
         """Capture-engine tuning, as the next stream would open, plus the
         inserted-silence auto-recovery settings."""
         from chirp.audio import shared_stream as _shared
-        blocksize, latency = _shared.current_params()
+        blocksize, latency, exclusive = _shared.current_params()
         out = dict(self._audio_cfg)
         out['capture_blocksize'] = blocksize
         out['capture_latency'] = latency
+        out['capture_exclusive'] = exclusive
         return out
 
     def _write_settings_to_path(self, path: str, data: dict) -> bool:
@@ -2728,7 +2729,7 @@ class ChirpWindow(QMainWindow):
         from chirp.constants import (CAPTURE_BLOCKSIZE_MAX,
                                      CAPTURE_BLOCKSIZE_MIN)
 
-        cur_bs, cur_lat = _shared.current_params()
+        cur_bs, cur_lat, cur_excl = _shared.current_params()
         cfg = dict(self._audio_cfg)
 
         dlg = QDialog(self)
@@ -2778,8 +2779,27 @@ class ChirpWindow(QMainWindow):
         cap_form.addWidget(hint_bs, row, 0, 1, 2)
         row += 1
 
-        lbl_apply = QLabel('Both take effect the next time a stream opens '
-                           '(Stop Acq → Start Acq, or a config load).')
+        chk_excl = QCheckBox('WASAPI exclusive mode (bypass the Windows '
+                             'audio mixer)')
+        chk_excl.setChecked(bool(cur_excl))
+        cap_form.addWidget(chk_excl, row, 0, 1, 2)
+        row += 1
+        hint_excl = QLabel(
+            'Hands the input endpoint to Chirp alone, so captured audio\n'
+            'comes straight from the driver instead of through the shared\n'
+            'Windows audio engine — the layer that inserts the silent gaps.\n'
+            'While it is on, no other application can use that input, and\n'
+            'the hardware must accept the stream format natively. Only\n'
+            'WASAPI devices support it; on MME / DirectSound / WDM-KS\n'
+            'entries the request is logged and ignored. If an exclusive\n'
+            'open is refused, Chirp opens shared and logs it — check\n'
+            'chirp_errors.log for "mode=EXCLUSIVE" to confirm it took.')
+        hint_excl.setStyleSheet(f'color: {C["subtext"]};')
+        cap_form.addWidget(hint_excl, row, 0, 1, 2)
+        row += 1
+
+        lbl_apply = QLabel('All three take effect the next time a stream '
+                           'opens (Stop Acq → Start Acq, or a config load).')
         lbl_apply.setStyleSheet(f'color: {C["peach"]};')
         cap_form.addWidget(lbl_apply, row, 0, 1, 2)
         v.addWidget(cap_box)
@@ -2852,8 +2872,10 @@ class ChirpWindow(QMainWindow):
         # 0 means "whatever the device says" — stored as 'high' so the
         # config keeps working with the string form the schema accepts.
         _shared.configure(cb_bs.currentData(),
-                          latency if latency > 0 else 'high')
+                          latency if latency > 0 else 'high',
+                          bool(chk_excl.isChecked()))
         self._audio_cfg.update({
+            'capture_exclusive': bool(chk_excl.isChecked()),
             'auto_recover_zero_runs': bool(chk.isChecked()),
             'zero_recover_percent': float(sb_pct.value()),
             'zero_recover_seconds': float(sb_sec.value()),
@@ -2971,7 +2993,8 @@ class ChirpWindow(QMainWindow):
             self._zero_high_since.clear()
             from chirp.audio import shared_stream as _shared
             _shared.configure(audio_cfg.get('capture_blocksize'),
-                              audio_cfg.get('capture_latency'))
+                              audio_cfg.get('capture_latency'),
+                              audio_cfg.get('capture_exclusive'))
         except Exception as exc:
             print(f'[Chirp] could not apply audio settings: {exc}')
         try:

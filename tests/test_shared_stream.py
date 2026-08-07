@@ -309,6 +309,119 @@ def test_stream_opens_with_configured_params():
     a, _ = _cap(device=7)
     kw = FakeStream.instances[0].kw
     from chirp.audio import shared_stream as sh
-    blocksize, latency = sh.current_params()
+    blocksize, latency, _excl = sh.current_params()
     assert kw['blocksize'] == blocksize
     assert kw['latency'] == latency
+
+
+# ── WASAPI exclusive mode ────────────────────────────────────────────────
+#
+# Field logs (2026-08-07) put the inserted-silence fault BELOW PortAudio:
+# whole 5-8 ms driver periods arrive as digital zeros with no status flag
+# while Chirp's own callback is provably on time. Exclusive mode takes
+# the shared Windows audio engine out of that path. These tests pin the
+# contract that makes it safe to leave on an unattended overnight rig:
+# it is requested only where it exists, and a refusal degrades to a
+# shared open rather than to a dead stream.
+
+@pytest.fixture
+def _fake_hostapi(monkeypatch):
+    """Fake sd.query_devices / query_hostapis / WasapiSettings so the
+    real ``_exclusive_settings`` logic is exercised without hardware."""
+    state = {'api': 'Windows WASAPI'}
+
+    class _Settings:
+        def __init__(self, exclusive=False, **kw):
+            self.exclusive = exclusive
+
+    monkeypatch.setattr(shared.sd, 'query_devices',
+                        lambda dev: {'hostapi': 0, 'max_input_channels': 2,
+                                     'default_samplerate': 44100.0})
+    monkeypatch.setattr(shared.sd, 'query_hostapis',
+                        lambda i: {'name': state['api']})
+    monkeypatch.setattr(shared.sd, 'WasapiSettings', _Settings, raising=False)
+    return state
+
+
+@pytest.fixture(autouse=True)
+def _restore_capture_params():
+    before = shared.current_params()
+    yield
+    shared.configure(*before)
+
+
+def test_shared_mode_is_the_default_and_passes_no_extra_settings():
+    a, _ = _cap(device=7)
+    assert a.valid
+    assert FakeStream.instances[0].kw['extra_settings'] is None
+    assert a._shared.exclusive is False
+
+
+def test_exclusive_mode_requests_wasapi_exclusive(_fake_hostapi):
+    shared.configure(exclusive=True)
+    a, _ = _cap(device=7)
+    assert a.valid
+    extra = FakeStream.instances[0].kw['extra_settings']
+    assert extra is not None and extra.exclusive is True
+    assert a._shared.exclusive is True
+
+
+def test_exclusive_mode_ignored_on_non_wasapi_host_api(_fake_hostapi):
+    """MME / DirectSound / WDM-KS have no exclusive mode — asking would
+    fail the open, so the request is dropped and the stream opens
+    normally rather than not at all."""
+    _fake_hostapi['api'] = 'Windows WDM-KS'
+    shared.configure(exclusive=True)
+    a, _ = _cap(device=7)
+    assert a.valid
+    assert FakeStream.instances[0].kw['extra_settings'] is None
+    assert a._shared.exclusive is False
+
+
+def test_refused_exclusive_open_falls_back_to_shared(monkeypatch,
+                                                     _fake_hostapi):
+    """Another app holding the endpoint (or an unsupported format) must
+    not leave an overnight rig with no capture at all."""
+    class _RefusesExclusive(FakeStream):
+        def __init__(self, **kw):
+            if kw.get('extra_settings') is not None:
+                raise OSError('Device unavailable [PaError -9985]')
+            super().__init__(**kw)
+
+    monkeypatch.setattr(shared, '_stream_factory', _RefusesExclusive)
+    shared.configure(exclusive=True)
+    a, _ = _cap(device=7)
+    assert a.valid, 'must fall back to a shared open, not fail'
+    assert a._shared.exclusive is False
+    assert FakeStream.instances[-1].kw['extra_settings'] is None
+
+
+def test_open_failure_still_reported_when_both_modes_fail(monkeypatch,
+                                                          _fake_hostapi):
+    class _Bad:
+        def __init__(self, **kw):
+            raise OSError('no such device [PaError -9996]')
+
+    monkeypatch.setattr(shared, '_stream_factory', _Bad)
+    shared.configure(exclusive=True)
+    cap, _ = _cap(device=7)
+    assert cap.valid is False
+    assert 'OSError' in cap.open_error
+    assert shared.registry_size() == 0
+
+
+def test_exclusive_mode_skips_the_shared_resampler_warning(monkeypatch,
+                                                           _fake_hostapi):
+    """The SRC warning describes shared-mode behaviour; in exclusive mode
+    the engine's resampler isn't in the path, so repeating it would send
+    the user chasing a setting that no longer applies."""
+    seen = []
+    monkeypatch.setattr(shared, '_warn_samplerate_mismatch',
+                        lambda *a, **kw: seen.append(a))
+    shared.configure(exclusive=True)
+    _cap(device=7)
+    assert seen == []
+    shared.configure(exclusive=False)
+    shared.reset_registry()
+    _cap(device=8)
+    assert len(seen) == 1

@@ -354,6 +354,28 @@ def test_audio_section_round_trip():
     assert not [w for w in warnings if 'audio' in w.lower()]
 
 
+def test_capture_exclusive_round_trips_and_defaults_off():
+    """Exclusive mode must survive a save/load — it is set once on a
+    field machine and has to still be in force after the next launch.
+    It defaults OFF because it locks other applications out of the
+    input endpoint."""
+    from chirp.config.schema import (DEFAULT_AUDIO, build_settings_dict,
+                                     parse_audio_settings)
+    assert DEFAULT_AUDIO['capture_exclusive'] is False
+    e = _fresh_entity('excl')
+    data = build_settings_dict([e], audio={'capture_exclusive': True})
+    decoded = json.loads(json.dumps(data))
+    assert decoded['audio']['capture_exclusive'] is True
+    cfg, warnings = parse_audio_settings(decoded)
+    assert cfg['capture_exclusive'] is True
+    assert not [w for w in warnings if 'audio' in w.lower()]
+    # A hand-edited config must not feed a string into the open path.
+    cfg, _ = parse_audio_settings({'audio': {'capture_exclusive': 'yes'}})
+    assert cfg['capture_exclusive'] is True
+    cfg, _ = parse_audio_settings({'audio': {'capture_exclusive': 0}})
+    assert cfg['capture_exclusive'] is False
+
+
 def test_audio_defaults_when_section_absent():
     from chirp.config.schema import DEFAULT_AUDIO, parse_audio_settings
     cfg, warnings = parse_audio_settings({'recordings': []})
@@ -385,17 +407,17 @@ def test_blocksize_is_clamped_to_supported_range():
                                  CAPTURE_BLOCKSIZE)
     before = shared.current_params()
     try:
-        bs, _ = shared.configure(blocksize=10 ** 9)
+        bs, _, _ = shared.configure(blocksize=10 ** 9)
         assert bs == CAPTURE_BLOCKSIZE_MAX
-        bs, _ = shared.configure(blocksize=1)
+        bs, _, _ = shared.configure(blocksize=1)
         assert bs == CAPTURE_BLOCKSIZE_MIN
-        bs, _ = shared.configure(blocksize='not-a-number')
+        bs, _, _ = shared.configure(blocksize='not-a-number')
         assert bs == CAPTURE_BLOCKSIZE
-        bs, lat = shared.configure(blocksize=8192, latency='high')
+        bs, lat, _ = shared.configure(blocksize=8192, latency='high')
         assert (bs, lat) == (8192, 'high')
-        _bs, lat = shared.configure(latency=0.3)
+        _bs, lat, _ = shared.configure(latency=0.3)
         assert lat == 0.3
-        _bs, lat = shared.configure(latency='garbage')
+        _bs, lat, _ = shared.configure(latency='garbage')
         assert lat in ('low', 'high') or isinstance(lat, float)
     finally:
         shared.configure(*before)

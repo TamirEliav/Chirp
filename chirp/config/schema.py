@@ -37,7 +37,8 @@ from __future__ import annotations
 
 from typing import Iterable
 
-from chirp.constants import CAPTURE_BLOCKSIZE, CAPTURE_LATENCY
+from chirp.constants import (CAPTURE_BLOCKSIZE, CAPTURE_EXCLUSIVE,
+                             CAPTURE_LATENCY)
 from chirp.recording.entity import RecordingEntity
 
 
@@ -72,10 +73,14 @@ DEFAULT_MONITOR = {
 # display / trigger latency, none of which affects recorded audio);
 # ``capture_latency`` is passed to PortAudio as the suggested input
 # latency — 'low', 'high', or an explicit float in seconds — and is what
-# actually buys the driver slack.
+# actually buys the driver slack. ``capture_exclusive`` goes a layer
+# lower: it asks WASAPI for exclusive use of the endpoint, taking the
+# Windows audio engine (the layer field logs implicate in the
+# inserted-silence fault) out of the capture path entirely.
 DEFAULT_AUDIO = {
     "capture_blocksize": CAPTURE_BLOCKSIZE,
     "capture_latency": CAPTURE_LATENCY,
+    "capture_exclusive": CAPTURE_EXCLUSIVE,
     # Inserted-silence auto-recovery. When the zero-sample duty cycle
     # stays above ``zero_recover_percent`` for ``zero_recover_seconds``,
     # acquisition is restarted on every stream sharing the affected
@@ -197,6 +202,7 @@ def parse_audio_settings(data: dict) -> tuple[dict, list[str]]:
             out[k] = raw[k]
     # Coerce the numeric / boolean knobs so a hand-edited config can't
     # feed a string into the watchdog arithmetic.
+    out["capture_exclusive"] = bool(out["capture_exclusive"])
     try:
         out["auto_recover_zero_runs"] = bool(out["auto_recover_zero_runs"])
         out["zero_recover_percent"] = max(0.1, float(out["zero_recover_percent"]))
@@ -248,6 +254,9 @@ def build_settings_dict(entities: Iterable[RecordingEntity],
                                              DEFAULT_AUDIO["capture_blocksize"])),
             "capture_latency":   aud.get("capture_latency",
                                          DEFAULT_AUDIO["capture_latency"]),
+            "capture_exclusive": bool(
+                aud.get("capture_exclusive",
+                        DEFAULT_AUDIO["capture_exclusive"])),
             "auto_recover_zero_runs": bool(
                 aud.get("auto_recover_zero_runs",
                         DEFAULT_AUDIO["auto_recover_zero_runs"])),

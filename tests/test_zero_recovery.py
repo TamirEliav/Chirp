@@ -256,7 +256,7 @@ def test_advanced_dialog_builds_and_applies(monkeypatch):
         monkeypatch.setattr(QDialog, 'exec_', lambda self: QDialog.Accepted)
         host.open_advanced()
         # Values round-trip out of the widgets unchanged.
-        bs, lat = shared.current_params()
+        bs, lat, _ = shared.current_params()
         assert bs == 4096
         assert lat == 0.25
         assert host._audio_cfg['auto_recover_zero_runs'] is True
@@ -295,5 +295,50 @@ def test_advanced_dialog_cancel_changes_nothing(monkeypatch):
         assert host._audio_cfg['zero_recover_percent'] == 42.0
         assert host.dirty == 0
         assert shared.current_params() == before
+    finally:
+        shared.configure(*before)
+
+
+def test_advanced_dialog_round_trips_exclusive_mode(monkeypatch):
+    """The exclusive-mode checkbox must reach BOTH the open path
+    (shared_stream.configure, which the next stream reads) and the saved
+    config (_audio_cfg, which _build_audio_settings serializes) — a
+    setting that survives only one of those looks like it silently
+    reverted."""
+    from PyQt5.QtWidgets import QDialog, QWidget
+
+    import chirp.audio.shared_stream as shared
+
+    _qt_app()
+
+    class _Host(QWidget):
+        def __init__(self):
+            super().__init__()
+            self._audio_cfg = dict(DEFAULT_AUDIO)
+            self._zero_high_since = {}
+            self.dirty = 0
+
+        def _mark_dirty(self):
+            self.dirty += 1
+
+        open_advanced = ChirpWindow._open_advanced_settings
+
+    before = shared.current_params()
+    host = _Host()
+    try:
+        shared.configure(exclusive=False)
+        monkeypatch.setattr(QDialog, 'exec_', lambda self: QDialog.Accepted)
+        # The checkbox starts from what the next stream would open with,
+        # so flipping the module state and reopening the dialog must
+        # preserve it rather than silently reset to the default.
+        host.open_advanced()
+        assert shared.current_params()[2] is False
+        assert host._audio_cfg['capture_exclusive'] is False
+
+        shared.configure(exclusive=True)
+        host.open_advanced()
+        assert shared.current_params()[2] is True, \
+            'dialog must show and re-apply the current mode, not the default'
+        assert host._audio_cfg['capture_exclusive'] is True
     finally:
         shared.configure(*before)

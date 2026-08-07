@@ -52,7 +52,8 @@ import threading
 import sounddevice as sd
 
 from chirp.constants import (CAPTURE_BLOCKSIZE, CAPTURE_BLOCKSIZE_MAX,
-                             CAPTURE_BLOCKSIZE_MIN, CAPTURE_LATENCY, DTYPE)
+                             CAPTURE_BLOCKSIZE_MIN, CAPTURE_EXCLUSIVE,
+                             CAPTURE_LATENCY, DTYPE)
 from chirp.error_log import log as _err_log
 
 # Test seam: monkeypatch to substitute a fake stream class so the shared
@@ -67,17 +68,20 @@ _stream_factory = None
 # zero-fill) is hardware- and machine-specific.
 _capture_blocksize: int = CAPTURE_BLOCKSIZE
 _capture_latency = CAPTURE_LATENCY
+_capture_exclusive: bool = CAPTURE_EXCLUSIVE
 
 
-def configure(blocksize=None, latency=None) -> tuple[int, object]:
-    """Set the capture blocksize / latency for streams opened after this
-    call, clamping the blocksize into the supported range. Already-open
-    streams keep their parameters until they are reopened (Stop/Start
-    Acq, or a config load, which rebuilds every capture).
+def configure(blocksize=None, latency=None,
+              exclusive=None) -> tuple[int, object, bool]:
+    """Set the capture blocksize / latency / exclusive-mode flag for
+    streams opened after this call, clamping the blocksize into the
+    supported range. Already-open streams keep their parameters until
+    they are reopened (Stop/Start Acq, or a config load, which rebuilds
+    every capture).
 
-    Returns the effective ``(blocksize, latency)``.
+    Returns the effective ``(blocksize, latency, exclusive)``.
     """
-    global _capture_blocksize, _capture_latency
+    global _capture_blocksize, _capture_latency, _capture_exclusive
     if blocksize is not None:
         try:
             bs = int(blocksize)
@@ -94,12 +98,14 @@ def configure(blocksize=None, latency=None) -> tuple[int, object]:
                 _capture_latency = max(0.0, float(latency))
             except (TypeError, ValueError):
                 _capture_latency = CAPTURE_LATENCY
-    return _capture_blocksize, _capture_latency
+    if exclusive is not None:
+        _capture_exclusive = bool(exclusive)
+    return _capture_blocksize, _capture_latency, _capture_exclusive
 
 
-def current_params() -> tuple[int, object]:
+def current_params() -> tuple[int, object, bool]:
     """The capture parameters the next stream will open with."""
-    return _capture_blocksize, _capture_latency
+    return _capture_blocksize, _capture_latency, _capture_exclusive
 
 # (device, samplerate) → SharedInputStream. Guarded by ``_registry_lock``
 # for mutation; the audio callback never touches it.
@@ -118,6 +124,45 @@ def _device_input_channels(device) -> int:
         return int(info.get('max_input_channels', 0) or 0)
     except Exception:
         return 0
+
+
+def _exclusive_settings(device, name: str = ''):
+    """PortAudio ``extra_settings`` requesting WASAPI exclusive mode, or
+    ``None`` when this device cannot honour it.
+
+    Exclusive mode is a WASAPI concept: the endpoint is handed to a
+    single client and the Windows audio engine's mixing / buffering path
+    — the layer observed inserting whole zero-filled periods into the
+    capture — is out of the picture. Asking for it on an MME,
+    DirectSound or WDM-KS entry would make the open fail, so the request
+    is logged and dropped instead (WDM-KS already bypasses the engine on
+    its own).
+    """
+    try:
+        dev = device
+        if dev is None:
+            dev = sd.default.device[0]
+        info = sd.query_devices(dev)
+        api = sd.query_hostapis(int(info['hostapi']))
+        api_name = str(api.get('name', ''))
+    except Exception as exc:
+        _err_log('open', name,
+                 f'exclusive mode requested but the device could not be '
+                 f'probed ({type(exc).__name__}: {exc}) — opening shared')
+        return None
+    if 'wasapi' not in api_name.lower():
+        _err_log('open', name,
+                 f'exclusive mode requested but device is on host API '
+                 f'"{api_name}", which has no exclusive mode — opening '
+                 f'normally (only WASAPI entries support it)')
+        return None
+    try:
+        return sd.WasapiSettings(exclusive=True)
+    except Exception as exc:
+        _err_log('open', name,
+                 f'exclusive mode unavailable in this sounddevice build '
+                 f'({type(exc).__name__}: {exc}) — opening shared')
+        return None
 
 
 def _warn_samplerate_mismatch(device, samplerate: int, name: str) -> None:
@@ -162,22 +207,53 @@ class SharedInputStream:
         self._dead       = False
         self._key        = (device, int(samplerate))
         factory = _stream_factory or sd.InputStream
-        try:
-            self.blocksize = int(_capture_blocksize)
-            self.latency = _capture_latency
-            self._stream = factory(
+        self.blocksize = int(_capture_blocksize)
+        self.latency = _capture_latency
+        # Resolved below: what the stream actually opened with, not what
+        # was asked for. A device that cannot do exclusive mode still
+        # opens — shared — so an overnight rig never dies on a setting.
+        self.exclusive = False
+        extra = (_exclusive_settings(device, name)
+                 if _capture_exclusive else None)
+
+        def _open(extra_settings):
+            return factory(
                 samplerate=self.samplerate, channels=self.channels,
                 dtype=DTYPE, blocksize=self.blocksize, device=device,
                 latency=self.latency, callback=self._callback,
+                extra_settings=extra_settings,
             )
+
+        try:
+            self._stream = _open(extra)
+            self.exclusive = extra is not None
         except Exception as exc:
-            self.open_error = f'{type(exc).__name__}: {exc}'[:200]
-            print(f'[SharedInputStream] Failed to open device {device}: '
-                  f'{exc}')
-            _err_log('open', name,
-                     f'failed to open device {device}: '
-                     f'{type(exc).__name__}: {exc}')
-            return
+            if extra is not None:
+                # Exclusive open refused — the format isn't supported
+                # natively or another application holds the endpoint.
+                # Fall back rather than leave the stream down, but say so
+                # loudly: an experiment that silently ran in shared mode
+                # would look like exclusive mode failing to help.
+                msg = (f'EXCLUSIVE mode open failed on device {device} '
+                       f'({type(exc).__name__}: {exc}) — falling back to '
+                       f'shared mode. Another app may hold this endpoint, '
+                       f'or the hardware may not accept '
+                       f'{self.channels} ch @ {self.samplerate} Hz natively.')
+                print(f'[SharedInputStream] {msg}')
+                _err_log('open', name, msg)
+                try:
+                    self._stream = _open(None)
+                except Exception as exc2:
+                    exc = exc2
+                    self._stream = None
+            if self._stream is None:
+                self.open_error = f'{type(exc).__name__}: {exc}'[:200]
+                print(f'[SharedInputStream] Failed to open device {device}: '
+                      f'{exc}')
+                _err_log('open', name,
+                         f'failed to open device {device}: '
+                         f'{type(exc).__name__}: {exc}')
+                return
         # Report what the driver actually granted: ``latency`` is only a
         # *suggestion*, and on WASAPI the device's own 'high' default can
         # be as little as 10 ms — far too thin a margin for a shared
@@ -193,8 +269,13 @@ class SharedInputStream:
                      f'({self.blocksize / max(1, self.samplerate) * 1000:.0f} ms), '
                      f'requested latency={self.latency}, '
                      f'granted latency={actual * 1000:.1f} ms, '
-                     f'{self.channels} ch @ {self.samplerate} Hz')
-        _warn_samplerate_mismatch(device, self.samplerate, name)
+                     f'{self.channels} ch @ {self.samplerate} Hz, '
+                     f'mode={"EXCLUSIVE" if self.exclusive else "shared"}')
+        if not self.exclusive:
+            # Exclusive mode owns the endpoint outright, so the shared
+            # engine's resampler isn't in the path and the mismatch
+            # warning would be misleading.
+            _warn_samplerate_mismatch(device, self.samplerate, name)
 
     # ── Introspection ────────────────────────────────────────────────
 

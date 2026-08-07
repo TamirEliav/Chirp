@@ -84,6 +84,22 @@ CAPTURE_BLOCKSIZE   = 4096
 # exists to escape.
 CAPTURE_BLOCKSIZE_MIN = 256
 CAPTURE_BLOCKSIZE_MAX = 65536
+# WASAPI exclusive mode for capture (``audio.capture_exclusive``).
+#
+# In shared mode every capture goes through the Windows audio engine,
+# which owns the endpoint's buffer and is free to zero-fill a period it
+# could not service. Field logs show exactly that: whole 5-8 ms driver
+# periods arriving as digital silence, at a rate that ramps over hours,
+# with NO PortAudio status flag and with Chirp's own callback provably
+# on time. Exclusive mode hands the endpoint to a single client and
+# bypasses the engine's mixing/buffering path entirely, so it is the
+# next layer down to test.
+#
+# Off by default: exclusive mode locks other applications out of the
+# endpoint and requires the hardware to accept the requested format
+# natively. Only WASAPI devices honour it — on MME / DirectSound /
+# WDM-KS entries the request is logged and ignored.
+CAPTURE_EXCLUSIVE   = False
 
 # ── Display ────────────────────────────────────────────────────────────────────
 DISPLAY_SECONDS     = 10.0
@@ -269,6 +285,7 @@ __all__ = [
     "SAMPLE_RATE", "CHANNELS", "CHUNK_FRAMES", "DTYPE", "RING_SECONDS",
     "CAPTURE_LATENCY", "CAPTURE_BLOCKSIZE",
     "CAPTURE_BLOCKSIZE_MIN", "CAPTURE_BLOCKSIZE_MAX",
+    "CAPTURE_EXCLUSIVE",
     # Display
     "DISPLAY_SECONDS", "SPECTROGRAM_NPERSEG", "COLORMAP",
     "ANIMATION_INTERVAL", "SPEC_DB_MIN", "SPEC_DB_MAX", "N_DISPLAY_ROWS",
