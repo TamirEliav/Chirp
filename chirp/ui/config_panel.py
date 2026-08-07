@@ -27,9 +27,8 @@ from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import QMenu
 
 from chirp.constants import (AMP_DB_EPS, AMP_DB_MAX, AMP_DB_MIN, C,
-                             CHUNK_FRAMES, SPEC_DB_MIN)
-from chirp.ui.pg_panel import (EVENTS_BG, blank_span, events_rgba,
-                               hidden_span, spec_ytick_key, spec_ytick_list)
+                             CHUNK_FRAMES)
+from chirp.ui.pg_panel import events_rgba, spec_ytick_key, spec_ytick_list
 
 _INFERNO_LUT = (
     matplotlib.colormaps['inferno'](np.linspace(0.0, 1.0, 256))[:, :3] * 255
@@ -58,10 +57,7 @@ def _decimate_max(y: np.ndarray, max_cols: int) -> np.ndarray:
     """Peak (max) decimation for non-negative envelope data."""
     n = y.shape[0]
     if n <= max_cols * 2:
-        # Copy, never the caller's array: the display-pacing blank
-        # mutates what we return, and these inputs are live ring
-        # buffers the ingest thread owns.
-        return y.copy()
+        return y
     k = n // max_cols
     m = n // k
     return y[:m * k].reshape(m, k).max(axis=1)
@@ -72,10 +68,7 @@ def _decimate_minmax(y: np.ndarray, max_cols: int) -> np.ndarray:
     preserves the visual peak envelope in both directions."""
     n = y.shape[0]
     if n <= max_cols * 2:
-        # Copy, never the caller's array: the display-pacing blank
-        # mutates what we return, and these inputs are live ring
-        # buffers the ingest thread owns.
-        return y.copy()
+        return y
     k = n // max_cols
     m = n // k
     z = y[:m * k].reshape(m, k)
@@ -247,15 +240,13 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
         if show_wave:
             p = add_plot(mouse_y=True)
             p.setLabel('left', 'Wave')
-            self._wave = p.plot(pen=pg.mkPen(C['teal'], width=1),
-                                connect='finite')
+            self._wave = p.plot(pen=pg.mkPen(C['teal'], width=1))
             self._wave.setDownsampling(auto=True, method='peak')
             self._wave.setClipToView(True)
             if stereo:
                 p = add_plot(mouse_y=True)
                 p.setLabel('left', 'Wave R')
-                self._wave_r = p.plot(pen=pg.mkPen(C['pink'], width=1),
-                                      connect='finite')
+                self._wave_r = p.plot(pen=pg.mkPen(C['pink'], width=1))
                 self._wave_r.setDownsampling(auto=True, method='peak')
                 self._wave_r.setClipToView(True)
 
@@ -265,15 +256,11 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
         # the interesting range is often a narrow band near the noise floor.
         amp_p = add_plot(mouse_y=True)
         amp_p.setLabel('left', 'Amp (dB)' if self._amp_scale == 'log' else 'Amp')
-        # connect='finite': display pacing blanks with NaN (see
-        # pg_panel.blank_span), which must break the curve.
-        self._amp = amp_p.plot(pen=pg.mkPen(C['blue'], width=1),
-                               connect='finite')
+        self._amp = amp_p.plot(pen=pg.mkPen(C['blue'], width=1))
         self._amp.setDownsampling(auto=True, method='peak')
         self._amp.setClipToView(True)
         if stereo:
-            self._amp_r = amp_p.plot(pen=pg.mkPen(C['pink'], width=1),
-                                     connect='finite')
+            self._amp_r = amp_p.plot(pen=pg.mkPen(C['pink'], width=1))
             self._amp_r.setDownsampling(auto=True, method='peak')
             self._amp_r.setClipToView(True)
         if self._amp_scale == 'log':
@@ -291,8 +278,7 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
             ent_p = add_plot(mouse_y=True)
             ent_p.setLabel('left', 'Entropy')
             ent_p.setYRange(0.0, 1.0, padding=0)
-            self._entropy = ent_p.plot(pen=pg.mkPen(C['peach'], width=1),
-                                       connect='finite')
+            self._entropy = ent_p.plot(pen=pg.mkPen(C['peach'], width=1))
             self._spec_thr_line = pg.InfiniteLine(
                 angle=0, movable=not self._locked,
                 pen=pg.mkPen(C['peach'], width=2, style=pg.QtCore.Qt.DashLine))
@@ -390,9 +376,7 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
     def update_from_entity(self, e) -> None:
         self.rebuild_if_needed(e)
         disp = float(e.display_seconds)
-        # Paced cursor + the strip that has been ingested but not yet
-        # revealed (see RecordingEntity.advance_display).
-        hidden = hidden_span(e)
+        # Paced cursor (see RecordingEntity.advance_display).
         cursor_x = (e.display_head / e.sample_rate) % disp
         for cur in self._cursors:
             cur.setValue(cursor_x)
@@ -424,15 +408,13 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
 
         clim_lo = min(e.db_floor, e.db_ceil - 0.1)
         if self._img is not None:
-            spec = blank_span(e.resample_spec(e.spec_buffer), hidden,
-                              SPEC_DB_MIN, axis=1)
+            spec = e.resample_spec(e.spec_buffer)
             self._img.setImage(spec, autoLevels=False)
             self._img.setLevels([clim_lo, e.db_ceil])
             self._img.setRect(pg.QtCore.QRectF(0.0, 0.0, disp,
                                                float(spec.shape[0])))
         if self._img_r is not None:
-            spec_r = blank_span(e.resample_spec(e.spec_buffer_r), hidden,
-                                SPEC_DB_MIN, axis=1)
+            spec_r = e.resample_spec(e.spec_buffer_r)
             self._img_r.setImage(spec_r, autoLevels=False)
             self._img_r.setLevels([clim_lo, e.db_ceil])
             self._img_r.setRect(pg.QtCore.QRectF(0.0, 0.0, disp,
@@ -445,36 +427,28 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
         if self._wave is not None:
             color = C['red'] if getattr(e, 'saturated', False) else C['teal']
             self._wave.setPen(pg.mkPen(color, width=1))
-            w = blank_span(_decimate_minmax(e.amp_buffer, _MAX_WAVE_COLS),
-                           hidden, np.nan)
+            w = _decimate_minmax(e.amp_buffer, _MAX_WAVE_COLS)
             self._wave.setData(self._t_axis(w.shape[0], disp), w)
         if self._wave_r is not None:
-            w_r = blank_span(
-                _decimate_minmax(e.amp_buffer_r, _MAX_WAVE_COLS),
-                hidden, np.nan)
+            w_r = _decimate_minmax(e.amp_buffer_r, _MAX_WAVE_COLS)
             self._wave_r.setData(self._t_axis(w_r.shape[0], disp), w_r)
         if self._amp is not None:
             color = C['red'] if getattr(e, 'saturated', False) else C['blue']
             self._amp.setPen(pg.mkPen(color, width=1))
             a = _amp_to_display(
-                blank_span(_decimate_max(e.abs_amp_buffer, _MAX_ENV_COLS),
-                           hidden, np.nan), scale)
+                _decimate_max(e.abs_amp_buffer, _MAX_ENV_COLS), scale)
             self._amp.setData(self._t_axis(a.shape[0], disp), a)
         if self._amp_r is not None:
             a_r = _amp_to_display(
-                blank_span(_decimate_max(e.abs_amp_buffer_r, _MAX_ENV_COLS),
-                           hidden, np.nan), scale)
+                _decimate_max(e.abs_amp_buffer_r, _MAX_ENV_COLS), scale)
             self._amp_r.setData(self._t_axis(a_r.shape[0], disp), a_r)
 
         if self._entropy is not None:
             nc = e._n_cols
-            self._entropy.setData(
-                self._t_axis(nc, disp),
-                blank_span(e.entropy_buffer.copy(), hidden, np.nan))
+            self._entropy.setData(self._t_axis(nc, disp), e.entropy_buffer)
 
         if self._events_img is not None:
             rgba = events_rgba(e)
             if rgba is not None:
-                blank_span(rgba, hidden, EVENTS_BG, axis=1)
                 self._events_img.setImage(rgba, autoLevels=False)
                 self._events_img.setRect(pg.QtCore.QRectF(0.0, 0.0, disp, 2.0))

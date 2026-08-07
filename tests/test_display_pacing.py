@@ -16,9 +16,14 @@ cushion. These tests pin the properties that make that safe to watch:
 * an idle stream doesn't starve its way to the maximum cushion;
 * a counter reset (sample-rate change) and a long UI stall resync
   instead of replaying history in slow motion;
-* the strip between the paced cursor and the write head is blanked —
-  it holds the newest audio sitting where the OLDEST should be, and
-  drawing it would show a duplicate of what is about to scroll past.
+* rendering never modifies the entity's buffers.
+
+Nothing is hidden between the paced cursor and the write head: those
+samples are already drawn at their correct position on the wrapping
+window, simply revealed before the cursor reaches them. Blanking them
+was tried and removed — the gap's far edge is the write head, which
+still jumps by a whole device buffer, so the blank strip pulsed at the
+burst rate and was more distracting than the early reveal.
 """
 
 import numpy as np
@@ -26,7 +31,6 @@ import pytest
 
 from chirp.constants import CHUNK_FRAMES
 from chirp.recording.entity import RecordingEntity
-from chirp.ui.pg_panel import blank_span, hidden_span
 
 
 @pytest.fixture
@@ -178,56 +182,11 @@ def test_cushion_is_capped_by_the_visible_window(ent):
             <= ent.DISPLAY_LAG_MAX_FRACTION * ent._total_samples + CHUNK_FRAMES)
 
 
-# ── Blanking the unrevealed strip ────────────────────────────────────────
-
-def test_hidden_span_none_when_caught_up(ent):
-    _ingest(ent, 40)
-    ent.advance_display(now=0.0)          # syncs: paced head == write head
-    assert ent._disp_abs == float(ent._samples_total)
-    assert hidden_span(ent) is None
-
-
-def test_blank_span_non_wrapping():
-    a = np.ones(10)
-    blank_span(a, (0.2, 0.5), 0.0)
-    assert list(a) == [1, 1, 0, 0, 0, 1, 1, 1, 1, 1]
-
-
-def test_blank_span_wrapping():
-    a = np.ones(10)
-    blank_span(a, (0.8, 0.2), 0.0)
-    assert list(a) == [0, 0, 1, 1, 1, 1, 1, 1, 0, 0]
-
-
-def test_blank_span_2d_time_axis():
-    a = np.ones((3, 10))
-    blank_span(a, (0.4, 0.6), 0.0, axis=1)
-    assert a[:, 4].sum() == 0 and a[:, 5].sum() == 0
-    assert a[:, 3].sum() == 3 and a[:, 6].sum() == 3
-
-
-def test_blank_span_no_op_without_a_span():
-    a = np.ones(10)
-    blank_span(a, None, 0.0)
-    assert a.sum() == 10
-
-
-def test_hidden_strip_covers_the_unrevealed_samples(ent):
-    ent.advance_display(now=0.0)          # engage pacing
-    ent._samples_total = ent._total_samples // 2
-    ent.write_head = ent._samples_total % ent._total_samples
-    ent._disp_abs = float(ent._samples_total - ent._total_samples // 10)
-    span = hidden_span(ent)
-    assert span is not None
-    assert span[0] == pytest.approx(0.4, abs=0.01)
-    assert span[1] == pytest.approx(0.5, abs=0.01)
-
-
 # ── Panels ───────────────────────────────────────────────────────────────
 
 def test_panels_render_paced_without_touching_live_buffers():
-    """The blank mutates arrays; a decimator that hands back the live
-    ring buffer would corrupt the audio the recorder still reads."""
+    """Rendering is a read: the display must never write into buffers
+    the ingest thread and recorder still own."""
     pytest.importorskip('pyqtgraph')
     from PyQt5.QtWidgets import QApplication
 
@@ -243,8 +202,7 @@ def test_panels_render_paced_without_touching_live_buffers():
         e.advance_display(now=0.0)
         e.advance_display(now=0.05)
         e._disp_priming = False
-        e._disp_abs -= 4 * CHUNK_FRAMES         # a strip to hide
-        assert hidden_span(e) is not None
+        e._disp_abs -= 4 * CHUNK_FRAMES         # cursor behind the data
 
         amp_before = e.amp_buffer.copy()
         abs_before = e.abs_amp_buffer.copy()
@@ -286,9 +244,8 @@ def test_panel_cursor_follows_the_paced_head_not_the_write_head():
 
 
 def test_unpaced_entity_renders_exactly_as_before(ent):
-    """Nothing must change for a caller that never drives the pacing —
-    the cursor follows the write head and no strip is hidden."""
+    """Nothing must change for a caller that never drives the pacing:
+    the cursor follows the write head, exactly as before pacing."""
     _ingest(ent, 40)
     assert ent._disp_wall is None
     assert ent.display_head == ent.write_head
-    assert hidden_span(ent) is None
