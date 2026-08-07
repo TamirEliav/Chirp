@@ -4121,6 +4121,13 @@ class ChirpWindow(QMainWindow):
         # updates the display. Drop / saturation badges still need
         # polling here.
         for idx, e in enumerate(self._entities):
+            # Display pacing: advance every entity's paced cursor, not
+            # just the visible ones — an off-screen stream that skipped
+            # ticks would jump when it came back into view.
+            try:
+                e.advance_display()
+            except Exception:
+                pass
             if hasattr(e.capture, 'consume_drop_count'):
                 n_drops = e.capture.consume_drop_count()
                 if hasattr(self, '_sidebar'):

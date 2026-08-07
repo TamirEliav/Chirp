@@ -281,6 +281,15 @@ class RecordingEntity:
         self.write_head = 0
         self.col_head   = 0
 
+        # Display pacing (see ``advance_display``). Absolute paced
+        # position, the wall clock it was last advanced at, the current
+        # hold-back, and whether we are still building that hold-back.
+        self._disp_abs      = 0.0
+        self._disp_wall     = None
+        self._disp_lag      = float(CHUNK_FRAMES)
+        self._disp_priming  = True
+        self._disp_last_total = -1
+
         # Display state
         self.saturated  = False   # True when current chunk contains clipped audio
         # #28: latched "has ever saturated since last reset" flag —
@@ -850,6 +859,104 @@ class RecordingEntity:
         self.freq_map_idx_floor = np.floor(frac_idx).astype(int).clip(0, n_src - 2)
         self.freq_map_frac      = (frac_idx - self.freq_map_idx_floor).astype(np.float32)
         self.display_freqs      = dst_freqs
+
+    # ── Display pacing ────────────────────────────────────────────────────
+    #
+    # The plots draw the whole ring buffer with a cursor at the write
+    # head, so the cursor moves exactly as the data arrives. That is
+    # fine when capture trickles in on the audio engine's own period,
+    # but WASAPI exclusive and WDM-KS deliver one device buffer at a
+    # time: the write head stands still and then jumps by the whole
+    # buffer, and the display jumps with it. At a 1 s device buffer the
+    # spectrogram advances once per second, which is unusable next to a
+    # (now smooth) audio monitor.
+    #
+    # Pacing decouples the two. A second cursor advances at real time
+    # instead of at delivery time, held back from the write head by a
+    # cushion; the strip between them is audio Chirp has but has not
+    # revealed yet, and the panels blank it. Like the monitor's jitter
+    # buffer the cushion self-tunes — it doubles whenever the paced
+    # cursor catches up with the data — so nothing has to be configured
+    # and a well-behaved shared-mode stream keeps a cushion of one chunk
+    # (23 ms), which nobody can see.
+    #
+    # The cursor never moves backwards: on a starve it FREEZES until the
+    # cushion is rebuilt. A display that occasionally pauses reads as
+    # "waiting"; one that jumps back reads as broken.
+    #
+    # Recording, triggering and timestamps are untouched — this shifts
+    # only what the screen shows, never what is ingested or written.
+
+    # Ceiling for the hold-back, and its share of the visible window.
+    DISPLAY_LAG_MAX_SEC = 2.0
+    DISPLAY_LAG_MAX_FRACTION = 0.25
+
+    def advance_display(self, now: float | None = None) -> None:
+        """Move the paced display cursor. Call once per UI tick."""
+        total = self._samples_total
+        sr = max(1, int(self.sample_rate))
+        if now is None:
+            now = time.monotonic()
+        prev, self._disp_wall = self._disp_wall, now
+
+        max_lag = min(self.DISPLAY_LAG_MAX_SEC * sr,
+                      self.DISPLAY_LAG_MAX_FRACTION * self._total_samples)
+        max_lag = max(float(CHUNK_FRAMES), max_lag)
+
+        # Nothing ingested since the last call and already caught up:
+        # acquisition is stopped or the stream is idle. Returning here
+        # keeps an idle stream from starving its way to the maximum
+        # cushion, which would then be inherited by the next run.
+        if total == self._disp_last_total and self._disp_abs >= total:
+            return
+        self._disp_last_total = total
+
+        if prev is None or self._disp_abs > total:
+            # First tick, or the sample counter was reset under us (a
+            # sample-rate change rebuilds the pipeline). Resync.
+            self._disp_abs = float(total)
+            self._disp_priming = True
+            return
+
+        if self._disp_priming:
+            # Hold position until the cushion exists. The blanked strip
+            # ahead of the frozen cursor grows meanwhile, which is
+            # exactly what "waiting for data" should look like.
+            if total - self._disp_abs >= self._disp_lag:
+                self._disp_priming = False
+            return
+
+        self._disp_abs += max(0.0, now - prev) * sr
+        if self._disp_abs > total:
+            # Caught up with the data: the cushion was too small for
+            # this source's delivery cadence. Freeze and grow it.
+            self._disp_abs = float(total)
+            self._disp_lag = min(max_lag, self._disp_lag * 2.0)
+            self._disp_priming = True
+        elif total - self._disp_abs > 2.0 * max_lag:
+            # Far behind — the UI thread was blocked (config load, a
+            # modal dialog, a stalled repaint). Skip forward rather than
+            # replay minutes of history in slow motion.
+            self._disp_abs = float(total) - self._disp_lag
+
+    @property
+    def display_head(self) -> int:
+        """Ring position of the paced cursor — what the panels draw as
+        "now". Equals ``write_head`` when nothing is being held back.
+
+        Falls back to the write head entirely until something calls
+        ``advance_display``: an entity nobody paces must render exactly
+        as it did before pacing existed, not freeze at position zero.
+        """
+        if self._disp_wall is None:
+            return self.write_head
+        return int(self._disp_abs) % self._total_samples
+
+    @property
+    def display_lag_sec(self) -> float:
+        """How far the display is behind the newest ingested audio."""
+        return max(0.0, (self._samples_total - self._disp_abs)
+                   / max(1, int(self.sample_rate)))
 
     def resample_spec(self, spec_buffer: np.ndarray) -> np.ndarray:
         fl = self.freq_map_idx_floor

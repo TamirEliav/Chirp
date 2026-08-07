@@ -37,12 +37,69 @@ _INFERNO_LUT = (
 # pyqtgraph image data is indexed [row, col] == [freq, time] in row-major.
 pg.setConfigOption('imageAxisOrder', 'row-major')
 
+# Empty cell in the detect/record strip (Catppuccin surface0) — also the
+# fill for the not-yet-revealed strip under display pacing.
+EVENTS_BG = np.array([49, 50, 68, 255], dtype=np.ubyte)
+
 
 def _amp_to_display(buf: np.ndarray, scale: str) -> np.ndarray:
     """Linear envelope → display units (dB when scale == 'log')."""
     if scale == 'log':
         return 20.0 * np.log10(np.maximum(np.abs(buf), 1e-4))
     return buf
+
+
+def hidden_span(e) -> tuple[float, float] | None:
+    """Normalised ``(start, end)`` of the not-yet-revealed strip, or
+    ``None`` when the display is fully caught up.
+
+    The entity's paced cursor (``display_head``) sits behind the write
+    head by the pacing cushion. The samples in between have been
+    ingested — they are already in the buffers, overwriting what the
+    display still shows as the OLDEST part of the window — but they have
+    not been revealed yet. Drawing them would put the newest audio at
+    the far edge, a full window early. Blanking that strip is what makes
+    a paced display read correctly instead of showing a duplicate of
+    what is about to scroll past the cursor.
+
+    Values are fractions of the visible window; ``start > end`` means
+    the strip wraps around the right edge.
+    """
+    total = getattr(e, '_total_samples', 0)
+    if not total:
+        return None
+    head = getattr(e, 'display_head', None)
+    if head is None:
+        return None
+    write = e.write_head
+    if head == write:
+        return None
+    return (head / total, write / total)
+
+
+def blank_span(arr: np.ndarray, span, fill, axis: int = 0) -> np.ndarray:
+    """Fill ``arr``'s time axis over the normalised ``span`` (from
+    :func:`hidden_span`), wrapping if needed. Mutates and returns
+    ``arr`` — always pass an array you own, never a live entity buffer.
+    """
+    if span is None or arr is None or arr.size == 0:
+        return arr
+    n = arr.shape[axis]
+    lo = int(span[0] * n)
+    hi = int(span[1] * n)
+    if lo == hi:
+        return arr
+    sl = [slice(None)] * arr.ndim
+    if lo < hi:
+        sl[axis] = slice(lo, hi)
+        arr[tuple(sl)] = fill
+    else:
+        # Wrapped: tail + head.
+        sl[axis] = slice(lo, n)
+        arr[tuple(sl)] = fill
+        sl[axis] = slice(0, hi)
+        arr[tuple(sl)] = fill
+    return arr
 
 
 def spec_ytick_list(e) -> list:
@@ -98,10 +155,7 @@ def events_rgba(e):
             if disc_buf is not None else None)
     rgba = np.zeros((2, nc, 4), dtype=np.ubyte)
     # Background (Catppuccin surface0) so empty cells aren't pure black.
-    rgba[..., 0] = 49
-    rgba[..., 1] = 50
-    rgba[..., 2] = 68
-    rgba[..., 3] = 255
+    rgba[...] = EVENTS_BG
     # Row 0 = detect (yellow), row 1 = record (green).
     rgba[0, det] = (249, 226, 175, 255)
     rgba[1, rec] = (166, 227, 161, 255)
@@ -119,7 +173,10 @@ def _decimate_max(y: np.ndarray, max_cols: int) -> np.ndarray:
     single reduction; everything downstream is O(pixels)."""
     n = y.shape[0]
     if n <= max_cols * 2:
-        return y
+        # Copy, never the caller's array: the display-pacing blank
+        # mutates what we return, and these inputs are live ring
+        # buffers the ingest thread owns.
+        return y.copy()
     k = n // max_cols
     m = n // k
     return y[:m * k].reshape(m, k).max(axis=1)
@@ -171,7 +228,10 @@ class StreamPlotPanel(pg.GraphicsLayoutWidget):
         self._amp_plot.setXLink(self._spec_plot)
         self._amp_plot.setLabel('left', 'Amp')
         self._amp_plot.setLabel('bottom', 'Time', units='s')
-        self._amp_curve = self._amp_plot.plot(pen=pg.mkPen(C['blue'], width=1))
+        # connect='finite': the display-pacing blank is written as NaN,
+        # which must break the curve rather than draw a line across it.
+        self._amp_curve = self._amp_plot.plot(pen=pg.mkPen(C['blue'], width=1),
+                                              connect='finite')
         self._amp_curve.setDownsampling(auto=True, method='peak')
         self._amp_curve.setClipToView(True)
         self._thr_line = pg.InfiniteLine(
@@ -225,11 +285,16 @@ class StreamPlotPanel(pg.GraphicsLayoutWidget):
         to call at the render rate; pyqtgraph applies the LUT/levels and
         curve downsampling itself."""
         disp_secs = float(e.display_seconds)
+        # Strip that has been ingested but not revealed yet (display
+        # pacing). Every array blanked below is a fresh copy produced by
+        # the resample/decimate step — never a live entity buffer.
+        hidden = hidden_span(e)
 
         # Spectrogram: resample to the display freq mapping (mel/log/linear),
         # add gain — same transform the matplotlib path used. The LUT +
         # levels are applied by pyqtgraph, not recomputed here.
-        spec = e.resample_spec(e.spec_buffer)          # (rows, cols) dB
+        spec = blank_span(e.resample_spec(e.spec_buffer), hidden,
+                          SPEC_DB_MIN, axis=1)         # (rows, cols) dB
         n_rows = spec.shape[0]
         self._img.setImage(spec, autoLevels=False)
         clim_lo = min(e.db_floor, e.db_ceil - 0.1)
@@ -244,7 +309,7 @@ class StreamPlotPanel(pg.GraphicsLayoutWidget):
             self._ytick_key = key
             self._spec_plot.getAxis('left').setTicks([spec_ytick_list(e)])
 
-        cursor_x = (e.write_head / e.sample_rate) % disp_secs
+        cursor_x = (e.display_head / e.sample_rate) % disp_secs
         self._spec_cursor.setValue(cursor_x)
         self._amp_cursor.setValue(cursor_x)
         self._ev_cursor.setValue(cursor_x)
@@ -252,6 +317,7 @@ class StreamPlotPanel(pg.GraphicsLayoutWidget):
         # Detect/record events strip.
         rgba = events_rgba(e)
         if rgba is not None:
+            blank_span(rgba, hidden, EVENTS_BG, axis=1)
             self._events_img.setImage(rgba, autoLevels=False)
             self._events_img.setRect(
                 pg.QtCore.QRectF(0.0, 0.0, disp_secs, 2.0))
@@ -259,8 +325,12 @@ class StreamPlotPanel(pg.GraphicsLayoutWidget):
         # Amplitude envelope — peak-decimated to display resolution
         # before the dB conversion (H3).
         scale = getattr(e, 'amp_scale', 'log')
-        env = _amp_to_display(_decimate_max(e.abs_amp_buffer, _MAX_ENV_COLS),
-                              scale)
+        # Blank BEFORE the dB conversion so the hidden strip becomes a
+        # NaN break in the curve rather than a fake floor-level line.
+        env = _amp_to_display(
+            blank_span(_decimate_max(e.abs_amp_buffer, _MAX_ENV_COLS),
+                       hidden, np.nan),
+            scale)
         t = self._time_axis(env.shape[0], disp_secs)
         self._amp_curve.setData(t, env)
         # Threshold line in display units.
@@ -271,7 +341,8 @@ class StreamPlotPanel(pg.GraphicsLayoutWidget):
         if self._wave_curve is not None:
             # Separate ramp — the envelope axis above is decimated and
             # no longer matches the raw buffer length.
-            wave = e.amp_buffer
+            # Copy: amp_buffer is the live ring, and blanking mutates.
+            wave = blank_span(e.amp_buffer.copy(), hidden, np.nan)
             t_w = np.linspace(0.0, disp_secs, wave.shape[0], dtype=np.float32)
             self._wave_curve.setData(t_w, wave)
             color = C['red'] if getattr(e, 'saturated', False) else C['teal']
