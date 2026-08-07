@@ -126,6 +126,33 @@ def _device_input_channels(device) -> int:
         return 0
 
 
+def _device_label(device) -> str:
+    """``17 "Analogue 1 + 2 (Focusrite USB)" [Windows WASAPI]`` — what
+    was actually opened, for the log.
+
+    A bare device index is useless after the fact: indices shift when
+    endpoints appear or disappear, one physical interface publishes
+    several endpoints with near-identical names, and the same endpoint
+    exists once per host API. Which API a stream ended up on is exactly
+    what an experiment comparing shared / exclusive / WDM-KS needs to
+    confirm from the log rather than from memory.
+    """
+    try:
+        dev = device
+        if dev is None:
+            dev = sd.default.device[0]
+        info = sd.query_devices(dev)
+        label = f'{dev} "{info.get("name", "?")}"'
+        try:
+            api = sd.query_hostapis(int(info['hostapi']))
+            label += f' [{api.get("name", "?")}]'
+        except Exception:
+            pass
+        return label
+    except Exception:
+        return 'default input' if device is None else str(device)
+
+
 def _exclusive_settings(device, name: str = ''):
     """PortAudio ``extra_settings`` requesting WASAPI exclusive mode, or
     ``None`` when this device cannot honour it.
@@ -234,7 +261,8 @@ class SharedInputStream:
                 # Fall back rather than leave the stream down, but say so
                 # loudly: an experiment that silently ran in shared mode
                 # would look like exclusive mode failing to help.
-                msg = (f'EXCLUSIVE mode open failed on device {device} '
+                msg = (f'EXCLUSIVE mode open failed on device '
+                       f'{_device_label(device)} '
                        f'({type(exc).__name__}: {exc}) — falling back to '
                        f'shared mode. Another app may hold this endpoint, '
                        f'or the hardware may not accept '
@@ -247,11 +275,12 @@ class SharedInputStream:
                     exc = exc2
                     self._stream = None
             if self._stream is None:
+                label = _device_label(device)
                 self.open_error = f'{type(exc).__name__}: {exc}'[:200]
-                print(f'[SharedInputStream] Failed to open device {device}: '
+                print(f'[SharedInputStream] Failed to open device {label}: '
                       f'{exc}')
                 _err_log('open', name,
-                         f'failed to open device {device}: '
+                         f'failed to open device {label}: '
                          f'{type(exc).__name__}: {exc}')
                 return
         # Report what the driver actually granted: ``latency`` is only a
@@ -265,7 +294,8 @@ class SharedInputStream:
             actual = 0.0
         if actual:
             _err_log('open', name,
-                     f'capture stream open: blocksize={self.blocksize} '
+                     f'capture stream open: device {_device_label(device)}, '
+                     f'blocksize={self.blocksize} '
                      f'({self.blocksize / max(1, self.samplerate) * 1000:.0f} ms), '
                      f'requested latency={self.latency}, '
                      f'granted latency={actual * 1000:.1f} ms, '

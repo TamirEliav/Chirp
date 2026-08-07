@@ -425,3 +425,49 @@ def test_exclusive_mode_skips_the_shared_resampler_warning(monkeypatch,
     shared.reset_registry()
     _cap(device=8)
     assert len(seen) == 1
+
+
+def test_open_log_names_the_device_and_host_api(monkeypatch, _fake_hostapi):
+    """A bare device index is useless after the fact — indices shift,
+    one interface publishes several near-identically-named endpoints,
+    and the same endpoint exists once per host API. An experiment
+    comparing shared / exclusive / WDM-KS has to be able to confirm from
+    the log which API each stream actually landed on."""
+    lines = []
+    monkeypatch.setattr(shared, '_err_log',
+                        lambda kind, name, msg: lines.append((kind, msg)))
+    monkeypatch.setattr(shared.sd, 'query_devices',
+                        lambda dev: {'hostapi': 0, 'max_input_channels': 2,
+                                     'name': 'Analogue 1 + 2 (Focusrite)',
+                                     'default_samplerate': 44100.0})
+
+    class _WithLatency(FakeStream):
+        latency = 0.686
+
+    monkeypatch.setattr(shared, '_stream_factory', _WithLatency)
+    a, _ = _cap(device=7)
+    assert a.valid
+    opens = [m for k, m in lines if 'capture stream open' in m]
+    assert len(opens) == 1
+    assert 'Analogue 1 + 2 (Focusrite)' in opens[0]
+    assert 'Windows WASAPI' in opens[0]
+    assert 'device 7' in opens[0]
+
+
+def test_failed_open_log_names_the_device(monkeypatch, _fake_hostapi):
+    lines = []
+    monkeypatch.setattr(shared, '_err_log',
+                        lambda kind, name, msg: lines.append(msg))
+    monkeypatch.setattr(shared.sd, 'query_devices',
+                        lambda dev: {'hostapi': 0, 'max_input_channels': 2,
+                                     'name': 'Analogue 3 + 4 (Focusrite)'})
+
+    class _Bad:
+        def __init__(self, **kw):
+            raise OSError('no such device [PaError -9996]')
+
+    monkeypatch.setattr(shared, '_stream_factory', _Bad)
+    cap, _ = _cap(device=7)
+    assert cap.valid is False
+    assert any('Analogue 3 + 4 (Focusrite)' in m and 'failed to open' in m
+               for m in lines)
