@@ -371,3 +371,163 @@ def test_publish_after_a_counter_reset_does_not_copy_backwards(ent):
     ent.publish_display()                    # must not raise or copy
     assert ent._view_pos == 0
     assert ent._view_col_pos == 0
+
+
+# ── A/V sync: the red line marks what is being HEARD ─────────────────────
+#
+# The monitor is delayed by its jitter buffer plus the output device's
+# latency; the display was delayed only by its own small cushion, so the
+# spectrogram ran visibly ahead of the sound. advance_display() takes
+# the monitor's feed-to-speaker delay and servos the cursor onto the
+# sample actually coming out of the speaker.
+
+def _drive_av(e, burst_sec, out_lat, secs=60.0, prefill_factor=1.3):
+    """Model BOTH sides off the same delivery events, as the app does.
+
+    A device buffer lands -> the capture side and the monitor's ring
+    both jump by it; between deliveries the speaker drains the monitor
+    ring at real time. Each delivery hands over whatever accumulated
+    since the last one, so the long-run rate is exactly real time —
+    getting that wrong models a source that is losing audio, not a
+    bursty one. Returns the alignment errors in ms over the last third
+    (positive = spectrogram ahead of the sound).
+    """
+    sr = e.sample_rate
+    t = 0.0
+    k = 1
+    last = 0.0
+    next_burst = burst_sec
+    mon_q = burst_sec * sr * prefill_factor      # the jitter buffer
+    errs = []
+    while t < secs:
+        t += 0.05
+        mon_q = max(0.0, mon_q - 0.05 * sr)
+        if t >= next_burst:
+            n = int((t - last) * sr)
+            e._samples_total += n
+            e.write_head = e._samples_total % e._total_samples
+            mon_q += n
+            last = t
+            k += 1
+            next_burst = k * burst_sec
+        delay = mon_q / sr + out_lat
+        e.advance_display(now=t, monitor_delay_sec=delay)
+        if t > secs * 2 / 3:
+            heard = e._samples_total - delay * sr
+            errs.append((e._disp_abs - heard) / sr * 1000.0)
+    return np.array(errs)
+
+
+def test_cursor_lands_on_the_sample_being_heard(ent):
+    """The whole point: the red line must mark what the monitor is
+    playing, not what has merely been ingested."""
+    errs = _drive_av(ent, burst_sec=0.5, out_lat=0.1)
+    assert abs(errs.mean()) < 20, f'{errs.mean():+.0f} ms out of sync'
+    assert np.abs(errs).max() < 40, f'worst {np.abs(errs).max():.0f} ms'
+
+
+def test_sync_holds_across_delivery_cadences_and_output_latencies(ent):
+    for burst, out_lat in ((0.186, 0.10), (0.5, 0.10), (1.0, 0.10),
+                           (0.5, 0.30), (1.0, 0.50), (2.0, 0.20)):
+        e = RecordingEntity(name=f'{burst}-{out_lat}', device_id=None)
+        try:
+            errs = _drive_av(e, burst, out_lat)
+            assert abs(errs.mean()) < 20,                 f'burst={burst}s out={out_lat}s -> {errs.mean():+.0f} ms'
+        finally:
+            e.close()
+
+
+def test_sync_has_no_systematic_lead(ent):
+    """Regression: comparing the cursor against a target sampled at the
+    END of the tick while applying the correction ACROSS the tick left
+    the servo settled exactly one tick (~50 ms) ahead of the sound."""
+    errs = _drive_av(ent, burst_sec=0.5, out_lat=0.1, secs=90.0)
+    assert abs(errs.mean()) < 5, f'systematic lead of {errs.mean():+.1f} ms'
+
+
+def test_sync_correction_stays_below_a_visible_speed_change(ent):
+    """Convergence must not look like fast-forward: the cursor may
+    deviate from real time only within the servo's rate bound."""
+    sr = ent.sample_rate
+    ent._samples_total = 100 * sr
+    ent.advance_display(now=0.0, monitor_delay_sec=1.0)
+    ent._disp_priming = False
+    ent._disp_abs = float(ent._samples_total)      # 1 s of error to correct
+    steps = []
+    t = 0.0
+    for _ in range(200):
+        t += 0.05
+        ent._samples_total += int(0.05 * sr)
+        before = ent._disp_abs
+        ent.advance_display(now=t, monitor_delay_sec=1.0)
+        steps.append((ent._disp_abs - before) / (0.05 * sr))
+    assert min(steps) >= 1.0 - ent.DISPLAY_SYNC_MAX_RATE_ADJ - 1e-6
+    assert max(steps) <= 1.0 + ent.DISPLAY_SYNC_MAX_RATE_ADJ + 1e-6
+    assert all(s >= 0 for s in steps), 'never runs backwards while syncing'
+
+
+def test_no_monitor_means_no_added_delay(ent):
+    """With nothing routed the display runs at its own cushion — it must
+    not sit half a second back for no reason."""
+    sr = ent.sample_rate
+    t = 0.0
+    next_burst = 0.186
+    lags = []
+    while t < 30.0:
+        t += 0.05
+        if t >= next_burst:
+            ent._samples_total += int(0.186 * sr)
+            ent.write_head = ent._samples_total % ent._total_samples
+            next_burst += 0.186
+        ent.advance_display(now=t, monitor_delay_sec=None)
+        if t > 20.0:
+            lags.append(ent.display_lag_sec)
+    # The trough is what matters: the lag sawtooths by one delivery.
+    assert min(lags) < 0.1, f'min lag {min(lags):.3f}s without a monitor'
+
+
+def test_monitor_delay_below_the_cushion_does_not_fight(ent):
+    """If the monitor is somehow running with less delay than the
+    display needs to survive the delivery cadence, the cushion wins and
+    the display settles — rather than starving, doubling the cushion,
+    and lurching."""
+    errs = _drive_av(ent, burst_sec=0.5, out_lat=0.0, prefill_factor=0.05)
+    assert ent._disp_lag <= ent.DISPLAY_LAG_MAX_FRACTION * ent._total_samples
+    assert ent.display_lag_sec < 1.5, 'cushion ran away'
+    assert np.std(errs) < 250, 'display lurching against the monitor'
+
+
+def test_cushion_decays_when_it_is_no_longer_needed(ent):
+    """The cushion doubles on every starve. Without decay, one bad patch
+    would leave the display permanently further back than the source
+    needs — and behind the monitor it is meant to track."""
+    sr = ent.sample_rate
+    ent._samples_total = 10 * sr
+    ent.advance_display(now=0.0)
+    ent._disp_priming = False
+    ent._disp_lag = 1.5 * sr
+    t = 0.0
+    for _ in range(2000):          # 100 s of healthy, steady delivery
+        t += 0.05
+        ent._samples_total += int(0.05 * sr)
+        ent.advance_display(now=t)
+    assert ent._disp_lag < 0.5 * sr, 'cushion never shrank'
+
+
+def test_monitor_reports_feed_to_speaker_delay():
+    from chirp.audio.monitor import AudioMonitor, _RingBuffer
+    m = AudioMonitor()
+    assert m.playback_delay_sec == 0.0, 'nothing routed → nothing to align'
+
+    class _Stream:
+        latency = 0.12
+
+        def stop(self): pass
+        def close(self): pass
+
+    m._stream = _Stream()
+    m._source_id = 'src'
+    m._samplerate = 44100
+    m._ring = _RingBuffer(capacity_frames=44100, channels=1)
+    m._ring.write(np.zeros(4410, dtype=np.float32))     # 100 ms queued
+    assert m.playback_delay_sec == pytest.approx(0.1 + 0.12, abs=1e-3)

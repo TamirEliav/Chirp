@@ -895,9 +895,34 @@ class RecordingEntity:
     # Ceiling for the hold-back, and its share of the visible window.
     DISPLAY_LAG_MAX_SEC = 2.0
     DISPLAY_LAG_MAX_FRACTION = 0.25
+    # A/V sync servo: how fast the cursor may deviate from real time to
+    # correct an alignment error, and the time constant it aims to
+    # correct over. 25% is well under the threshold where a scrolling
+    # spectrogram looks like it is running fast or slow.
+    DISPLAY_SYNC_MAX_RATE_ADJ = 0.25
+    DISPLAY_SYNC_TAU_SEC = 2.0
+    # Time constant for shrinking the cushion back down (it doubles on
+    # every starve). Slow enough that a bursty source keeps the cushion
+    # it needs between bursts.
+    DISPLAY_LAG_DECAY_SEC = 30.0
 
-    def advance_display(self, now: float | None = None) -> None:
-        """Move the paced display cursor. Call once per UI tick."""
+    def advance_display(self, now: float | None = None,
+                        monitor_delay_sec: float | None = None) -> None:
+        """Move the paced display cursor. Call once per UI tick.
+
+        ``monitor_delay_sec`` is the audio monitor's feed-to-speaker
+        delay (:attr:`AudioMonitor.playback_delay_sec`). When given, the
+        cursor is servoed onto the sample the monitor is CURRENTLY
+        PLAYING, so the red line marks what you hear rather than what
+        has merely been ingested. Without it the cursor just trails the
+        newest audio by its own small cushion.
+
+        Why a servo and not an offset: the two paths measure their delay
+        against different references, and both move. Steering the cursor
+        with a bounded rate adjustment converges smoothly and rides out
+        the jitter, where jumping to a computed position would make the
+        display stutter every time the estimate moved.
+        """
         total = self._samples_total
         sr = max(1, int(self.sample_rate))
         if now is None:
@@ -931,18 +956,75 @@ class RecordingEntity:
                 self._disp_priming = False
             return
 
-        self._disp_abs += max(0.0, now - prev) * sr
+        # Slow decay of the cushion. It doubles on every starve, so
+        # without this a single bad patch — or a latency setting the
+        # user has since lowered — would leave the display permanently
+        # further behind than the source now requires, and (worse) hold
+        # it behind the monitor it is supposed to be aligned with.
+        # Grow fast, shrink slow.
+        if not self._disp_priming and prev is not None:
+            decay = max(0.0, now - prev) / self.DISPLAY_LAG_DECAY_SEC
+            self._disp_lag = max(float(CHUNK_FRAMES),
+                                 self._disp_lag * (1.0 - decay))
+
+        dt = max(0.0, now - prev)
+        step = dt * sr                      # natural motion: real time
+        target = self._sync_target(monitor_delay_sec, total, sr)
+        if target is not None:
+            # Correct against where the cursor WILL be after this tick's
+            # natural motion, not where it was. Measuring the error
+            # before the step and applying the correction across it
+            # leaves a fixed point one tick ahead of the target — a
+            # constant ~50 ms lead, which is exactly the kind of small
+            # systematic offset this servo exists to remove.
+            err = target - (self._disp_abs + step)
+            corr = err * (dt / self.DISPLAY_SYNC_TAU_SEC)
+            lim = self.DISPLAY_SYNC_MAX_RATE_ADJ * step
+            step = max(0.0, step + max(-lim, min(lim, corr)))
+
+        self._disp_abs += step
         if self._disp_abs > total:
             # Caught up with the data: the cushion was too small for
             # this source's delivery cadence. Freeze and grow it.
             self._disp_abs = float(total)
             self._disp_lag = min(max_lag, self._disp_lag * 2.0)
             self._disp_priming = True
-        elif total - self._disp_abs > 2.0 * max_lag:
+        elif total - self._disp_abs > 2.0 * max_lag and target is None:
             # Far behind — the UI thread was blocked (config load, a
             # modal dialog, a stalled repaint). Skip forward rather than
-            # replay minutes of history in slow motion.
+            # replay minutes of history in slow motion. Not applied
+            # while syncing: there the target is authoritative and the
+            # servo is already closing the gap.
             self._disp_abs = float(total) - self._disp_lag
+
+    def _sync_target(self, monitor_delay_sec, total: int, sr: int):
+        """Absolute sample index the monitor is playing right now, or
+        ``None`` when there is nothing to align to.
+
+        ``_samples_total`` counts *processed* samples while the monitor
+        is fed straight from the capture callback, so the not-yet-
+        ingested backlog (``ring.available``) has to be added back to
+        put both on the same timeline. Both that backlog and the
+        monitor's queue jump by a whole device buffer at the same
+        instant, so their difference — and therefore this target — stays
+        smooth even though the delivery does not.
+        """
+        if monitor_delay_sec is None or monitor_delay_sec <= 0.0:
+            return None
+        try:
+            backlog = max(0, int(self.ring.available))
+        except Exception:
+            backlog = 0
+        target = total + backlog - monitor_delay_sec * sr
+        # The cushion is a floor, not a suggestion. If the monitor is
+        # running with LESS delay than the display needs to survive this
+        # source's delivery cadence, chasing it would starve the cursor
+        # at the end of every gap — and each starve doubles the cushion,
+        # so the two would fight and the display would lurch. Sit at the
+        # cushion instead: as close to the sound as the data allows.
+        # (In practice the monitor's own jitter buffer covers the same
+        # bursts, so its delay is normally the larger of the two.)
+        return min(float(total) - self._disp_lag, target)
 
     @property
     def display_head(self) -> int:

@@ -4120,12 +4120,21 @@ class ChirpWindow(QMainWindow):
         # (#19 / c21). The main thread only reads the ring buffers and
         # updates the display. Drop / saturation badges still need
         # polling here.
+        # A/V sync: how far behind the audio monitor is running right
+        # now (its jitter buffer + the output device's latency). The
+        # SAME figure goes to every stream, not just the monitored one,
+        # so the whole grid stays comparable with itself as well as with
+        # what is being heard.
+        try:
+            mon_delay = self._monitor.playback_delay_sec
+        except Exception:
+            mon_delay = 0.0
         for idx, e in enumerate(self._entities):
             # Display pacing: advance every entity's paced cursor, not
             # just the visible ones — an off-screen stream that skipped
             # ticks would jump when it came back into view.
             try:
-                e.advance_display()
+                e.advance_display(monitor_delay_sec=mon_delay or None)
                 e.publish_display()
             except Exception:
                 pass

@@ -271,6 +271,31 @@ class AudioMonitor:
         self._gain = float(min(2.0, max(0.0, gain)))
 
     @property
+    def playback_delay_sec(self) -> float:
+        """Seconds between a sample being fed in and coming out of the
+        speaker: the frames still queued ahead of it in the ring, plus
+        the output device's own latency.
+
+        The display servo uses this to put the red cursor on the sample
+        currently being HEARD (see ``RecordingEntity.advance_display``).
+        Returns 0.0 when nothing is routed — there is then nothing to
+        align to, and the display should run at its own minimal lag.
+
+        Note the ring residency is read live rather than assumed from
+        the prefill target: after priming, the level is whatever the
+        driver's delivery pattern left in it, which is the delay a
+        listener actually experiences.
+        """
+        if self._stream is None or self._source_id is None:
+            return 0.0
+        sr = max(1, int(self._samplerate))
+        try:
+            out_lat = float(getattr(self._stream, 'latency', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            out_lat = 0.0
+        return self._ring.size() / sr + out_lat
+
+    @property
     def prefill_frames(self) -> int:
         """Frames the jitter buffer currently holds back before playing.
         Grows on underrun; the monitor's delay tracks it."""
