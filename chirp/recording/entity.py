@@ -289,6 +289,11 @@ class RecordingEntity:
         self._disp_lag      = float(CHUNK_FRAMES)
         self._disp_priming  = True
         self._disp_last_total = -1
+        # Paced copies of the display buffers (see ``view``), and how
+        # far each granularity has been published.
+        self._view_bufs: dict[str, np.ndarray] = {}
+        self._view_pos      = 0
+        self._view_col_pos  = 0
 
         # Display state
         self.saturated  = False   # True when current chunk contains clipped audio
@@ -957,6 +962,119 @@ class RecordingEntity:
         """How far the display is behind the newest ingested audio."""
         return max(0.0, (self._samples_total - self._disp_abs)
                    / max(1, int(self.sample_rate)))
+
+    # ── Paced display buffers ─────────────────────────────────────────────
+    #
+    # Pacing the cursor alone is not enough. The panels draw the entity's
+    # live ring buffers, and the ingest thread has already written the
+    # region between the paced cursor and the write head — so whatever
+    # pacing holds back is visible anyway, just early. Blanking that
+    # strip made it pulse at the burst rate; drawing it shows audio the
+    # monitor has not reached yet, which is worse: the view and the
+    # sound disagree.
+    #
+    # What a scrolling display should show ahead of the cursor is the
+    # PREVIOUS sweep — history, until the cursor arrives and replaces
+    # it. That history is gone from the live buffer by the time we draw,
+    # so the entity keeps a second copy that is advanced only as far as
+    # the paced cursor. Panels read ``view(name)``; ``publish_display``
+    # copies each newly revealed slice across once per UI tick.
+    #
+    # Cost is one extra copy of the display buffers per stream (~6 MB
+    # mono, ~10 MB stereo at 10 s / 44.1 kHz), allocated lazily — an
+    # entity nobody paces keeps drawing the live buffers and allocates
+    # nothing. Per tick only the revealed slice is copied (~50 ms of
+    # audio), not the buffer, which is what keeps this off the GIL.
+
+    # (attribute name, axis of the time dimension). Column-granularity
+    # buffers advance in CHUNK_FRAMES steps; the rest are per-sample.
+    _VIEW_SAMPLE_BUFFERS = (
+        ('amp_buffer', 0), ('amp_buffer_r', 0),
+        ('abs_amp_buffer', 0), ('abs_amp_buffer_r', 0),
+        ('detect_mask_buffer', 0), ('record_mask_buffer', 0),
+        ('discard_mask_buffer', 0),
+    )
+    _VIEW_COL_BUFFERS = (
+        ('spec_buffer', 1), ('spec_buffer_r', 1), ('entropy_buffer', 0),
+    )
+
+    def view(self, name: str) -> np.ndarray:
+        """The paced copy of display buffer ``name``.
+
+        Falls back to the live buffer until pacing is actually being
+        driven, so an entity nobody ticks renders exactly as it did
+        before pacing existed — and allocates no mirror.
+        """
+        src = getattr(self, name)
+        if self._disp_wall is None:
+            return src
+        m = self._view_bufs.get(name)
+        if m is None or m.shape != src.shape or m.dtype != src.dtype:
+            # First use, or the buffer was reallocated (display seconds,
+            # sample rate, FFT size). Start from a full copy.
+            m = src.copy()
+            self._view_bufs[name] = m
+        return m
+
+    @staticmethod
+    def _copy_wrapped(dst, src, start: int, n: int, axis: int) -> None:
+        """Copy ``n`` entries starting at ``start`` along ``axis``,
+        wrapping at the end of the buffer."""
+        cap = dst.shape[axis]
+        start %= cap
+        first = min(n, cap - start)
+        sl = [slice(None)] * dst.ndim
+        sl[axis] = slice(start, start + first)
+        t = tuple(sl)
+        dst[t] = src[t]
+        if n > first:
+            sl[axis] = slice(0, n - first)
+            t = tuple(sl)
+            dst[t] = src[t]
+
+    def publish_display(self) -> None:
+        """Advance the paced copies up to the paced cursor. Call once
+        per UI tick, right after :meth:`advance_display`."""
+        if self._disp_wall is None or not self._view_bufs:
+            return
+        to_abs = int(self._disp_abs)
+        # Per-sample buffers.
+        n = to_abs - self._view_pos
+        if n < 0:
+            # The counter was reset under us (sample-rate change) —
+            # resync rather than copy backwards.
+            self._view_pos = to_abs
+            self._view_col_pos = to_abs // CHUNK_FRAMES
+            return
+        if n > 0:
+            full = n >= self._total_samples
+            for name, axis in self._VIEW_SAMPLE_BUFFERS:
+                m = self._view_bufs.get(name)
+                if m is None:
+                    continue
+                src = getattr(self, name)
+                if full or m.shape != src.shape:
+                    self._view_bufs[name] = src.copy()
+                else:
+                    self._copy_wrapped(m, src, self._view_pos, n, axis)
+            self._view_pos = to_abs
+        # Column buffers advance only in whole CHUNK_FRAMES blocks, so
+        # they carry their own cursor — rounding the sample cursor down
+        # would re-copy, and rounding it up would skip.
+        c_to = to_abs // CHUNK_FRAMES
+        n_cols = c_to - self._view_col_pos
+        if n_cols > 0:
+            full_cols = n_cols >= self._n_cols
+            for name, axis in self._VIEW_COL_BUFFERS:
+                m = self._view_bufs.get(name)
+                if m is None:
+                    continue
+                src = getattr(self, name)
+                if full_cols or m.shape != src.shape:
+                    self._view_bufs[name] = src.copy()
+                else:
+                    self._copy_wrapped(m, src, self._view_col_pos, n_cols, axis)
+            self._view_col_pos = c_to
 
     def resample_spec(self, spec_buffer: np.ndarray) -> np.ndarray:
         fl = self.freq_map_idx_floor

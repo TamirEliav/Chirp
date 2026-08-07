@@ -16,14 +16,17 @@ cushion. These tests pin the properties that make that safe to watch:
 * an idle stream doesn't starve its way to the maximum cushion;
 * a counter reset (sample-rate change) and a long UI stall resync
   instead of replaying history in slow motion;
-* rendering never modifies the entity's buffers.
+* rendering never modifies the entity's buffers;
+* HISTORY stays visible ahead of the cursor until the cursor reaches it.
 
-Nothing is hidden between the paced cursor and the write head: those
-samples are already drawn at their correct position on the wrapping
-window, simply revealed before the cursor reaches them. Blanking them
-was tried and removed — the gap's far edge is the write head, which
-still jumps by a whole device buffer, so the blank strip pulsed at the
-burst rate and was more distracting than the early reveal.
+That last one is why ``view``/``publish_display`` exist. The ingest
+thread has already overwritten the region between the paced cursor and
+the write head, so a panel reading the live buffers sees audio the
+monitor has not played yet — the view and the sound disagree. Blanking
+that strip was tried first and was worse: its far edge is the write
+head, which still jumps by a whole device buffer, so the blank pulsed
+at the burst rate. The paced copy keeps the previous sweep instead,
+which is what a scrolling display is supposed to show.
 """
 
 import numpy as np
@@ -249,3 +252,122 @@ def test_unpaced_entity_renders_exactly_as_before(ent):
     _ingest(ent, 40)
     assert ent._disp_wall is None
     assert ent.display_head == ent.write_head
+
+
+# ── Paced display buffers ────────────────────────────────────────────────
+
+def _fill_live(e, value, start, n):
+    """Write ``value`` into the live per-sample display buffers as the
+    ingest thread would, wrapping, and move the write head there."""
+    total = e._total_samples
+    idx = (np.arange(start, start + n) % total)
+    e.amp_buffer[idx] = value
+    e.abs_amp_buffer[idx] = abs(value)
+    e._samples_total = start + n
+    e.write_head = e._samples_total % total
+
+
+def test_history_stays_visible_until_the_cursor_reaches_it(ent):
+    """The property the whole feature exists for: what is drawn ahead of
+    the red line is the PREVIOUS sweep, not audio the monitor has yet to
+    play."""
+    ent.amp_buffer[:] = 1.0                 # sweep 1 = history
+    ent.advance_display(now=0.0)            # engage pacing
+    assert ent.view('amp_buffer') is not ent.amp_buffer
+    np.testing.assert_array_equal(ent.view('amp_buffer'), 1.0)
+
+    # A burst of sweep-2 audio lands; the cursor has only reached 2 of
+    # its 5 chunks.
+    _fill_live(ent, 2.0, 0, 5 * CHUNK_FRAMES)
+    ent._disp_abs = float(2 * CHUNK_FRAMES)
+    ent.publish_display()
+
+    view = ent.view('amp_buffer')
+    np.testing.assert_array_equal(view[:2 * CHUNK_FRAMES], 2.0), 'revealed'
+    np.testing.assert_array_equal(
+        view[2 * CHUNK_FRAMES:5 * CHUNK_FRAMES], 1.0), 'history preserved'
+    # ...while the live buffer has already been overwritten.
+    np.testing.assert_array_equal(
+        ent.amp_buffer[2 * CHUNK_FRAMES:5 * CHUNK_FRAMES], 2.0)
+
+    # The cursor arrives: history is replaced, in order.
+    ent._disp_abs = float(5 * CHUNK_FRAMES)
+    ent.publish_display()
+    np.testing.assert_array_equal(ent.view('amp_buffer')[:5 * CHUNK_FRAMES], 2.0)
+
+
+def test_published_region_wraps(ent):
+    ent.amp_buffer[:] = 1.0
+    ent.advance_display(now=0.0)
+    ent.view('amp_buffer')
+    total = ent._total_samples
+    start = total - 2 * CHUNK_FRAMES         # straddle the end of the ring
+    ent._view_pos = start
+    ent._view_col_pos = start // CHUNK_FRAMES
+    _fill_live(ent, 3.0, start, 4 * CHUNK_FRAMES)
+    ent._disp_abs = float(start + 4 * CHUNK_FRAMES)
+    ent.publish_display()
+    view = ent.view('amp_buffer')
+    np.testing.assert_array_equal(view[start:], 3.0)          # tail
+    np.testing.assert_array_equal(view[:2 * CHUNK_FRAMES], 3.0)  # wrapped head
+
+
+def test_column_buffers_advance_in_whole_columns(ent):
+    """Spectrogram columns move in CHUNK_FRAMES steps; a sample cursor
+    that lands mid-column must not skip or re-copy one."""
+    ent.spec_buffer[:] = -99.0
+    ent.advance_display(now=0.0)
+    ent.view('spec_buffer')
+    ent.spec_buffer[:] = -5.0                # a whole new sweep arrives
+    ent._samples_total = 10 * CHUNK_FRAMES
+    # Cursor lands mid-column: 2 whole columns are revealed.
+    ent._disp_abs = 2.5 * CHUNK_FRAMES
+    ent.publish_display()
+    view = ent.view('spec_buffer')
+    np.testing.assert_array_equal(view[:, :2], -5.0)
+    np.testing.assert_array_equal(view[:, 2:], -99.0)
+    # The rest of that column is published once the cursor clears it.
+    ent._disp_abs = 3.0 * CHUNK_FRAMES
+    ent.publish_display()
+    np.testing.assert_array_equal(ent.view('spec_buffer')[:, :3], -5.0)
+
+
+def test_unpaced_entity_draws_the_live_buffers(ent):
+    """No pacing driven → no mirror allocated, and panels see live data
+    exactly as before this feature."""
+    assert ent.view('amp_buffer') is ent.amp_buffer
+    assert ent.view('spec_buffer') is ent.spec_buffer
+    assert ent._view_bufs == {}
+
+
+def test_buffer_reallocation_resyncs_the_paced_copy(ent):
+    """Changing display seconds / sample rate / FFT size replaces the
+    buffers; the paced copy must follow rather than render a stale
+    shape."""
+    ent.advance_display(now=0.0)
+    ent.view('amp_buffer')
+    ent.change_display_seconds(5.0)
+    v = ent.view('amp_buffer')
+    assert v.shape == ent.amp_buffer.shape
+    ent.publish_display()                    # must not raise
+    assert ent.view('spec_buffer').shape == ent.spec_buffer.shape
+
+
+def test_gap_larger_than_the_window_falls_back_to_a_full_copy(ent):
+    ent.advance_display(now=0.0)
+    ent.view('amp_buffer')
+    ent.amp_buffer[:] = 7.0
+    ent._samples_total = 3 * ent._total_samples
+    ent._disp_abs = float(ent._samples_total)
+    ent.publish_display()
+    np.testing.assert_array_equal(ent.view('amp_buffer'), 7.0)
+
+
+def test_publish_after_a_counter_reset_does_not_copy_backwards(ent):
+    ent.advance_display(now=0.0)
+    ent.view('amp_buffer')
+    ent._view_pos = 10 * CHUNK_FRAMES
+    ent._disp_abs = 0.0
+    ent.publish_display()                    # must not raise or copy
+    assert ent._view_pos == 0
+    assert ent._view_col_pos == 0

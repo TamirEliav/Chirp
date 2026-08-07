@@ -4126,6 +4126,7 @@ class ChirpWindow(QMainWindow):
             # ticks would jump when it came back into view.
             try:
                 e.advance_display()
+                e.publish_display()
             except Exception:
                 pass
             if hasattr(e.capture, 'consume_drop_count'):

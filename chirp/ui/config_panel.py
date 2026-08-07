@@ -408,13 +408,13 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
 
         clim_lo = min(e.db_floor, e.db_ceil - 0.1)
         if self._img is not None:
-            spec = e.resample_spec(e.spec_buffer)
+            spec = e.resample_spec(e.view('spec_buffer'))
             self._img.setImage(spec, autoLevels=False)
             self._img.setLevels([clim_lo, e.db_ceil])
             self._img.setRect(pg.QtCore.QRectF(0.0, 0.0, disp,
                                                float(spec.shape[0])))
         if self._img_r is not None:
-            spec_r = e.resample_spec(e.spec_buffer_r)
+            spec_r = e.resample_spec(e.view('spec_buffer_r'))
             self._img_r.setImage(spec_r, autoLevels=False)
             self._img_r.setLevels([clim_lo, e.db_ceil])
             self._img_r.setRect(pg.QtCore.QRectF(0.0, 0.0, disp,
@@ -427,25 +427,27 @@ class ConfigPlotPanel(pg.GraphicsLayoutWidget):
         if self._wave is not None:
             color = C['red'] if getattr(e, 'saturated', False) else C['teal']
             self._wave.setPen(pg.mkPen(color, width=1))
-            w = _decimate_minmax(e.amp_buffer, _MAX_WAVE_COLS)
+            w = _decimate_minmax(e.view('amp_buffer'), _MAX_WAVE_COLS)
             self._wave.setData(self._t_axis(w.shape[0], disp), w)
         if self._wave_r is not None:
-            w_r = _decimate_minmax(e.amp_buffer_r, _MAX_WAVE_COLS)
+            w_r = _decimate_minmax(e.view('amp_buffer_r'), _MAX_WAVE_COLS)
             self._wave_r.setData(self._t_axis(w_r.shape[0], disp), w_r)
         if self._amp is not None:
             color = C['red'] if getattr(e, 'saturated', False) else C['blue']
             self._amp.setPen(pg.mkPen(color, width=1))
             a = _amp_to_display(
-                _decimate_max(e.abs_amp_buffer, _MAX_ENV_COLS), scale)
+                _decimate_max(e.view('abs_amp_buffer'), _MAX_ENV_COLS), scale)
             self._amp.setData(self._t_axis(a.shape[0], disp), a)
         if self._amp_r is not None:
             a_r = _amp_to_display(
-                _decimate_max(e.abs_amp_buffer_r, _MAX_ENV_COLS), scale)
+                _decimate_max(e.view('abs_amp_buffer_r'), _MAX_ENV_COLS),
+                scale)
             self._amp_r.setData(self._t_axis(a_r.shape[0], disp), a_r)
 
         if self._entropy is not None:
             nc = e._n_cols
-            self._entropy.setData(self._t_axis(nc, disp), e.entropy_buffer)
+            self._entropy.setData(self._t_axis(nc, disp),
+                                  e.view('entropy_buffer'))
 
         if self._events_img is not None:
             rgba = events_rgba(e)

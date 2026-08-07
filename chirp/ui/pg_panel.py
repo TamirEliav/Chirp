@@ -14,8 +14,10 @@ render path; the wins over the old renderer:
     the window can drive it at an adaptive rate and skip off-screen
     streams entirely (audio-priority degradation).
 
-The panel reads the entity's existing display ring buffers (the same ones
-the matplotlib path read), so no change to the DSP/ingest side is needed.
+The panel reads the entity's display ring buffers through ``e.view(name)``
+— the PACED copies, which stop at the paced cursor so history stays
+visible ahead of it (see ``RecordingEntity.publish_display``). Nothing on
+the DSP/ingest side is involved either way.
 """
 
 from __future__ import annotations
@@ -94,9 +96,10 @@ def events_rgba(e):
     need = nc * CHUNK_FRAMES
     if e.detect_mask_buffer.shape[0] < need:
         return None
-    det = e.detect_mask_buffer[:need].reshape(nc, CHUNK_FRAMES).any(axis=1)
-    rec = e.record_mask_buffer[:need].reshape(nc, CHUNK_FRAMES).any(axis=1)
-    disc_buf = getattr(e, 'discard_mask_buffer', None)
+    det = e.view('detect_mask_buffer')[:need].reshape(nc, CHUNK_FRAMES).any(axis=1)
+    rec = e.view('record_mask_buffer')[:need].reshape(nc, CHUNK_FRAMES).any(axis=1)
+    disc_buf = (e.view('discard_mask_buffer')
+                if getattr(e, 'discard_mask_buffer', None) is not None else None)
     disc = (disc_buf[:need].reshape(nc, CHUNK_FRAMES).any(axis=1)
             if disc_buf is not None else None)
     rgba = np.zeros((2, nc, 4), dtype=np.ubyte)
@@ -229,7 +232,9 @@ class StreamPlotPanel(pg.GraphicsLayoutWidget):
         # Spectrogram: resample to the display freq mapping (mel/log/linear),
         # add gain — same transform the matplotlib path used. The LUT +
         # levels are applied by pyqtgraph, not recomputed here.
-        spec = e.resample_spec(e.spec_buffer)          # (rows, cols) dB
+        # view(): the PACED copy — history stays visible ahead of the
+        # cursor until the cursor reaches it (see publish_display).
+        spec = e.resample_spec(e.view('spec_buffer'))  # (rows, cols) dB
         n_rows = spec.shape[0]
         self._img.setImage(spec, autoLevels=False)
         clim_lo = min(e.db_floor, e.db_ceil - 0.1)
@@ -259,8 +264,8 @@ class StreamPlotPanel(pg.GraphicsLayoutWidget):
         # Amplitude envelope — peak-decimated to display resolution
         # before the dB conversion (H3).
         scale = getattr(e, 'amp_scale', 'log')
-        env = _amp_to_display(_decimate_max(e.abs_amp_buffer, _MAX_ENV_COLS),
-                              scale)
+        env = _amp_to_display(
+            _decimate_max(e.view('abs_amp_buffer'), _MAX_ENV_COLS), scale)
         t = self._time_axis(env.shape[0], disp_secs)
         self._amp_curve.setData(t, env)
         # Threshold line in display units.
@@ -271,7 +276,7 @@ class StreamPlotPanel(pg.GraphicsLayoutWidget):
         if self._wave_curve is not None:
             # Separate ramp — the envelope axis above is decimated and
             # no longer matches the raw buffer length.
-            wave = e.amp_buffer
+            wave = e.view('amp_buffer')
             t_w = np.linspace(0.0, disp_secs, wave.shape[0], dtype=np.float32)
             self._wave_curve.setData(t_w, wave)
             color = C['red'] if getattr(e, 'saturated', False) else C['teal']
