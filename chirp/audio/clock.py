@@ -92,6 +92,7 @@ class DisciplinedClock:
         # Applied correction (seconds) and the sample index at the last
         # discipline update (meters the slew).
         self._corr = 0.0
+        self._corr_init = False
         self._last_s: int | None = None
         # Telemetry for the UI / error log.
         self.step_count = 0
@@ -154,6 +155,29 @@ class DisciplinedClock:
         delta_audio = max(0.0, (s - self._last_s) / self.sample_rate)
         if s > self._last_s:
             self._last_s = s
+
+        if not self._corr_init:
+            # Adopt the filtered offset outright on the first call.
+            #
+            # The slew limiter exists to keep already-issued timestamps
+            # consistent with each other; at this point none have been
+            # issued, so there is nothing to stay consistent with — and
+            # starting from zero is not neutral. The anchor observation
+            # is the FIRST callback of the first delivery, and under
+            # burst delivery (WASAPI exclusive, WDM-KS: a whole device
+            # buffer handed over at once, split into several blocksize
+            # callbacks with the same wall time) that is the *most late*
+            # observation of its group. The filtered target is therefore
+            # a whole device buffer behind it, and slewing 1 ms per
+            # second of audio takes 10-30 minutes to walk out — during
+            # which every filename is stamped late by up to that buffer.
+            # Measured before this: +900 ms at start and still +329 ms
+            # ten minutes in, on a 1 s WDM-KS buffer.
+            self._corr_init = True
+            self._corr = target
+            return (self._base_wall
+                    + (s - self._base_samples) / self.sample_rate
+                    + self._corr)
 
         err = target - self._corr
         if err > self.STEP_THRESHOLD and allow_step:
