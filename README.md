@@ -4,7 +4,7 @@
 
 Chirp is a desktop application for multi-stream audio monitoring, visualization, and threshold-triggered recording. It was designed with bioacoustics research in mind but works for any audio analysis task.
 
-![Version](https://img.shields.io/badge/Version-v3.8.0-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5%20%2B%20pyqtgraph-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
+![Version](https://img.shields.io/badge/Version-v3.9.0-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5%20%2B%20pyqtgraph-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 ---
 
@@ -46,6 +46,7 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - Gain, dB floor, and dB ceiling controls for spectrogram contrast
 - Configurable frequency display range
 - Mouse-wheel Y-zoom on the amplitude, waveform, and entropy plots
+- **Smooth, audio-aligned scrolling** — the view advances at wall-clock rate rather than as audio is delivered, so it scrolls smoothly even on capture backends that hand over a whole device buffer at a time (WASAPI exclusive, WDM-KS). The red cursor is steered onto the sample the **audio monitor is currently playing** — the monitor's jitter buffer *and* the output device's latency are both accounted for — so what you see and what you hear line up
 
 ### Threshold-Triggered Recording
 - Automatic recording triggered when amplitude crosses a configurable threshold
@@ -83,6 +84,11 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - Persistent `D` badge latches for the session; click to clear
 - In View Mode a per-tile `DROP×N` overlay shows the running session total
 
+### Capture Engine (⚙ Advanced)
+- **Input buffer (latency)** and **callback block size** are tunable per machine — the settings that decide how much slack the driver has before captured audio is lost, and how often Chirp is woken to collect it. Neither affects the recorded audio, only display/monitor delay
+- **WASAPI exclusive mode** — hands the input endpoint to Chirp alone so capture comes straight from the driver instead of through the shared Windows audio engine (the layer implicated in inserted silence). WASAPI devices only; on MME / DirectSound / WDM-KS the request is logged and ignored, and a refused exclusive open falls back to a shared open rather than leaving an unattended rig with no capture. The `open` log line names the device, its host API, and whether exclusive mode actually took
+- **Inserted-silence auto-recovery** — when a stream's digital-zero duty cycle stays above a configurable threshold for a configurable time, Chirp restarts acquisition on **every** stream sharing that device (the only reset known to clear a latched capture session) and resumes recording, with a cooldown to prevent restart loops. Every intervention is logged
+
 ### Inserted-Silence Detection
 - Detects **digital silence injected below the app** — a driver or the Windows audio engine can zero-fill milliseconds of a capture in place, corrupting the spectrogram, the monitor and every recorded WAV, sometimes *without raising any PortAudio error flag*
 - Two independent detectors: PortAudio's `input_underflow` status flag (zero samples inserted to cover missing data), and a **signal-level scan** for exact-zero runs ≥ 1 ms — a live analog input's noise floor never produces those, so such a run is inserted silence by definition
@@ -102,6 +108,7 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - Capture holes (device stall, drop burst) are jumped **between** recordings, never inside a file, and logged
 - **Publish-time watchdog** — every finalized WAV's onset + duration is checked against the wall clock; divergence beyond 10 s lights the sidebar `!` badge and is logged with the exact delta
 - **Clock audit log** (`chirp_clock_log.csv`, one row/min/stream) pairs the capture sample index with the derived time and the raw system clock, so any filename timestamp can be verified — or corrected — offline after a long experiment
+- `scripts/check_clock_log.py` audits that log for **lost** samples — audio the driver never delivered, which no in-app counter can see: it compares how fast the sample index advances against the wall clock, where a healthy capture agrees to within crystal difference (tens of ppm)
 
 ### Error Logging
 - Every pipeline failure surfaced by the sidebar `S` / `D` / `!` indicators is also written to a plain-text log file (`chirp_errors.log`) in the folder Chirp is launched from
@@ -146,6 +153,7 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - Per-stream monitor routes raw audio to a shared output device for live listening
 - **Enable/disable toggle** that remembers the source and output selections — unmute restores the exact same routing
 - **Follow-selection mode** — the monitor automatically re-targets to the stream selected in the sidebar (Config mode) or the tile clicked in the grid (View mode); the monitored tile shows a 🎧 marker
+- **Self-tuning jitter buffer** — capture backends that deliver one device buffer at a time (WASAPI exclusive, WDM-KS) hand over half a second of audio at once and then nothing; the monitor holds back a small reserve and grows it automatically until playback is gap-free, so bursty capture doesn't stutter
 
 ### WAV File Replay (Testing)
 - Swap the live capture for a WAV file (`WavFileCapture`) to feed a reproducible signal through the full pipeline — trigger, writer, spectrogram, entropy — for regression testing and offline analysis

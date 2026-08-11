@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Chirp v3.8.0 — User Manual</title>
+<title>Chirp v3.9.0 — User Manual</title>
 <style>
   :root {
     --base: #1e1e2e;
@@ -304,7 +304,7 @@
 <nav class="sidebar">
   <div class="logo">
     <h1>Chirp</h1>
-    <span>User Manual &mdash; v3.8.0</span>
+    <span>User Manual &mdash; v3.9.0</span>
   </div>
   <ul>
     <li><a href="#overview">Overview</a></li>
@@ -350,6 +350,7 @@
     <li><a href="#view-mode">View Mode</a></li>
     <li><a href="#settings-mgmt">Settings Management</a></li>
     <li><a href="#error-log">Error Logging</a></li>
+    <li><a href="#capture-engine">Capture Engine</a></li>
     <li><a href="#inserted-silence">Inserted Silence</a></li>
     <li><a href="#rdp">Remote Desktop (RDP)</a></li>
     <li><a href="#interactions">Mouse &amp; Keyboard</a></li>
@@ -366,7 +367,7 @@
 <header class="hero">
   <h1>Chirp</h1>
   <p class="subtitle">Real-Time Audio Monitoring, Visualization &amp; Triggered Recording</p>
-  <span class="version">v3.8.0</span>
+  <span class="version">v3.9.0</span>
 </header>
 
 <!-- ── 1. Overview ── -->
@@ -1124,6 +1125,19 @@ python chirp.py</code></pre>
     <a href="#channels">channel mode</a> while it is the monitor source, re-select it (or toggle the
     monitor) so the new channel takes effect.
   </div>
+  <div class="callout note">
+    <strong>Monitor delay and the red cursor:</strong> some capture backends (WASAPI
+    <em>exclusive</em> and WDM-KS) do not trickle audio in &mdash; they hand over a whole device
+    buffer at once, then deliver nothing until the next one is full. Playing that as it arrives
+    would stutter once per buffer, so the monitor holds back a small reserve and grows it
+    automatically until playback is gap-free. The cost is monitor delay of about that reserve,
+    which is unavoidable: a source that speaks every half second cannot be monitored on less.
+    Chirp compensates on the visual side instead &mdash; the red cursor is steered onto the sample
+    the monitor is <em>currently playing</em> (its buffer plus the output device's own latency),
+    so the spectrogram and the sound stay aligned. With the monitor running the whole display
+    therefore sits as far behind live as the monitor does; with nothing routed it runs near-live.
+  </div>
+
   <h3>Reference Date &amp; Subfolder Naming</h3>
   <p>
     The <strong>Reference Date</strong> field enables automatic subfolder naming based on the number
@@ -1271,6 +1285,85 @@ python chirp.py</code></pre>
 </section>
 
 <!-- ── Inserted Silence ── -->
+<section id="capture-engine">
+  <h2>Capture Engine (&#9881; Advanced)</h2>
+  <p>
+    The <strong>&#9881; Advanced</strong> button opens settings that belong to the machine and its
+    audio hardware rather than to any one stream: how capture streams are opened, and what Chirp
+    does when a capture session goes bad. They are stored in the configuration file's
+    <code>audio</code> section. <strong>All capture-engine settings take effect the next time a
+    stream opens</strong> &mdash; Stop&nbsp;Acq &rarr; Start&nbsp;Acq, or a config load.
+  </p>
+
+  <h3 id="capture-buffers">Input buffer and block size</h3>
+  <table>
+    <thead><tr><th>Setting</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>Input buffer (latency)</strong></td>
+        <td>How late the machine may be before captured audio is lost &mdash; the setting that
+          actually protects against dropouts. <em>Device default</em> can be as little as
+          10&nbsp;ms on WASAPI (measured on a Focusrite Scarlett), far too thin a margin for a
+          shared desktop; an explicit 0.25&ndash;0.5&nbsp;s is much safer. Chirp logs the latency
+          the driver actually <em>granted</em> when it opens the stream.</td>
+      </tr>
+      <tr>
+        <td><strong>Callback block size</strong></td>
+        <td>How often Chirp is handed audio. Larger means fewer wake-ups (less chance of being
+          late) at the cost of monitor and display delay. It does <strong>not</strong> affect the
+          recorded audio &mdash; the capture ring absorbs any buffer size.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3 id="exclusive-mode">WASAPI exclusive mode</h3>
+  <p>
+    In shared mode every capture passes through the Windows audio engine, which owns the endpoint
+    buffer and is free to zero-fill a period it could not service &mdash; the
+    <a href="#inserted-silence">inserted-silence</a> fault. <strong>Exclusive mode</strong> hands
+    the endpoint to Chirp alone, so audio comes straight from the driver and the engine's
+    mixing and buffering path is out of the picture entirely.
+  </p>
+  <ul>
+    <li>While it is on, <strong>no other application can use that input</strong>, and the hardware
+      must accept the stream's format natively (there is no engine resampler to absorb a
+      mismatch).</li>
+    <li>Only <strong>WASAPI</strong> devices have an exclusive mode. On MME, DirectSound and
+      WDM-KS entries the request is logged and ignored &mdash; WDM-KS already bypasses the engine
+      on its own.</li>
+    <li>If an exclusive open is <strong>refused</strong> (another application holds the endpoint,
+      or the format is not natively supported), Chirp opens the device in shared mode and logs it
+      loudly rather than leaving an unattended rig with no capture at all.</li>
+  </ul>
+  <div class="callout note">
+    <strong>Confirm what actually ran.</strong> The <code>open</code> line in
+    <code>chirp_errors.log</code> names the device, its host API and the mode it opened in, for
+    example <code>device 17 "Analogue 1 + 2 (Focusrite USB)" [Windows WASAPI], blocksize=8192
+    (186&nbsp;ms), requested latency=0.5, granted latency=685.8&nbsp;ms, 2 ch @ 44100 Hz,
+    mode=EXCLUSIVE</code>. A bare device index is not evidence: indices shift as endpoints come
+    and go, one interface publishes several near-identically-named endpoints, and the same
+    endpoint appears once per host API.
+  </div>
+
+  <h3 id="zero-recovery">Inserted-silence auto-recovery</h3>
+  <p>
+    A capture session that has latched into zero-filling is cleared only by stopping acquisition on
+    <em>every</em> stream that holds the device and starting again. This watchdog does it for you.
+    When a stream's digital-zero duty cycle stays above <strong>Trigger above</strong> for
+    <strong>Sustained for</strong>, Chirp stops acquisition on every stream sharing that input
+    device, waits for the operating system to tear the session down, then restarts them and
+    restores their recording state. <strong>Wait between attempts</strong> keeps a persistent fault
+    from turning into a restart loop. Every intervention is logged as
+    <code>zero_run_recovery</code>.
+  </p>
+  <p>
+    Defaults: on, above <strong>5%</strong> digital zeros sustained for <strong>15&nbsp;s</strong>,
+    at most one attempt per <strong>120&nbsp;s</strong> per device. Turn it off if you are trying to
+    <em>observe</em> the fault rather than survive it.
+  </p>
+</section>
+
+<!-- 11d. Inserted Silence -->
 <section id="inserted-silence">
   <h2>Inserted Silence (Zero Samples)</h2>
   <p>
@@ -1302,13 +1395,24 @@ python chirp.py</code></pre>
   </p>
 
   <div class="callout warning">
-    <strong>If the badge appears mid-session:</strong> the audio device has latched into a bad
-    state, and it will usually <em>stay</em> there &mdash; every recording made from that point on
-    is corrupted. To clear it, <strong>Stop&nbsp;Acq on every stream that uses that input device,
-    then start them again</strong>. Stopping only one stream is not enough: the operating system
-    keeps the capture session alive (and its bad state with it) as long as any stream still holds
-    the device.
+    <strong>If the badge appears mid-session:</strong> the audio device has entered a bad state and
+    recordings made from that point on are corrupted. To clear it, <strong>Stop&nbsp;Acq on every
+    stream that uses that input device, then start them again</strong>. Stopping only one stream is
+    not enough: the operating system keeps the capture session alive (and its bad state with it) as
+    long as any stream still holds the device. The
+    <a href="#zero-recovery">auto-recovery watchdog</a> performs exactly that reset for you.
   </div>
+  <p>
+    <strong>What an episode looks like.</strong> Field logs from a 21-hour, 5-stream run: the fault
+    arrives abruptly (0 to about 20% of samples zeroed within three seconds), affects one input
+    endpoint at a time (both streams of a split stereo input show <em>identical</em> zero runs
+    while other endpoints of the same interface stay clean), ramps upwards over the following hour
+    or two, then clears on its own after 30&ndash;190 minutes. Severity is driven by how
+    <em>often</em> the zero-fill happens, not how long each one lasts: the events stay
+    5&ndash;8&nbsp;ms (one driver period) while their rate climbs from about 6/s to 37/s. Mean duty
+    cycle across that run was 16% of all captured samples, peaking at 34%. Do not wait for it to
+    clear itself &mdash; reset the device, or let the watchdog do it, as soon as the badge lights.
+  </p>
 
   <h3>Reducing the odds</h3>
   <ul>
@@ -1321,6 +1425,13 @@ python chirp.py</code></pre>
     <li><strong>Keep the driver and firmware current</strong> for your audio interface.</li>
     <li><strong>Check the recordings, not just the badge</strong> &mdash; the log records exactly
       when the runs started, so you can tell which files are affected.</li>
+    <li><strong>Get out of the shared audio engine.</strong> Field measurement showed that raising
+      the buffer and the latency does <em>not</em> help: across a 21-hour run PortAudio never
+      raised <code>input_underflow</code>, Chirp never fell behind, and no ring overrun was
+      recorded &mdash; the zeros were already in the buffer handed to the application, below
+      anything the app can reach. The layer below is the next thing to try: either
+      <a href="#exclusive-mode">WASAPI exclusive mode</a> or the device's
+      <a href="#rdp">WDM-KS</a> entry.</li>
   </ul>
 </section>
 
@@ -1510,7 +1621,7 @@ python chirp.py</code></pre>
 
 <!-- Footer -->
 <footer style="margin-top:3rem; padding-top:1.5rem; border-top:1px solid var(--surface0); text-align:center; color:var(--overlay0); font-size:0.82rem;">
-  <p>Chirp v3.8.0 &mdash; User Manual</p>
+  <p>Chirp v3.9.0 &mdash; User Manual</p>
   <p>Designed for bioacoustics research. Built with Python, PyQt5, and pyqtgraph.</p>
 </footer>
 
