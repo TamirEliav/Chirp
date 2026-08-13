@@ -162,8 +162,8 @@ class RecordingSidebarItem(QWidget):
             'the UI/processing loop cannot keep up with the capture '
             'callback. Reduce the number of streams or lower the '
             'sample rate.')
-        self._lbl_sat.setToolTip(
-            'Saturation has not been detected on this stream.')
+        self._sat_tip = 'Saturation has not been detected on this stream.'
+        self._lbl_sat.setToolTip(self._sat_tip)
         self._lbl_drop_sticky.setToolTip(
             'No dropped chunks recorded for this stream.')
         self._lbl_err.setToolTip(self._err_tip)
@@ -377,20 +377,33 @@ class RecordingSidebarItem(QWidget):
         self._lbl_drop.setStyleSheet(
             f'color: {color}; font-weight: bold; font-size: 9pt;')
 
-    def update_saturation_sticky(self, ever: bool):
-        """#28: update the sticky saturation badge. Called each UI tick."""
+    def update_saturation_sticky(self, ever: bool, tooltip: str | None = None):
+        """#28: update the sticky saturation badge. Called each UI tick.
+
+        ``tooltip`` is authored by the caller (it knows which clipped
+        file to name). It can change while the badge stays lit — a
+        second clipped recording replaces the first — so the tooltip is
+        compared independently of the lit state, and only the stylesheet
+        write is skipped when nothing visual changed.
+        """
         ever = bool(ever)
-        if ever == self._sat_lit:
+        if tooltip is None:
+            tooltip = (
+                'Saturation detected at some point during this session — '
+                'click to clear.'
+                if ever else
+                'Saturation has not been detected on this stream.')
+        tip_changed = tooltip != self._sat_tip
+        if ever == self._sat_lit and not tip_changed:
             return
-        self._sat_lit = ever
-        color = C['red'] if ever else C['surface2']
-        self._lbl_sat.setStyleSheet(
-            f'color: {color}; font-weight: bold; font-size: 9pt;')
-        self._lbl_sat.setToolTip(
-            'Saturation detected at some point during this session — '
-            'click to clear.'
-            if ever else
-            'Saturation has not been detected on this stream.')
+        if tip_changed:
+            self._sat_tip = tooltip
+            self._lbl_sat.setToolTip(tooltip)
+        if ever != self._sat_lit:
+            self._sat_lit = ever
+            color = C['red'] if ever else C['surface2']
+            self._lbl_sat.setStyleSheet(
+                f'color: {color}; font-weight: bold; font-size: 9pt;')
 
     def update_error_sticky(self, has_errors: bool, tooltip: str):
         """#43 / #44 / #48: update the sticky error badge and its
@@ -643,10 +656,11 @@ class RecordingSidebar(QWidget):
         if 0 <= idx < len(self._items):
             self._items[idx].notify_drops(n_drops)
 
-    def update_item_saturation_sticky(self, idx: int, ever: bool):
+    def update_item_saturation_sticky(self, idx: int, ever: bool,
+                                      tooltip: str | None = None):
         """#28: update the sticky saturation badge for one item."""
         if 0 <= idx < len(self._items):
-            self._items[idx].update_saturation_sticky(ever)
+            self._items[idx].update_saturation_sticky(ever, tooltip)
 
     def update_item_drop_sticky(self, idx: int, has_ever: bool, total: int):
         """#29: update the sticky persistent-drops badge for one item."""

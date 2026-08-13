@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Chirp v3.9.0 — User Manual</title>
+<title>Chirp v3.9.1 — User Manual</title>
 <style>
   :root {
     --base: #1e1e2e;
@@ -304,7 +304,7 @@
 <nav class="sidebar">
   <div class="logo">
     <h1>Chirp</h1>
-    <span>User Manual &mdash; v3.9.0</span>
+    <span>User Manual &mdash; v3.9.1</span>
   </div>
   <ul>
     <li><a href="#overview">Overview</a></li>
@@ -350,7 +350,13 @@
     <li><a href="#view-mode">View Mode</a></li>
     <li><a href="#settings-mgmt">Settings Management</a></li>
     <li><a href="#error-log">Error Logging</a></li>
-    <li><a href="#capture-engine">Capture Engine</a></li>
+    <li>
+      <a href="#capture-engine">Capture Engine</a>
+      <ul>
+        <li><a href="#stall-recovery">Lost-Device Auto-Reconnect</a></li>
+        <li><a href="#amplitude-envelope">Amplitude Envelope</a></li>
+      </ul>
+    </li>
     <li><a href="#inserted-silence">Inserted Silence</a></li>
     <li><a href="#rdp">Remote Desktop (RDP)</a></li>
     <li><a href="#interactions">Mouse &amp; Keyboard</a></li>
@@ -367,7 +373,7 @@
 <header class="hero">
   <h1>Chirp</h1>
   <p class="subtitle">Real-Time Audio Monitoring, Visualization &amp; Triggered Recording</p>
-  <span class="version">v3.9.0</span>
+  <span class="version">v3.9.1</span>
 </header>
 
 <!-- ── 1. Overview ── -->
@@ -639,7 +645,12 @@ python chirp.py</code></pre>
         the signal reaches 99% of full scale or higher. The transient red tint clears as soon as a
         clean chunk arrives; the <strong>sticky
         <span style="color:var(--red); font-weight:bold">S</span> badge</strong> on the
-        sidebar entry latches until you click it, so a brief clip is never missed.</li>
+        sidebar entry latches until you click it, so a brief clip is never missed.
+        <strong>Hover the badge to see the last saved recording that contained clipped samples</strong>
+        &mdash; its filename, folder and peak level &mdash; so you can open that file directly
+        instead of searching <a href="#error-log">chirp_errors.log</a> for it. If clipping was seen
+        but no recording has captured it (acquisition running without recording armed, or a clipped
+        stretch that never triggered), the tooltip says so rather than naming an older file.</li>
     <li><strong>Drop warning</strong> &mdash; raw audio lands in a preallocated per-stream ring
         buffer straight from the realtime callback, so capture cannot be stalled by DSP or the
         display. The sticky <span style="color:var(--red); font-weight:bold">D</span> badge on the
@@ -686,7 +697,9 @@ python chirp.py</code></pre>
   <p>
     Chirp continuously monitors the amplitude envelope and automatically records audio segments
     when the signal exceeds a configurable threshold. This enables unattended data collection
-    over extended periods.
+    over extended periods. The envelope is a smooth measure of instantaneous loudness rather than
+    the raw sample values &mdash; see <a href="#amplitude-envelope">Amplitude envelope</a> for how it
+    is computed and the two estimators you can choose between.
   </p>
 
   <h3 id="state-machine">State Machine</h3>
@@ -800,6 +813,14 @@ python chirp.py</code></pre>
     time down to the millisecond. Both fields encode the same instant &mdash; the onset of the
     recorded event (including the pre-trigger lookback). Files are written in a background thread
     to avoid blocking the audio processing pipeline.
+  </p>
+  <p>
+    The <strong>prefix</strong> and <strong>suffix</strong> are yours to use freely, but they are
+    sanitized so they can never produce an unusable path. Letters, digits and
+    <code>-</code>&nbsp;<code>_</code>&nbsp;<code>.</code>&nbsp;<code>+</code> are kept as typed;
+    anything else &mdash; spaces, slashes, colons, accented or non-Latin characters &mdash; becomes
+    an underscore. So a suffix like <code>stim+</code> or <code>day3+ctrl</code> reaches the filename
+    intact.
   </p>
   <div class="callout tip">
     <strong>Tip:</strong> The epoch timestamp ensures filenames are unique even if the system clock
@@ -1056,15 +1077,24 @@ python chirp.py</code></pre>
       (column / row), "Active only" filter, and OpenGL rendering</li>
     <li><strong>Audio-monitor settings</strong> &mdash; output device (by name), gain, mute state,
       Follow toggle, and which stream is routed to the monitor</li>
+    <li><strong>&#9881; Advanced settings</strong> &mdash; the capture engine (input buffer, block
+      size, exclusive mode), both auto-recovery switches, and the
+      <a href="#amplitude-envelope">amplitude-envelope</a> estimator and cutoff</li>
   </ul>
-  <h3 id="unsaved-changes">Unsaved Changes on Quit</h3>
+  <h3 id="unsaved-changes">Unsaved Changes</h3>
   <p>
-    If you close Chirp with configuration changes that haven't been saved, a prompt asks whether to
-    <strong>Save</strong>, <strong>Discard</strong>, or <strong>Cancel</strong>. Choosing
-    <em>Save</em> writes to the current configuration file (or asks where to save if the config is
-    new); <em>Discard</em> quits without saving; <em>Cancel</em> returns to the app without closing.
-    A small dot after the file name in the window title marks when there are unsaved changes. If
-    acquisition or recording is still running, that warning appears first, then this save prompt.
+    A small dot after the file name in the window title marks unsaved changes, and the
+    <strong>Save</strong> button is <em>enabled only while there are unsaved changes</em> &mdash; a
+    greyed-out Save means Chirp believes the file on disk already matches what is in memory. Every
+    change that gets written to the configuration file marks the config as unsaved, including
+    structural ones like the input device, channel mode and sample rate.
+  </p>
+  <p>
+    If you close Chirp with unsaved changes, a prompt asks whether to <strong>Save</strong>,
+    <strong>Discard</strong>, or <strong>Cancel</strong>. Choosing <em>Save</em> writes to the
+    current configuration file (or asks where to save if the config is new); <em>Discard</em> quits
+    without saving; <em>Cancel</em> returns to the app without closing. If acquisition or recording
+    is still running, that warning appears first, then this save prompt.
   </p>
   <h3 id="startup-config">Startup Configuration</h3>
   <p>
@@ -1361,6 +1391,68 @@ python chirp.py</code></pre>
     at most one attempt per <strong>120&nbsp;s</strong> per device. Turn it off if you are trying to
     <em>observe</em> the fault rather than survive it.
   </p>
+
+  <h3 id="stall-recovery">Lost-device auto-reconnect</h3>
+  <p>
+    Separately from the zero-filling fault, a capture stream can stop delivering audio altogether
+    &mdash; classically because a remote-desktop connect or disconnect made Windows tear down or
+    re-route the audio endpoint. When no new frames arrive for five seconds, Chirp marks the stream
+    stalled, lights the <span style="color:var(--peach); font-weight:bold">!</span> badge, and logs
+    <code>capture_dead</code>. With <strong>Reopen a stream automatically when its device stops
+    delivering audio</strong> ticked (the default) it then closes the dead stream and reopens the
+    device by name, preserving the recording state.
+  </p>
+  <p>
+    That reconnect is not free: the teardown and reopen themselves cost audio. If your device tends
+    to come back on its own &mdash; notably with a <a href="#rdp">WDM-KS</a> input, whose
+    kernel-streaming pin sits below the per-session endpoint layer that RDP churns &mdash; the
+    reconnect can do more harm than the stall it is reacting to. Untick the box to keep the
+    detection and drop the automatic repair; the badge and the log line still tell you what
+    happened, and you reconnect with Stop&nbsp;Acq &rarr; Start&nbsp;Acq when it suits you.
+  </p>
+  <div class="callout note">
+    Unlike the other Advanced settings, this one takes effect immediately &mdash; it is consulted on
+    every watchdog tick, not when a stream opens.
+  </div>
+
+  <h3 id="amplitude-envelope">Amplitude envelope (trigger)</h3>
+  <p>
+    The trigger's question is "how loud is it right now?", asked of the band-filtered signal, sample
+    by sample. That instantaneous loudness is the <em>envelope</em>, and Chirp can compute it two
+    ways. This is an app-wide choice, and unlike the capture settings it applies to every running
+    stream on the next block &mdash; no restart.
+  </p>
+  <table>
+    <thead><tr><th>Estimator</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>Hilbert (analytic signal)</strong><br><em>default</em></td>
+        <td>Mathematically exact for a tone and has no delay at all, but is recomputed from scratch
+          for each block of audio, which leaves a brief artifact (tens of samples) at every block
+          boundary.</td>
+      </tr>
+      <tr>
+        <td><strong>Rectify + low-pass</strong></td>
+        <td>The classic envelope follower: take the absolute value, then smooth it. The smoothing
+          filter carries its state across blocks, so there is no boundary artifact at all &mdash; in
+          exchange the envelope lags the signal by roughly <code>1 / cutoff</code> (about 20&nbsp;ms
+          at the default 50&nbsp;Hz).</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    <strong>Low-pass cutoff</strong> applies to the rectify method only. It has to sit
+    <em>below</em> your signal band, so the tone itself is smoothed away, and <em>above</em> the rate
+    at which your calls turn on and off, so real onsets are not blurred. Lower it for a smoother,
+    slower envelope; raise it to track fast onsets more tightly.
+  </p>
+  <div class="callout note">
+    <strong>Switching is safe for your thresholds.</strong> Both estimators are scaled so that a
+    steady tone reads its true peak amplitude, so an existing threshold means the same thing under
+    either one &mdash; you do not have to re-calibrate every stream after changing this. The two
+    also cost effectively the same to run, so choose on the artifact-versus-delay trade-off rather
+    than on performance.
+  </div>
 </section>
 
 <!-- 11d. Inserted Silence -->
@@ -1507,6 +1599,13 @@ python chirp.py</code></pre>
     &mdash; the watchdog bounds the gap, it cannot eliminate it. For gap-free operation use the
     prevention settings above.
   </div>
+  <p>
+    The reconnect itself costs audio, so it can be a poor trade when the device recovers on its own
+    &mdash; which is typical of a WDM-KS input, whose kernel-streaming pin sits below the endpoint
+    layer RDP churns. Untick <strong>&#9881; Advanced &rarr;
+    <a href="#stall-recovery">Lost-device auto-reconnect</a></strong> to keep the detection (badge and
+    log line) while handling the reconnect yourself with Stop&nbsp;Acq &rarr; Start&nbsp;Acq.
+  </p>
 
   <h3>Display rendering in remote sessions (built in)</h3>
   <p>
@@ -1621,7 +1720,7 @@ python chirp.py</code></pre>
 
 <!-- Footer -->
 <footer style="margin-top:3rem; padding-top:1.5rem; border-top:1px solid var(--surface0); text-align:center; color:var(--overlay0); font-size:0.82rem;">
-  <p>Chirp v3.9.0 &mdash; User Manual</p>
+  <p>Chirp v3.9.1 &mdash; User Manual</p>
   <p>Designed for bioacoustics research. Built with Python, PyQt5, and pyqtgraph.</p>
 </footer>
 

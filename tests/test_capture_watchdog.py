@@ -174,6 +174,100 @@ def test_transient_stall_unlatches_on_resume(monkeypatch, fast_stall):
         e.close()
 
 
+def test_detection_still_latches_when_reconnect_is_disabled(monkeypatch,
+                                                            fast_stall):
+    """``auto_recover_capture_stall = False`` turns off the RECONNECT,
+    not the detection: the user must still see the `!` badge and get the
+    ``capture_dead`` log line, they just do Stop Acq / Start Acq
+    themselves. Only the message changes."""
+    e = _make_stalled_entity(monkeypatch)
+    try:
+        assert e.check_capture_stalled(recover=False) is False
+        time.sleep(0.1)
+        assert e.check_capture_stalled(recover=False) is True
+        assert e.capture_stalled is True
+        assert e.has_ever_ingest_errored is True
+        msg = e.last_ingest_error or ''
+        assert 'auto-reconnect is OFF' in msg
+        assert 'attempting reconnect' not in msg
+    finally:
+        e.acq_running = False
+        e.close()
+
+
+def test_watchdog_tick_skips_recovery_when_disabled(monkeypatch):
+    """The window-level gate: with the switch off, no recovery thread is
+    ever spawned no matter how many streams are stalled."""
+    from chirp.ui.window import ChirpWindow
+
+    win = ChirpWindow.__new__(ChirpWindow)
+    checked: list[bool] = []
+
+    class _Ent:
+        def check_capture_stalled(self, recover=True):
+            checked.append(recover)
+            return True
+
+    win._entities = [_Ent(), _Ent()]
+    win._audio_cfg = {'auto_recover_capture_stall': False}
+    win._recovery_thread = None
+    win._recovery_backoff = 30.0
+    win._recovery_last_attempt = 0.0
+    win._recovery_needs_refresh = True
+
+    win._capture_watchdog_tick()
+
+    # Detection ran on every entity, told the truth about the setting…
+    assert checked == [False, False]
+    # …and nothing was dispatched.
+    assert win._recovery_thread is None
+    # Backoff is reset so flipping the switch back on reacts promptly
+    # instead of sitting out a stale 30 s penalty.
+    assert win._recovery_backoff == 3.0
+
+
+def test_watchdog_tick_dispatches_when_enabled(monkeypatch):
+    """Mirror of the above — with the switch on (the default), a stalled
+    stream still gets a recovery worker."""
+    from chirp.ui.window import ChirpWindow
+
+    win = ChirpWindow.__new__(ChirpWindow)
+    started = {}
+
+    class _Ent:
+        acq_running = True
+        input_source = 'device'
+        capture_stalled = True
+
+        def check_capture_stalled(self, recover=True):
+            started['recover'] = recover
+            return True
+
+    class _FakeThread:
+        def __init__(self, **kw):
+            started['spawned'] = True
+            self.kw = kw
+
+        def start(self):
+            started['started'] = True
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr('chirp.ui.window.threading.Thread', _FakeThread)
+    win._entities = [_Ent()]
+    win._audio_cfg = {}          # key absent → historical behaviour (on)
+    win._recovery_thread = None
+    win._recovery_backoff = 3.0
+    win._recovery_last_attempt = 0.0
+    win._recovery_needs_refresh = False
+
+    win._capture_watchdog_tick()
+
+    assert started.get('recover') is True
+    assert started.get('started') is True
+
+
 def test_recovery_flushes_open_events_first(monkeypatch, fast_stall):
     """An event mid-recording when the device dies must land on disk
     (via the flush path) before the pipeline is rebuilt."""

@@ -39,6 +39,9 @@ from typing import Iterable
 
 from chirp.constants import (CAPTURE_BLOCKSIZE, CAPTURE_EXCLUSIVE,
                              CAPTURE_LATENCY)
+from chirp.dsp.envelope import (DEFAULT_ENVELOPE_CUTOFF_HZ,
+                                ENVELOPE_CUTOFF_MAX_HZ,
+                                ENVELOPE_CUTOFF_MIN_HZ, ENVELOPE_METHODS)
 from chirp.recording.entity import RecordingEntity
 
 
@@ -92,6 +95,23 @@ DEFAULT_AUDIO = {
     "zero_recover_percent": 5.0,
     "zero_recover_seconds": 15.0,
     "zero_recover_cooldown_sec": 120.0,
+    # Capture-stall (RDP) auto-reconnect. When a live-device capture
+    # stops delivering frames for CAPTURE_STALL_SECONDS, Chirp tears the
+    # stream down and reopens it by name. That is the right move when an
+    # RDP session change really did rip the endpoint out, and the wrong
+    # one when the device was only briefly busy — the teardown itself
+    # costs audio. WDM-KS inputs largely sidestep the RDP problem in the
+    # first place (kernel-streaming pins live below the per-session
+    # endpoint layer), so on such a rig the reconnect is all cost.
+    # Detection, the `!` badge and the ``capture_dead`` log line are
+    # unaffected by this switch — only the automatic reconnect is.
+    "auto_recover_capture_stall": True,
+    # Amplitude-envelope estimator for the trigger (app-wide, applies to
+    # every stream on the next chunk). 'hilbert' = |analytic signal|
+    # (historical default), 'rectify' = rectify + low-pass follower with
+    # ``envelope_cutoff_hz`` as its cutoff. See chirp/dsp/envelope.py.
+    "envelope_method": "hilbert",
+    "envelope_cutoff_hz": DEFAULT_ENVELOPE_CUTOFF_HZ,
 }
 
 # Set of top-level keys recognized by the loader. Anything else triggers
@@ -203,6 +223,7 @@ def parse_audio_settings(data: dict) -> tuple[dict, list[str]]:
     # Coerce the numeric / boolean knobs so a hand-edited config can't
     # feed a string into the watchdog arithmetic.
     out["capture_exclusive"] = bool(out["capture_exclusive"])
+    out["auto_recover_capture_stall"] = bool(out["auto_recover_capture_stall"])
     try:
         out["auto_recover_zero_runs"] = bool(out["auto_recover_zero_runs"])
         out["zero_recover_percent"] = max(0.1, float(out["zero_recover_percent"]))
@@ -214,6 +235,21 @@ def parse_audio_settings(data: dict) -> tuple[dict, list[str]]:
         for k in ("auto_recover_zero_runs", "zero_recover_percent",
                   "zero_recover_seconds", "zero_recover_cooldown_sec"):
             out[k] = DEFAULT_AUDIO[k]
+    # Envelope estimator. An unrecognised method is a typo in a
+    # hand-edited config, not a reason to refuse the file — warn and use
+    # the default, same as every other invalid value here.
+    if out["envelope_method"] not in ENVELOPE_METHODS:
+        warnings.append(
+            f"audio: unknown envelope_method {out['envelope_method']!r} — "
+            f"using {DEFAULT_AUDIO['envelope_method']!r}")
+        out["envelope_method"] = DEFAULT_AUDIO["envelope_method"]
+    try:
+        out["envelope_cutoff_hz"] = min(
+            max(float(out["envelope_cutoff_hz"]), ENVELOPE_CUTOFF_MIN_HZ),
+            ENVELOPE_CUTOFF_MAX_HZ)
+    except (TypeError, ValueError):
+        warnings.append("audio: invalid envelope_cutoff_hz — using default")
+        out["envelope_cutoff_hz"] = DEFAULT_ENVELOPE_CUTOFF_HZ
     return out, warnings
 
 
@@ -269,6 +305,15 @@ def build_settings_dict(entities: Iterable[RecordingEntity],
             "zero_recover_cooldown_sec": float(
                 aud.get("zero_recover_cooldown_sec",
                         DEFAULT_AUDIO["zero_recover_cooldown_sec"])),
+            "auto_recover_capture_stall": bool(
+                aud.get("auto_recover_capture_stall",
+                        DEFAULT_AUDIO["auto_recover_capture_stall"])),
+            "envelope_method": str(
+                aud.get("envelope_method",
+                        DEFAULT_AUDIO["envelope_method"])),
+            "envelope_cutoff_hz": float(
+                aud.get("envelope_cutoff_hz",
+                        DEFAULT_AUDIO["envelope_cutoff_hz"])),
         },
         "recordings": [e.to_dict() for e in entities],
     }

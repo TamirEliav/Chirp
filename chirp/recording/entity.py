@@ -48,8 +48,9 @@ from chirp.constants import (
     SPEC_DB_MIN,
     SPECTROGRAM_NPERSEG,
 )
-from chirp.dsp import BandpassFilter, SpectrogramAccumulator
+from chirp.dsp import BandpassFilter, RectifiedEnvelope, SpectrogramAccumulator
 from chirp.dsp import analytic_envelope as _envelope
+from chirp.dsp import envelope as _envelope_mod
 from chirp.dsp import normalized_spectral_entropy as _spectral_entropy
 from chirp.recording.trigger import ThresholdRecorder
 from chirp.recording import writer as _wav_writer
@@ -157,6 +158,12 @@ class RecordingEntity:
         self.recorder   = ThresholdRecorder(streaming=True)
         self.bpf        = BandpassFilter(sample_rate=self.sample_rate)
         self.bpf_r      = BandpassFilter(sample_rate=self.sample_rate)
+        # Rectify-and-low-pass envelope followers, built lazily by
+        # ``_trigger_envelope`` and only when that method is selected —
+        # the default Hilbert path allocates nothing. One per channel:
+        # the IIR history is per-signal and must not be shared.
+        self._env_lp: RectifiedEnvelope | None = None
+        self._env_lp_r: RectifiedEnvelope | None = None
 
         # Analysis FFT params — default to display params. When they
         # differ from the display FFT, a separate accumulator is used
@@ -302,6 +309,15 @@ class RecordingEntity:
         # isn't watching are still surfaced after the fact. Cleared
         # explicitly via clear_saturation_flag().
         self.saturated_ever = False
+        # Most recent PUBLISHED WAV whose audio contained clipped
+        # samples, so the sticky "S" badge can name the file instead of
+        # sending the user to chirp_errors.log to match timestamps by
+        # hand. Filled by ``poll_saturated_file`` from the writer-side
+        # registry (the publish happens on a writer-pool worker, which
+        # has no reference to this entity). Stays empty when clipping
+        # only ever happened outside a recording.
+        self.last_saturated_path = ''
+        self.last_saturated_peak = 0.0
         # #44: surface ingestion thread errors. The old _ingest_loop
         # swallowed every exception into traceback.print_exc() — in a
         # GUI build nobody sees stdout, and a recurring DSP error would
@@ -537,9 +553,28 @@ class RecordingEntity:
         """Clear the sticky ``saturated_ever`` flag (#28).
 
         The transient ``saturated`` flag is unaffected — it will turn
-        back on immediately if the next chunk is still clipping.
+        back on immediately if the next chunk is still clipping. The
+        remembered clipped file goes with the flag: the badge that named
+        it is being reset, so keeping the name would make the next
+        lighting of the badge point at a stale recording.
         """
         self.saturated_ever = False
+        self.last_saturated_path = ''
+        self.last_saturated_peak = 0.0
+        try:
+            _wav_writer.clear_saturated_file(self.name)
+        except Exception:
+            pass
+
+    def poll_saturated_file(self) -> None:
+        """Pick up the path of any WAV published with clipped audio
+        since the last poll (UI tick). Never raises."""
+        try:
+            rec = _wav_writer.consume_saturated_file(self.name)
+        except Exception:
+            return
+        if rec:
+            self.last_saturated_path, self.last_saturated_peak = rec
 
     def clear_drop_flag(self) -> None:
         """Clear the sticky dropped-audio stats on the attached capture
@@ -710,6 +745,39 @@ class RecordingEntity:
         self._env_peak_acc = -1.0
         return p if p >= 0.0 else None
 
+    # ── Trigger amplitude envelope ────────────────────────────────────
+
+    def _trigger_envelope(self, x, right: bool = False):
+        """Amplitude envelope of the (already bandpassed) chunk ``x``,
+        using the app-wide method from ``chirp.dsp.envelope``.
+
+        Read per chunk rather than cached at construction so a change in
+        ⚙ Advanced takes effect on every running stream immediately, with
+        no acquisition restart. The rectify follower is stateful, so it
+        is cached on the entity and rebuilt only when the cutoff or the
+        sample rate actually changes — rebuilding per chunk would reset
+        the IIR history every 1024 samples and defeat the point.
+        """
+        method, cutoff = _envelope_mod.current_params()
+        if method != 'rectify':
+            return _envelope(x)
+        slot = '_env_lp_r' if right else '_env_lp'
+        eng = getattr(self, slot, None)
+        # Compare against the REQUEST, not the designed cutoff: a cutoff
+        # clamped by Nyquist would never equal the configured value and
+        # the follower would be rebuilt (history wiped) every chunk.
+        if eng is None or eng.key != (self.sample_rate, float(cutoff)):
+            eng = RectifiedEnvelope(self.sample_rate, cutoff)
+            setattr(self, slot, eng)
+        return eng.process(x)
+
+    def _reset_envelope_followers(self) -> None:
+        """Drop the rectify followers' filter history (stream restart,
+        device change, sample-rate change). Cheap: they rebuild lazily on
+        the next chunk."""
+        self._env_lp = None
+        self._env_lp_r = None
+
     # ── TODO#1 (RDP): capture-stall watchdog ──────────────────────────
 
     #: Seconds without a single new frame from the PortAudio callback
@@ -721,12 +789,18 @@ class RecordingEntity:
     #: is far more expensive than reacting three seconds later.
     CAPTURE_STALL_SECONDS = 5.0
 
-    def check_capture_stalled(self) -> bool:
+    def check_capture_stalled(self, recover: bool = True) -> bool:
         """Return True when acquisition claims to run on a live device
         but the PortAudio callback has stopped delivering frames (the
         RDP connect/disconnect signature — Windows tore down or
         re-routed the audio endpoint). Latches ``capture_stalled`` and
         the sticky error badge on first detection. Polled per UI tick.
+
+        ``recover`` only affects what the badge and the log line SAY —
+        detection and latching are unconditional. The caller
+        (``ChirpWindow._capture_watchdog_tick``) passes the user's
+        auto-reconnect setting so a stalled stream doesn't promise a
+        reconnect that is switched off.
         """
         if (not self.acq_running or self.input_source != 'device'
                 or self.ring is None):
@@ -754,15 +828,20 @@ class RecordingEntity:
                 and now - self._stall_wt_t >= self.CAPTURE_STALL_SECONDS):
             self.capture_stalled = True
             self.has_ever_ingest_errored = True
+            action = ('attempting reconnect' if recover else
+                      'auto-reconnect is OFF — use Stop Acq / Start Acq')
             self.last_ingest_error = (
                 'audio device stopped delivering samples (device lost / '
-                'RDP session change?) — attempting reconnect')
+                f'RDP session change?) — {action}')
             print(f'[Chirp] {self.name}: capture stalled — no frames for '
-                  f'{self.CAPTURE_STALL_SECONDS:.0f}s; starting recovery')
+                  f'{self.CAPTURE_STALL_SECONDS:.0f}s; '
+                  + ('starting recovery' if recover
+                     else 'auto-reconnect disabled'))
             _err_log('capture_dead', self.name,
                      f'no frames for {self.CAPTURE_STALL_SECONDS:.0f}s — '
-                     f'device lost (RDP session change?); auto-reconnect '
-                     f'engaged')
+                     f'device lost (RDP session change?); '
+                     + ('auto-reconnect engaged' if recover
+                        else 'auto-reconnect disabled by settings'))
         return self.capture_stalled
 
     def attempt_capture_recovery(self) -> bool:
@@ -1474,6 +1553,9 @@ class RecordingEntity:
         # Rebuild filters and capture
         self.bpf   = BandpassFilter(sample_rate=new_rate)
         self.bpf_r = BandpassFilter(sample_rate=new_rate)
+        # The rectify followers are designed against the old rate; drop
+        # them so the next chunk builds them at the new one.
+        self._reset_envelope_followers()
         # TODO#7: reset the FFT accumulators — their 4096-sample overlap
         # still holds OLD-rate audio. Without this, the first columns
         # after an SR change mix old samples into the new-rate FFT: the
@@ -1673,6 +1755,7 @@ class RecordingEntity:
                     pass
             self.bpf.reset()
             self.bpf_r.reset()
+            self._reset_envelope_followers()
             self.spec_acc.reset()
             self.spec_acc_r.reset()
             if self._analysis_acc is not None:
@@ -1916,9 +1999,13 @@ class RecordingEntity:
         #       from what the recorder sees.
         #
         # Amplitude component: per-sample ENVELOPE ≥ threshold under
-        # the active `trigger_mode` rule. Envelope = |analytic signal|
-        # (Hilbert transform magnitude), which is smooth across
-        # waveform zero crossings. Using |filtered signal| instead
+        # the active `trigger_mode` rule. The envelope is smooth across
+        # waveform zero crossings — either |analytic signal| (Hilbert
+        # magnitude, the default) or a rectify-and-low-pass follower,
+        # selected app-wide in ⚙ Advanced and dispatched by
+        # ``_trigger_envelope``; both are scaled so a steady tone reads
+        # its peak amplitude, so the threshold means the same thing
+        # under either. Using |filtered signal| instead
         # (pre-fix) made narrowband signals — pure tones, bandpassed
         # bioacoustic calls — dip below threshold every half-cycle,
         # so the consecutive-above-samples streak could never reach
@@ -1928,8 +2015,8 @@ class RecordingEntity:
         # value per FFT column), so it contributes a scalar AND/OR
         # gate.
         if mode == 'Stereo':
-            env_fl = _envelope(filt_l)
-            env_fr = _envelope(filt_r)
+            env_fl = self._trigger_envelope(filt_l)
+            env_fr = self._trigger_envelope(filt_r, right=True)
             tm = self.trigger_mode
             if tm == 'Left Channel':
                 filt_combined_env = env_fl
@@ -1942,7 +2029,7 @@ class RecordingEntity:
             else:  # Average
                 filt_combined_env = (env_fl + env_fr) * 0.5
         else:
-            filt_combined_env = _envelope(filt)
+            filt_combined_env = self._trigger_envelope(filt)
         amp_mask = filt_combined_env >= self.threshold
 
         # M8: accumulate the envelope peak for auto-calibrate. Cheap

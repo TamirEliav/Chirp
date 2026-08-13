@@ -376,6 +376,65 @@ def test_capture_exclusive_round_trips_and_defaults_off():
     assert cfg['capture_exclusive'] is False
 
 
+def test_capture_stall_recovery_round_trips_and_defaults_on():
+    """The RDP auto-reconnect switch. It defaults ON (the historical
+    behaviour) but has to survive a save/load — a rig where the
+    reconnect does more harm than good is configured once and left."""
+    from chirp.config.schema import (DEFAULT_AUDIO, build_settings_dict,
+                                     parse_audio_settings)
+    assert DEFAULT_AUDIO['auto_recover_capture_stall'] is True
+    e = _fresh_entity('stall')
+    data = build_settings_dict(
+        [e], audio={'auto_recover_capture_stall': False})
+    decoded = json.loads(json.dumps(data))
+    assert decoded['audio']['auto_recover_capture_stall'] is False
+    cfg, warnings = parse_audio_settings(decoded)
+    assert cfg['auto_recover_capture_stall'] is False
+    assert not [w for w in warnings if 'audio' in w.lower()]
+    # Absent from an older config → the historical behaviour.
+    cfg, _ = parse_audio_settings({'audio': {'capture_blocksize': 4096}})
+    assert cfg['auto_recover_capture_stall'] is True
+
+
+def test_envelope_settings_round_trip():
+    from chirp.config.schema import (DEFAULT_AUDIO, build_settings_dict,
+                                     parse_audio_settings)
+    # Default must stay the historical estimator — switching it silently
+    # would change every existing user's detection behaviour on upgrade.
+    assert DEFAULT_AUDIO['envelope_method'] == 'hilbert'
+    e = _fresh_entity('env')
+    data = build_settings_dict([e], audio={'envelope_method': 'rectify',
+                                           'envelope_cutoff_hz': 80.0})
+    decoded = json.loads(json.dumps(data))
+    cfg, warnings = parse_audio_settings(decoded)
+    assert cfg['envelope_method'] == 'rectify'
+    assert cfg['envelope_cutoff_hz'] == 80.0
+    assert not [w for w in warnings if 'audio' in w.lower()]
+
+
+def test_envelope_method_typo_warns_and_falls_back():
+    from chirp.config.schema import parse_audio_settings
+    cfg, warnings = parse_audio_settings(
+        {'audio': {'envelope_method': 'rectifie'}})
+    assert cfg['envelope_method'] == 'hilbert'
+    assert any('envelope_method' in w for w in warnings)
+
+
+def test_envelope_cutoff_is_clamped_and_junk_tolerant():
+    from chirp.config.schema import parse_audio_settings
+    from chirp.dsp.envelope import (DEFAULT_ENVELOPE_CUTOFF_HZ,
+                                    ENVELOPE_CUTOFF_MAX_HZ,
+                                    ENVELOPE_CUTOFF_MIN_HZ)
+    cfg, _ = parse_audio_settings({'audio': {'envelope_cutoff_hz': 1e9}})
+    assert cfg['envelope_cutoff_hz'] == ENVELOPE_CUTOFF_MAX_HZ
+    cfg, _ = parse_audio_settings({'audio': {'envelope_cutoff_hz': -5}})
+    assert cfg['envelope_cutoff_hz'] == ENVELOPE_CUTOFF_MIN_HZ
+    cfg, warnings = parse_audio_settings(
+        {'audio': {'envelope_cutoff_hz': 'fifty'}})
+    assert cfg['envelope_cutoff_hz'] == DEFAULT_ENVELOPE_CUTOFF_HZ
+    assert warnings
+
+
 def test_audio_defaults_when_section_absent():
     from chirp.config.schema import DEFAULT_AUDIO, parse_audio_settings
     cfg, warnings = parse_audio_settings({'recordings': []})

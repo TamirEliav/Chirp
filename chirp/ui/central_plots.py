@@ -110,6 +110,7 @@ class StreamTile(QWidget):
             lbl.setCursor(Qt.PointingHandCursor)
             h.addWidget(lbl)
         self._sat_lit = False
+        self._sat_tip = ''
         self._drop_lit = False
         self._err_lit = False
         self._err_tip = ''
@@ -174,15 +175,16 @@ class StreamTile(QWidget):
 
     def update_badges(self, e) -> None:
         """Refresh the sticky S/D/! badges from the entity's flags."""
-        sat = bool(getattr(e, 'saturated_ever', False))
+        from chirp.ui.status_util import compose_saturation_state
+        sat, sat_tip = compose_saturation_state(e)
+        if sat_tip != self._sat_tip:
+            self._sat_tip = sat_tip
+            self._lbl_sat.setToolTip(sat_tip)
         if sat != self._sat_lit:
             self._sat_lit = sat
             color = C['red'] if sat else C['surface2']
             self._lbl_sat.setStyleSheet(
                 f'color: {color}; font-weight: bold; font-size: 9pt;')
-            self._lbl_sat.setToolTip(
-                'Saturation detected during this session — click to clear.'
-                if sat else 'No saturation detected on this stream.')
 
         cap = getattr(e, 'capture', None)
         drop = bool(getattr(cap, 'has_ever_dropped', False))

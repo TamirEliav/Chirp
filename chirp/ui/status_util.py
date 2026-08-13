@@ -9,6 +9,39 @@ lives here so the sidebar badges (Config mode) and the per-tile headers
 
 from __future__ import annotations
 
+import os
+
+
+_SAT_CLEAR_TIP = 'Saturation has not been detected on this stream.'
+
+
+def compose_saturation_state(e) -> tuple[bool, str]:
+    """Return ``(ever_saturated, tooltip)`` for one RecordingEntity.
+
+    When a clipped WAV has actually been published, the tooltip names it
+    — the whole point being that the user can open that file directly
+    instead of grepping ``chirp_errors.log`` for the matching timestamp.
+    Clipping detected live but never written (acquisition without
+    recording, or a clipped stretch that never triggered) has no file to
+    name, and the tooltip says so rather than pointing at an older,
+    unrelated recording.
+    """
+    ever = bool(getattr(e, 'saturated_ever', False))
+    if not ever:
+        return False, _SAT_CLEAR_TIP
+    path = str(getattr(e, 'last_saturated_path', '') or '')
+    if not path:
+        return True, ('Saturation detected during this session, but no '
+                      'saved recording has contained clipped samples yet '
+                      '— click to clear.')
+    peak = float(getattr(e, 'last_saturated_peak', 0.0) or 0.0)
+    return True, (
+        f'Saturation detected during this session.\n'
+        f'Last clipped recording (peak {peak:.4f}):\n'
+        f'{os.path.basename(path)}\n'
+        f'in {os.path.dirname(path)}\n'
+        f'— click to clear.')
+
 
 def compose_error_state(e) -> tuple[bool, str]:
     """Return ``(any_error, tooltip)`` for one RecordingEntity.

@@ -2362,7 +2362,9 @@ class ChirpWindow(QMainWindow):
             self._entities[idx].clear_saturation_flag()
             # Push a fresh update so the badge goes grey immediately
             # without waiting for the next plot tick.
-            self._sidebar.update_item_saturation_sticky(idx, False)
+            from chirp.ui.status_util import compose_saturation_state
+            self._sidebar.update_item_saturation_sticky(
+                idx, *compose_saturation_state(self._entities[idx]))
 
     def _on_clear_drops(self, idx: int):
         """Clear the sticky drop stats on the idx-th stream."""
@@ -2596,6 +2598,15 @@ class ChirpWindow(QMainWindow):
         self._date_line.setText(datetime.date.today().strftime('%Y-%m-%d'))
         self._dph_prefix_edit.clear()
         self._combo_display_mode.setCurrentText('Spectrogram')
+        # The line edits above write through on ``editingFinished``,
+        # which setText() does not emit — push them into the entity by
+        # hand or Reset would leave the old folder/prefix/suffix live
+        # (and unsaved-but-different from what the fields show).
+        self._on_folder_changed()
+        self._on_prefix_changed()
+        self._on_suffix_changed()
+        self._on_dph_prefix_changed()
+        self._mark_dirty()
 
     # ──────────────────────────────────────────────────────────────────────
     # Save / Load settings
@@ -2622,11 +2633,15 @@ class ChirpWindow(QMainWindow):
         """Capture-engine tuning, as the next stream would open, plus the
         inserted-silence auto-recovery settings."""
         from chirp.audio import shared_stream as _shared
+        from chirp.dsp import envelope as _env
         blocksize, latency, exclusive = _shared.current_params()
+        method, cutoff = _env.current_params()
         out = dict(self._audio_cfg)
         out['capture_blocksize'] = blocksize
         out['capture_latency'] = latency
         out['capture_exclusive'] = exclusive
+        out['envelope_method'] = method
+        out['envelope_cutoff_hz'] = cutoff
         return out
 
     def _write_settings_to_path(self, path: str, data: dict) -> bool:
@@ -2728,13 +2743,24 @@ class ChirpWindow(QMainWindow):
         from chirp.audio import shared_stream as _shared
         from chirp.constants import (CAPTURE_BLOCKSIZE_MAX,
                                      CAPTURE_BLOCKSIZE_MIN)
+        from chirp.dsp import envelope as _env
 
         cur_bs, cur_lat, cur_excl = _shared.current_params()
+        cur_env_method, cur_env_cut = _env.current_params()
         cfg = dict(self._audio_cfg)
 
         dlg = QDialog(self)
         dlg.setWindowTitle('Advanced Settings')
-        v = QVBoxLayout(dlg)
+        outer = QVBoxLayout(dlg)
+        # Four explained groups no longer fit a laptop screen at once, so
+        # the groups scroll and the OK/Cancel row stays pinned below.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        page = QWidget()
+        v = QVBoxLayout(page)
+        scroll.setWidget(page)
+        outer.addWidget(scroll, 1)
 
         # ── Capture engine ────────────────────────────────────────────
         cap_box = QGroupBox('CAPTURE ENGINE')
@@ -2853,6 +2879,76 @@ class ChirpWindow(QMainWindow):
         rec_form.addWidget(hint_rec, r, 0, 1, 2)
         v.addWidget(rec_box)
 
+        # ── Capture-stall (RDP) reconnect ─────────────────────────────
+        stall_box = QGroupBox('LOST-DEVICE AUTO-RECONNECT')
+        stall_form = QGridLayout(stall_box)
+        chk_stall = QCheckBox(
+            'Reopen a stream automatically when its device stops '
+            'delivering audio')
+        chk_stall.setChecked(
+            bool(cfg.get('auto_recover_capture_stall', True)))
+        stall_form.addWidget(chk_stall, 0, 0, 1, 2)
+        hint_stall = QLabel(
+            'A remote-desktop connect/disconnect can rip out the Windows\n'
+            'audio endpoint; this closes the dead stream and reopens the\n'
+            'device by name. It is not free — the teardown costs audio —\n'
+            'so if the device recovers on its own, or you are using a\n'
+            'WDM-KS input (which survives RDP session churn), turning\n'
+            'this off avoids reconnects that do more harm than good.\n'
+            'Detection is unaffected: the stream is still marked stalled,\n'
+            'the "!" badge still lights, and chirp_errors.log still gets\n'
+            'the capture_dead line — you just reconnect it yourself with\n'
+            'Stop Acq / Start Acq.')
+        hint_stall.setStyleSheet(f'color: {C["subtext"]};')
+        stall_form.addWidget(hint_stall, 1, 0, 1, 2)
+        v.addWidget(stall_box)
+
+        # ── Amplitude envelope ────────────────────────────────────────
+        env_box = QGroupBox('AMPLITUDE ENVELOPE (TRIGGER)')
+        env_form = QGridLayout(env_box)
+        er = 0
+        env_form.addWidget(QLabel('Estimator:'), er, 0)
+        cb_env = QComboBox()
+        cb_env.addItem('Hilbert (analytic signal)', 'hilbert')
+        cb_env.addItem('Rectify + low-pass', 'rectify')
+        _ei = cb_env.findData(cur_env_method)
+        cb_env.setCurrentIndex(_ei if _ei >= 0 else 0)
+        env_form.addWidget(cb_env, er, 1)
+        er += 1
+
+        env_form.addWidget(QLabel('Low-pass cutoff:'), er, 0)
+        sb_env_cut = QDoubleSpinBox()
+        sb_env_cut.setRange(_env.ENVELOPE_CUTOFF_MIN_HZ,
+                            _env.ENVELOPE_CUTOFF_MAX_HZ)
+        sb_env_cut.setSingleStep(5.0)
+        sb_env_cut.setDecimals(1)
+        sb_env_cut.setSuffix(' Hz')
+        sb_env_cut.setValue(float(cur_env_cut))
+        env_form.addWidget(sb_env_cut, er, 1)
+        er += 1
+
+        hint_env = QLabel(
+            'How the trigger measures "how loud is it right now" from the\n'
+            'band-filtered signal. Hilbert is exact and lag-free but is\n'
+            'recomputed per block, so it has a small artifact at every\n'
+            'block edge. Rectify + low-pass is the classic envelope\n'
+            'follower: continuous across blocks, at the cost of a delay\n'
+            'of roughly 1/cutoff. They cost the same to run — choose on\n'
+            'artifact-vs-delay, not speed. The cutoff must sit below\n'
+            'your signal band (to remove the tone itself) and above the\n'
+            'rate at which the calls turn on and off. Both are scaled so\n'
+            'a steady tone reads its true amplitude — switching does not\n'
+            'move your thresholds. Applies to every stream on the next\n'
+            'block; no restart needed.')
+        hint_env.setStyleSheet(f'color: {C["subtext"]};')
+        env_form.addWidget(hint_env, er, 0, 1, 2)
+        v.addWidget(env_box)
+
+        def _sync_env_enabled():
+            sb_env_cut.setEnabled(cb_env.currentData() == 'rectify')
+        cb_env.currentIndexChanged.connect(lambda _i: _sync_env_enabled())
+        _sync_env_enabled()
+
         def _sync_rec_enabled():
             on = chk.isChecked()
             for w in (sb_pct, sb_sec, sb_cool):
@@ -2860,10 +2956,14 @@ class ChirpWindow(QMainWindow):
         chk.toggled.connect(_sync_rec_enabled)
         _sync_rec_enabled()
 
+        v.addStretch(1)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(dlg.accept)
         bb.rejected.connect(dlg.reject)
-        v.addWidget(bb)
+        outer.addWidget(bb)
+        # Tall enough to show a group or two without the user resizing,
+        # but capped so the dialog never grows past a small screen.
+        dlg.resize(dlg.sizeHint().width(), 620)
 
         if dlg.exec_() != QDialog.Accepted:
             return
@@ -2874,12 +2974,17 @@ class ChirpWindow(QMainWindow):
         _shared.configure(cb_bs.currentData(),
                           latency if latency > 0 else 'high',
                           bool(chk_excl.isChecked()))
+        env_method, env_cutoff = _env.configure(cb_env.currentData(),
+                                                sb_env_cut.value())
         self._audio_cfg.update({
             'capture_exclusive': bool(chk_excl.isChecked()),
             'auto_recover_zero_runs': bool(chk.isChecked()),
             'zero_recover_percent': float(sb_pct.value()),
             'zero_recover_seconds': float(sb_sec.value()),
             'zero_recover_cooldown_sec': float(sb_cool.value()),
+            'auto_recover_capture_stall': bool(chk_stall.isChecked()),
+            'envelope_method': env_method,
+            'envelope_cutoff_hz': env_cutoff,
         })
         self._zero_high_since.clear()
         self._mark_dirty()
@@ -2995,6 +3100,9 @@ class ChirpWindow(QMainWindow):
             _shared.configure(audio_cfg.get('capture_blocksize'),
                               audio_cfg.get('capture_latency'),
                               audio_cfg.get('capture_exclusive'))
+            from chirp.dsp import envelope as _env
+            _env.configure(audio_cfg.get('envelope_method'),
+                           audio_cfg.get('envelope_cutoff_hz'))
         except Exception as exc:
             print(f'[Chirp] could not apply audio settings: {exc}')
         try:
@@ -3245,6 +3353,10 @@ class ChirpWindow(QMainWindow):
         # Apply the new threshold
         if e:
             e.threshold = new_threshold
+            self._mark_dirty()
+        # Silent so the spinbox handler doesn't fight the value we just
+        # wrote; the dirty mark above is what that handler would have
+        # done.
         self._set_thr_silent(new_threshold)
         self._sync_thr_line(new_threshold)
 
@@ -3305,6 +3417,7 @@ class ChirpWindow(QMainWindow):
         e.display_freq_lo = self._sb_disp_freq_lo.value()
         e.display_freq_hi = self._sb_disp_freq_hi.value()
         e.rebuild_freq_mapping()
+        self._mark_dirty()
 
     # ── 4b: all-streams config table ─────────────────────────────────
 
@@ -3515,6 +3628,7 @@ class ChirpWindow(QMainWindow):
         if chosen:
             if e:
                 e.output_dir = chosen
+                self._mark_dirty()
             self._folder_edit.setText(chosen)
             self._apply_folder_validation(e, chosen)
 
@@ -3552,6 +3666,7 @@ class ChirpWindow(QMainWindow):
             else:
                 e.ref_date = None
                 self._lbl_day_count.setText('Day: —')
+            self._mark_dirty()
 
     def _on_ref_date_text_changed(self):
         e = self._sel
@@ -3561,6 +3676,7 @@ class ChirpWindow(QMainWindow):
                 e.ref_date = d
                 days = (datetime.date.today() - d).days
                 self._lbl_day_count.setText(f'Day: {days}')
+                self._mark_dirty()
 
     def _on_pick_date(self):
         dlg = QDialog(self)
@@ -3584,11 +3700,13 @@ class ChirpWindow(QMainWindow):
                 if self._chk_ref_date.isChecked():
                     days = (datetime.date.today() - d).days
                     self._lbl_day_count.setText(f'Day: {days}')
+                self._mark_dirty()
 
     def _on_dph_prefix_changed(self):
         e = self._sel
         if e:
             e.dph_folder_prefix = self._dph_prefix_edit.text()
+            self._mark_dirty()
 
     def _parse_date_text(self):
         text = self._date_line.text().strip()
@@ -3681,6 +3799,10 @@ class ChirpWindow(QMainWindow):
         need_ch = 2 if e.channel_mode != 'Mono' else 1
         with self._busy_cursor():
             ok = e.change_device(device_id, need_ch)
+        # ``device_id`` is set by change_device even when the open
+        # failed, and it is what to_dict() serializes — so the config
+        # differs from the last saved file either way.
+        self._mark_dirty()
         if not ok:
             QMessageBox.warning(self, 'Device Error',
                                 f'Could not open device:\n{self._device_combo.currentText()}')
@@ -3743,6 +3865,7 @@ class ChirpWindow(QMainWindow):
         e.wav_loop = bool(checked)
         if isinstance(e.capture, WavFileCapture):
             e.capture.set_loop(checked)
+        self._mark_dirty()
 
     def _handle_wav_sim_selection(self, e: RecordingEntity):
         """Prompt for a WAV file and switch ``e`` to WAV-simulation mode.
@@ -3785,6 +3908,7 @@ class ChirpWindow(QMainWindow):
         self._sr_combo.blockSignals(False)
 
         self._refresh_wav_controls()
+        self._mark_dirty()
 
         if warning:
             QMessageBox.information(self, 'WAV File Simulation', warning)
@@ -3814,6 +3938,7 @@ class ChirpWindow(QMainWindow):
                     self._chan_combo.blockSignals(False)
                     e.channel_mode = 'Mono'
                     self._trig_combo.setEnabled(False)
+                    self._mark_dirty()
                     return
             except Exception:
                 pass
@@ -3835,11 +3960,13 @@ class ChirpWindow(QMainWindow):
         # stream has the right channel count.
         if self._monitor.source_id == id(e):
             self._apply_monitor_source(id(e))
+        self._mark_dirty()
 
     def _on_trigger_mode_changed(self, mode: str):
         e = self._sel
         if e:
             e.trigger_mode = mode
+            self._mark_dirty()
 
     def _on_sample_rate_changed(self, _index: int):
         e = self._sel
@@ -3891,6 +4018,7 @@ class ChirpWindow(QMainWindow):
             self._sb_disp_freq_hi.setValue(e.display_freq_hi)
             self._sb_disp_freq_hi.blockSignals(False)
             self._refresh_transport_ui()
+            self._mark_dirty()
         finally:
             if _app is not None:
                 QApplication.restoreOverrideCursor()
@@ -3906,6 +4034,7 @@ class ChirpWindow(QMainWindow):
             return
         e.change_display_seconds(new_secs)
         self._refresh_transport_ui()
+        self._mark_dirty()
 
     # ──────────────────────────────────────────────────────────────────────
     # View Mode
@@ -4053,11 +4182,13 @@ class ChirpWindow(QMainWindow):
 
     def _on_vm_cols_changed(self, val):
         self._vm_n_cols = val
+        self._mark_dirty()
         if self._view_mode:
             self._rebuild_view()
 
     def _on_vm_height_changed(self, val):
         self._vm_panel_height = val
+        self._mark_dirty()
         if self._view_mode and self._pg_grid is not None:
             self._pg_grid.set_tile_height(val)
 
@@ -4162,16 +4293,21 @@ class ChirpWindow(QMainWindow):
                 # Inserted-silence (zero-run) detector — the throttled
                 # zero_run log line is emitted inside this consume.
                 e.consume_zero_run_count()
+                # Pick up the path of any clipped WAV published since
+                # the last tick, so the "S" badge can name the file.
+                e.poll_saturated_file()
                 # M3: detect a dead ingest thread while acq claims to
                 # be running (BaseException escaped the chunk guard).
                 e.check_ingest_alive()
             except Exception:
                 pass
             if hasattr(self, '_sidebar'):
-                # #28: sticky saturation flag.
+                # #28: sticky saturation flag + the last clipped file.
                 try:
+                    from chirp.ui.status_util import compose_saturation_state
+                    sat, sat_tip = compose_saturation_state(e)
                     self._sidebar.update_item_saturation_sticky(
-                        idx, bool(getattr(e, 'saturated_ever', False)))
+                        idx, sat, sat_tip)
                 except Exception:
                     pass
                 # #29: sticky persistent-drops flag.
@@ -4375,8 +4511,15 @@ class ChirpWindow(QMainWindow):
         (3 s doubling to 30 s) so a device that never comes back
         doesn't get hammered.
         """
-        stalled = [e for e in self._entities if e.check_capture_stalled()]
-        if not stalled:
+        # Detection always runs — the `!` badge and the ``capture_dead``
+        # log line are how the user finds out at all. Only the automatic
+        # reconnect is optional: on a rig where the device comes back on
+        # its own (WDM-KS inputs largely ride out RDP session churn), the
+        # teardown-and-reopen costs more audio than it saves.
+        recover = bool(self._audio_cfg.get('auto_recover_capture_stall', True))
+        stalled = [e for e in self._entities
+                   if e.check_capture_stalled(recover=recover)]
+        if not stalled or not recover:
             self._recovery_backoff = 3.0
             return
         if (self._recovery_thread is not None

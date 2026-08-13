@@ -172,6 +172,14 @@ def _make_window_for_sr_tests(n_entities: int, initial_sr: int = 44100):
     # Methods called near the end of the handler
     win._apply_monitor_source = MagicMock()
     win._refresh_transport_ui = MagicMock()
+    # Dirty tracking: keep the real _mark_dirty (so the test can assert
+    # the handler flags unsaved changes) but stub the three Qt-touching
+    # refreshers it fans out to — setWindowTitle on a QMainWindow whose
+    # __init__ never ran raises.
+    win._config_dirty = False
+    win._update_title = MagicMock()
+    win._update_save_tooltip = MagicMock()
+    win._update_save_button = MagicMock()
     return win
 
 
@@ -189,6 +197,8 @@ def test_on_sr_change_disables_combo_and_calls_change(qapp=None):
     win._sr_combo.setEnabled.assert_any_call(True)
     # change_sample_rate did run on the selected entity.
     win._entities[0].change_sample_rate.assert_called_once_with(48000)
+    # Sample rate is persisted, so the config is now unsaved-dirty.
+    assert win._config_dirty is True
 
 
 def test_on_sr_change_is_reentrancy_safe():

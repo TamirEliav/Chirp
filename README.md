@@ -4,7 +4,7 @@
 
 Chirp is a desktop application for multi-stream audio monitoring, visualization, and threshold-triggered recording. It was designed with bioacoustics research in mind but works for any audio analysis task.
 
-![Version](https://img.shields.io/badge/Version-v3.9.0-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5%20%2B%20pyqtgraph-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
+![Version](https://img.shields.io/badge/Version-v3.9.1-orange) ![Python](https://img.shields.io/badge/Python-3.11+-blue) ![PyQt5](https://img.shields.io/badge/GUI-PyQt5%20%2B%20pyqtgraph-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 ---
 
@@ -76,6 +76,7 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - Real-time clipping detection when audio peaks reach ≥ 99% of full scale
 - Amplitude waveform turns **red** to alert on saturation
 - **Sticky `S` badge** in the sidebar latches on the first clip and stays lit until clicked — brief clips are never missed
+- Its tooltip **names the last saved recording that contained clipping** (filename, folder and peak level), so you can open the affected file directly instead of searching the error log for it. Clipping seen live but never written to a file says so, rather than pointing at an older recording
 - In View Mode the per-tile `SAT` overlay surfaces the same state across the monitoring grid
 
 ### Lossless Capture & Drop Tracking
@@ -88,6 +89,8 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - **Input buffer (latency)** and **callback block size** are tunable per machine — the settings that decide how much slack the driver has before captured audio is lost, and how often Chirp is woken to collect it. Neither affects the recorded audio, only display/monitor delay
 - **WASAPI exclusive mode** — hands the input endpoint to Chirp alone so capture comes straight from the driver instead of through the shared Windows audio engine (the layer implicated in inserted silence). WASAPI devices only; on MME / DirectSound / WDM-KS the request is logged and ignored, and a refused exclusive open falls back to a shared open rather than leaving an unattended rig with no capture. The `open` log line names the device, its host API, and whether exclusive mode actually took
 - **Inserted-silence auto-recovery** — when a stream's digital-zero duty cycle stays above a configurable threshold for a configurable time, Chirp restarts acquisition on **every** stream sharing that device (the only reset known to clear a latched capture session) and resumes recording, with a cooldown to prevent restart loops. Every intervention is logged
+- **Lost-device auto-reconnect** (on by default, switchable) — a stream that stops delivering audio for 5 s is closed and reopened by name. The reconnect itself costs audio, so it can be turned off on rigs where the device recovers on its own (typical of WDM-KS inputs under RDP); detection, the `!` badge and the `capture_dead` log line stay either way, so you can reconnect by hand with Stop Acq → Start Acq. Applies immediately rather than on the next stream open
+- **Amplitude-envelope estimator** — how the trigger measures instantaneous loudness: **Hilbert** (default; exact and lag-free, with a small artifact at each block boundary) or **rectify + low-pass** (continuous across blocks, with a group delay of roughly 1/cutoff). Both are calibrated so a steady tone reads its true peak amplitude, so switching does not move existing thresholds; the change applies to every running stream on the next block
 
 ### Inserted-Silence Detection
 - Detects **digital silence injected below the app** — a driver or the Windows audio engine can zero-fill milliseconds of a capture in place, corrupting the spectrogram, the monitor and every recorded WAV, sometimes *without raising any PortAudio error flag*
@@ -124,7 +127,7 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 - Configurable low and high frequency cutoffs
 
 ### Flexible Output
-- Custom output folder, filename prefix, and suffix per stream
+- Custom output folder, filename prefix, and suffix per stream — letters, digits and `-` `_` `.` `+` are kept verbatim, anything else is replaced with `_` so a filename can never be unusable
 - **Reference date tracking** with automatic day-count subfolder naming (e.g., for days post-hatch)
 
 ### Three Visualization Modes
@@ -144,7 +147,8 @@ Chirp is a desktop application for multi-stream audio monitoring, visualization,
 ### Settings Persistence
 - **Save** and **Save As** for configuration files (`.json` format)
 - **Load** restores complete configurations (also reads legacy `.chirp` files)
-- All parameters preserved including device names, sample rates, trigger settings, and display options
+- All parameters preserved including device names, sample rates, trigger settings, display options, and the ⚙ Advanced capture-engine / envelope settings
+- Unsaved changes are marked with a dot in the window title, and **Save is enabled only while there are unsaved changes** — every edit that would be written to the file, including structural ones like the input device or channel mode, marks the config dirty
 
 ### Bulk Editing
 - **All-Streams Table** — an editable side-by-side table of every parameter of every stream (double-click a cell to edit; structural params like device and sample rate are shown read-only)

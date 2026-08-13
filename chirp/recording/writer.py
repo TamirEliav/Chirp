@@ -41,7 +41,12 @@ from chirp.constants import SAMPLE_RATE
 from chirp.error_log import log as _err_log
 
 
-_FILENAME_SAFE = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._")
+# ``+`` is legal in filenames on Windows and POSIX alike (it is not in
+# the Windows reserved set ``<>:"/\|?*`` and needs no shell quoting that
+# ``-`` doesn't already need), and users label conditions with it
+# ("stim+", "day3+control"). Keeping it out of this set silently rewrote
+# such a suffix to ``_``.
+_FILENAME_SAFE = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._+")
 
 # #51: Windows reserved device names. Case-insensitive match on the
 # token minus any extension — ``CON.wav`` is still reserved. If a user
@@ -59,6 +64,53 @@ _WIN_RESERVED = {
 # MAX_PATH is 260; leaving ~64 chars per token keeps a four-token
 # filename under that even with a long output folder.
 _TOKEN_MAX_LEN = 64
+
+
+# ── Last-saturated-file registry ─────────────────────────────────────────────
+#
+# The sticky "S" badge tells the user that clipping happened at some
+# point, but not WHERE — finding the offending recording meant opening
+# chirp_errors.log and matching timestamps by hand. Both publish paths
+# already know the final path and the peak at the moment they log the
+# ``saturation`` line, so they record it here too and the badge tooltip
+# names the file directly.
+#
+# Keyed by ``filename_stream`` (the entity name) because that is the only
+# stream identity the writer layer has. Entities poll it once per UI tick
+# and cache the result on themselves, so a mid-session rename loses at
+# most the pending record, not the one already shown.
+_sat_lock = threading.Lock()
+_last_saturated: dict[str, tuple[str, float]] = {}
+
+
+def note_saturated_file(stream: str, path: str, peak: float) -> None:
+    """Record ``path`` as the most recent clipped WAV for ``stream``.
+
+    Called from the writer-pool worker that just published the file.
+    Never raises — a bookkeeping failure must not fail the write.
+    """
+    try:
+        with _sat_lock:
+            _last_saturated[str(stream or 'global')] = (str(path), float(peak))
+    except Exception:
+        pass
+
+
+def consume_saturated_file(stream: str) -> tuple[str, float] | None:
+    """Pop the pending ``(path, peak)`` for ``stream``, or None.
+
+    Pop rather than peek: the caller (``RecordingEntity``) caches what it
+    takes, so leaving the entry behind would just make every later poll
+    re-copy the same tuple.
+    """
+    with _sat_lock:
+        return _last_saturated.pop(str(stream or 'global'), None)
+
+
+def clear_saturated_file(stream: str) -> None:
+    """Drop any pending record for ``stream`` (sticky-flag reset)."""
+    with _sat_lock:
+        _last_saturated.pop(str(stream or 'global'), None)
 
 
 def _sanitize_token(s: str) -> str:
@@ -275,6 +327,7 @@ def write_wav_sync(buf_snapshot: list, output_dir: str,
         _err_log('saturation', filename_stream or 'global',
                  f'recording contains clipped samples (peak={peak:.4f})',
                  wav_path=path)
+        note_saturated_file(filename_stream, path, peak)
     return path
 
 
@@ -504,6 +557,7 @@ class StreamingWavWriter:
             _err_log('saturation', self.filename_stream or 'global',
                      f'recording contains clipped samples (peak={self.peak:.4f})',
                      wav_path=self.path)
+            note_saturated_file(self.filename_stream, self.path, self.peak)
         return self.path
 
     def abort(self) -> None:

@@ -87,6 +87,28 @@ def test_sanitize_empty_is_empty():
     assert _sanitize_token('___') == ''
 
 
+def test_sanitize_keeps_plus():
+    """``+`` is legal in Windows and POSIX filenames and users label
+    conditions with it ('stim+', 'day3+ctrl'); it used to be rewritten
+    to '_' along with the genuinely hostile characters."""
+    assert _sanitize_token('stim+') == 'stim+'
+    assert _sanitize_token('day3+ctrl') == 'day3+ctrl'
+    assert _sanitize_token('+') == '+'
+
+
+def test_plus_survives_into_the_written_filename(tmp_path):
+    """End-to-end: a '+' in the suffix must reach disk, not just the
+    sanitizer (the composer joins sanitized tokens, so a regression in
+    either layer loses it)."""
+    audio = [np.zeros(64, dtype=np.float32)]
+    path = write_wav_sync(audio, str(tmp_path), prefix='a+b', suffix='stim+',
+                          sample_rate=8000)
+    name = os.path.basename(path)
+    assert name.startswith('a+b_')
+    assert name.endswith('stim+.wav')
+    assert os.path.exists(path)
+
+
 # ── write_wav_sync refuses to escape output_dir ──────────────────────
 
 def test_write_wav_sync_refuses_path_traversal_prefix(tmp_path):
